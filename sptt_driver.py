@@ -135,6 +135,7 @@ def decode_frame(raw_chunks, w, h, encoding, binning=0):
         arr = np.array(pixels[:w * h], dtype=dtype)
         if len(arr) < w * h:
             arr = np.pad(arr, (0, w * h - len(arr)))
+        
         return arr.reshape(h, w)
 
     frame = [0] * (w * h)
@@ -313,6 +314,18 @@ class SpttCamera:
             frame_size = w * h * 3 // 2
         else:
             frame_size = w * h
+
+        if self.binning == 0:
+            self.w = 744
+            self.h = 576
+
+        if self.binning == 1:
+            self.w = 372
+            self.h = 288
+        
+        if self.binning == 3:
+            self.w = 188
+            self.h = 144
 
         _usb_write_retry(self.ep_wr, make_command(CMD_READ_PREPARE, frame_size))
         raw_chunks = read_raw_frame(frame_size, self.ep_tr)
