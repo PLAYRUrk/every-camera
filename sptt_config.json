@@ -1,0 +1,10 @@
+{
+  "instance_name": "",
+  "output_dir": "/home/alex/output/",
+  "exposure": 1000,
+  "gain": 1,
+  "binning": 0,
+  "encoding": 1,
+  "target_temp": null,
+  "firmware_dir": ""
+}
