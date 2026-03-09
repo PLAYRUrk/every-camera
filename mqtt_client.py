@@ -39,8 +39,11 @@ class MqttPublisherConsole:
             self._client.tls_set()
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        self._client.on_message = self._on_message
         self._host = host
         self._port = int(port)
+        self._sub_topic = None
+        self._on_command_cb = None
 
     def connect_broker(self):
         try:
@@ -63,15 +66,31 @@ class MqttPublisherConsole:
         except Exception:
             pass
 
+    def subscribe_commands(self, topic, callback):
+        """Subscribe to command topic. callback(topic, payload_bytes)."""
+        self._sub_topic = topic
+        self._on_command_cb = callback
+        if self._client.is_connected():
+            self._client.subscribe(self._sub_topic, qos=1)
+
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
             print("[INFO] MQTT connected")
+            if self._sub_topic:
+                client.subscribe(self._sub_topic, qos=1)
         else:
             print(f"[WARN] MQTT connection refused (rc={reason_code})")
 
     def _on_disconnect(self, client, userdata, disconnect_flags=None,
                        reason_code=None, properties=None):
         pass  # auto-reconnect handles this
+
+    def _on_message(self, client, userdata, msg):
+        if self._on_command_cb:
+            try:
+                self._on_command_cb(msg.topic, msg.payload)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +103,7 @@ try:
         connected = pyqtSignal()
         disconnected = pyqtSignal()
         error = pyqtSignal(str)
+        command_received = pyqtSignal(str, bytes)  # topic, payload
 
         def __init__(self, host, port, user="", password="", use_tls=False, client_id=""):
             super().__init__()
@@ -96,8 +116,10 @@ try:
                 self._client.tls_set()
             self._client.on_connect = self._on_connect
             self._client.on_disconnect = self._on_disconnect
+            self._client.on_message = self._on_message
             self._host = host
             self._port = int(port)
+            self._sub_topic = None
 
         def connect_broker(self):
             try:
@@ -120,9 +142,17 @@ try:
             except Exception:
                 pass
 
+        def subscribe_commands(self, topic):
+            """Subscribe to command topic. Emits command_received signal."""
+            self._sub_topic = topic
+            if self._client.is_connected():
+                self._client.subscribe(self._sub_topic, qos=1)
+
         def _on_connect(self, client, userdata, flags, reason_code, properties=None):
             if reason_code == 0:
                 self.connected.emit()
+                if self._sub_topic:
+                    client.subscribe(self._sub_topic, qos=1)
             else:
                 self.error.emit(f"MQTT connection refused (rc={reason_code})")
 
@@ -130,11 +160,18 @@ try:
                            reason_code=None, properties=None):
             self.disconnected.emit()
 
+        def _on_message(self, client, userdata, msg):
+            try:
+                self.command_received.emit(msg.topic, bytes(msg.payload))
+            except Exception:
+                pass
+
     class MqttSubscriber(QObject):
         """MQTT subscriber for monitor GUI."""
         connected = pyqtSignal()
         disconnected = pyqtSignal()
         message_received = pyqtSignal(str, str)  # topic, payload JSON
+        binary_received = pyqtSignal(str, bytes)  # topic, raw payload
         error = pyqtSignal(str)
 
         def __init__(self, host, port, user="", password="", use_tls=False, client_id=""):
@@ -151,16 +188,30 @@ try:
             self._client.on_message = self._on_message
             self._host = host
             self._port = int(port)
-            self._topic = None
+            self._topics = []
 
         def connect_broker(self, topic):
-            self._topic = topic
+            self._topics = [topic] if isinstance(topic, str) else list(topic)
             try:
                 self._client.reconnect_delay_set(min_delay=2, max_delay=30)
                 self._client.connect_async(self._host, self._port, keepalive=60)
                 self._client.loop_start()
             except Exception as e:
                 self.error.emit(str(e))
+
+        def add_subscription(self, topic):
+            """Add extra subscription after connection."""
+            if topic not in self._topics:
+                self._topics.append(topic)
+            if self._client.is_connected():
+                self._client.subscribe(topic, qos=1)
+
+        def publish(self, topic, payload, retain=False, qos=1):
+            """Publish a message (for sending commands)."""
+            try:
+                self._client.publish(topic, payload, qos=qos, retain=retain)
+            except Exception:
+                pass
 
         def disconnect_broker(self):
             try:
@@ -171,7 +222,8 @@ try:
 
         def _on_connect(self, client, userdata, flags, reason_code, properties=None):
             if reason_code == 0:
-                client.subscribe(self._topic, qos=1)
+                for t in self._topics:
+                    client.subscribe(t, qos=1)
                 self.connected.emit()
             else:
                 self.error.emit(f"Connection refused (rc={reason_code})")
@@ -182,7 +234,14 @@ try:
 
         def _on_message(self, client, userdata, msg):
             try:
-                self.message_received.emit(msg.topic, msg.payload.decode("utf-8"))
+                # Try text decode for status messages
+                payload_str = msg.payload.decode("utf-8")
+                self.message_received.emit(msg.topic, payload_str)
+            except Exception:
+                pass
+            # Always emit binary for frame data
+            try:
+                self.binary_received.emit(msg.topic, bytes(msg.payload))
             except Exception:
                 pass
 

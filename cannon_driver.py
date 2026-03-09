@@ -282,21 +282,43 @@ class CannonWorkerConsole(threading.Thread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
         self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
         self._last_shot = None
+        self._last_frame_data = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
 
     def request_stop(self):
         self._stop_event.set()
 
+    def _on_mqtt_command(self, topic, payload):
+        """Handle incoming MQTT commands (e.g. get_frame)."""
+        if topic.endswith("/cmd/get_frame") and self._last_frame_data:
+            import base64
+            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+            frame_payload = json.dumps({
+                "camera_type": "cannon",
+                "instance_name": self.instance_name,
+                "format": "jpeg",
+                "data": base64.b64encode(self._last_frame_data).decode(),
+                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            print("[INFO] Frame sent via MQTT")
+
     def run(self):
         last_fired = (-1, -1)
         consecutive_errors = 0
         os.makedirs(self.status_dir, exist_ok=True)
+
+        # Subscribe to command topic
+        if self._mqtt:
+            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
+            self._mqtt.subscribe_commands(cmd_topic, self._on_mqtt_command)
 
         print("[INFO] Cannon measurement started")
         self._save_status("running")
@@ -351,6 +373,7 @@ class CannonWorkerConsole(threading.Thread):
             img_data = capture_image(self.cam)
             with open(filepath, "wb") as fh:
                 fh.write(img_data)
+            self._last_frame_data = img_data
             print(f"[INFO] Shot saved: {os.path.basename(filepath)}")
             return True
         except Exception as exc:

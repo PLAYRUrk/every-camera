@@ -1,10 +1,12 @@
 """
 Camera Monitor GUI — displays live status of all running camera instances.
 Supports MQTT (remote) and local file modes.
+Allows requesting last frame from running instances.
 """
 import os
 import json
 import glob
+import base64
 
 from datetime import datetime as dt
 
@@ -13,10 +15,11 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem,
     QFileDialog, QHeaderView, QAbstractItemView,
-    QGroupBox, QTabWidget, QCheckBox,
+    QGroupBox, QTabWidget, QCheckBox, QDialog,
+    QMessageBox, QSizePolicy,
 )
 from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QImage, QPixmap
 
 from mqtt_client import MQTT_AVAILABLE
 
@@ -43,6 +46,54 @@ STATUS_COLORS = {
     "stale":   QColor(200, 80, 0),
     "unknown": QColor(100, 100, 100),
 }
+
+
+# ---------------------------------------------------------------------------
+# Frame viewer dialog
+# ---------------------------------------------------------------------------
+class FrameViewerDialog(QDialog):
+    """Dialog to display a received camera frame."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Last Frame")
+        self.resize(800, 600)
+        lay = QVBoxLayout(self)
+
+        self.lbl_info = QLabel("")
+        self.lbl_info.setStyleSheet("font-weight:bold; font-size:12px;")
+        lay.addWidget(self.lbl_info)
+
+        self.lbl_image = QLabel("Waiting for frame...")
+        self.lbl_image.setAlignment(Qt.AlignCenter)
+        self.lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl_image.setStyleSheet("background-color: #1a1a1a; color: #888;")
+        lay.addWidget(self.lbl_image, 1)
+
+    def show_frame(self, instance_name, camera_type, jpeg_data, timestamp=None):
+        """Display a JPEG frame."""
+        qimg = QImage()
+        if qimg.loadFromData(jpeg_data):
+            pixmap = QPixmap.fromImage(qimg)
+            scaled = pixmap.scaled(self.lbl_image.size(),
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_image.setPixmap(scaled)
+        else:
+            self.lbl_image.setText("Failed to decode image")
+
+        ts = timestamp or "?"
+        self.lbl_info.setText(
+            f"{instance_name}  |  {camera_type.upper()}  |  {ts}")
+        self.setWindowTitle(f"Last Frame — {instance_name}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-scale pixmap on resize
+        pm = self.lbl_image.pixmap()
+        if pm and not pm.isNull():
+            self.lbl_image.setPixmap(
+                pm.scaled(self.lbl_image.size(),
+                          Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +131,7 @@ def status_display(rec):
 
 def fmt_dt(iso_str):
     if not iso_str:
-        return "—"
+        return "\u2014"
     try:
         return dt.fromisoformat(iso_str).strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
@@ -104,7 +155,7 @@ def _extra_info(rec):
         if rec.get("frame_size"):
             parts.append(rec["frame_size"])
         if rec.get("cam_temp_ccd") is not None:
-            parts.append(f"T:{rec['cam_temp_ccd']}°")
+            parts.append(f"T:{rec['cam_temp_ccd']}\u00b0")
     # System info
     sys_info = rec.get("system", {})
     if sys_info.get("disk_free_mb") is not None:
@@ -153,6 +204,7 @@ class MqttTab(QWidget):
         self._subscriber = None
         self._instances = {}
         self._mqtt_cfg = mqtt_cfg or {}
+        self._frame_viewer = None
         self._build_ui()
         self._load_config()
 
@@ -213,9 +265,19 @@ class MqttTab(QWidget):
         self.table = make_table()
         lay.addWidget(self.table, 1)
 
+        # Footer with frame request button
+        footer_lay = QHBoxLayout()
         self.lbl_footer = QLabel("Not connected")
         self.lbl_footer.setStyleSheet("color:#666; font-size:11px;")
-        lay.addWidget(self.lbl_footer)
+        footer_lay.addWidget(self.lbl_footer, 1)
+
+        self.btn_get_frame = QPushButton("View Last Frame")
+        self.btn_get_frame.setEnabled(False)
+        self.btn_get_frame.setToolTip("Request last frame from selected instance")
+        self.btn_get_frame.clicked.connect(self._on_request_frame)
+        footer_lay.addWidget(self.btn_get_frame)
+
+        lay.addLayout(footer_lay)
 
         self._stale_timer = QTimer(self)
         self._stale_timer.setInterval(5000)
@@ -244,7 +306,8 @@ class MqttTab(QWidget):
         user = self.le_user.text().strip()
         password = self.le_pass.text()
         prefix = self.le_prefix.text().strip() or "every_camera"
-        topic = f"{prefix}/+/status"
+        status_topic = f"{prefix}/+/status"
+        frame_topic = f"{prefix}/+/frame"
 
         try:
             self._subscriber = MqttSubscriber(host, port, user, password,
@@ -253,7 +316,8 @@ class MqttTab(QWidget):
             self._subscriber.disconnected.connect(self._on_broker_disconnected)
             self._subscriber.message_received.connect(self._on_message)
             self._subscriber.error.connect(self._on_broker_error)
-            self._subscriber.connect_broker(topic)
+            # Subscribe to both status and frame topics
+            self._subscriber.connect_broker([status_topic, frame_topic])
             self.lbl_conn.setText("Connecting...")
             self.lbl_conn.setStyleSheet("color:#888; font-weight:bold;")
             self.btn_connect.setEnabled(False)
@@ -269,30 +333,92 @@ class MqttTab(QWidget):
         self._refresh_table()
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
+        self.btn_get_frame.setEnabled(False)
 
     def _on_broker_connected(self):
         self.lbl_conn.setText(f"Connected to {self.le_host.text().strip()}")
         self.lbl_conn.setStyleSheet("color:#007700; font-weight:bold;")
         self.btn_disconnect.setEnabled(True)
+        self.btn_get_frame.setEnabled(True)
 
     def _on_broker_disconnected(self):
         self.lbl_conn.setText("Disconnected")
         self.lbl_conn.setStyleSheet("color:#888; font-weight:bold;")
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
+        self.btn_get_frame.setEnabled(False)
 
     def _on_broker_error(self, msg):
         self.lbl_conn.setText(f"Error: {msg}")
         self.lbl_conn.setStyleSheet("color:#cc0000; font-weight:bold;")
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
+        self.btn_get_frame.setEnabled(False)
 
     def _on_message(self, topic, payload):
+        # Handle frame responses
+        if "/frame" in topic and not topic.endswith("/status"):
+            self._on_frame_received(topic, payload)
+            return
+        # Handle status messages
         try:
             data = json.loads(payload)
             self._instances[topic] = (data, dt.now())
             self._refresh_table()
         except json.JSONDecodeError:
+            pass
+
+    def _on_request_frame(self):
+        """Request last frame from the selected instance."""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No selection",
+                                    "Select an instance in the table first.")
+            return
+
+        instance_item = self.table.item(row, 0)
+        if not instance_item:
+            return
+        instance_name = instance_item.text()
+        prefix = self.le_prefix.text().strip() or "every_camera"
+        cmd_topic = f"{prefix}/{instance_name}/cmd/get_frame"
+
+        if self._subscriber:
+            self._subscriber.publish(cmd_topic, b"", retain=False)
+            self.lbl_footer.setText(f"Frame requested from {instance_name}...")
+
+            # Open viewer dialog
+            if not self._frame_viewer or not self._frame_viewer.isVisible():
+                self._frame_viewer = FrameViewerDialog(self)
+            self._frame_viewer.lbl_image.setText(
+                f"Waiting for frame from {instance_name}...")
+            self._frame_viewer.lbl_info.setText(f"Requesting: {instance_name}")
+            self._frame_viewer.show()
+            self._frame_viewer.raise_()
+
+    def _on_frame_received(self, topic, payload):
+        """Handle incoming frame data."""
+        try:
+            data = json.loads(payload)
+            jpeg_b64 = data.get("data")
+            if not jpeg_b64:
+                return
+            jpeg_data = base64.b64decode(jpeg_b64)
+            instance_name = data.get("instance_name", "?")
+            camera_type = data.get("camera_type", "?")
+            timestamp = data.get("timestamp")
+
+            if not self._frame_viewer or not self._frame_viewer.isVisible():
+                self._frame_viewer = FrameViewerDialog(self)
+                self._frame_viewer.show()
+
+            self._frame_viewer.show_frame(
+                instance_name, camera_type, jpeg_data, timestamp)
+            self._frame_viewer.raise_()
+            self.lbl_footer.setText(
+                f"Frame received from {instance_name} at "
+                f"{dt.now().strftime('%H:%M:%S')}")
+        except Exception:
             pass
 
     def _refresh_table(self):

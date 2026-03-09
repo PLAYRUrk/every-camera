@@ -16,6 +16,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_STATUS_DIR = str(Path.home() / ".every_camera" / "status")
 HOME_CONFIG_FILE = str(Path.home() / ".every_camera" / "config.json")
 LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+LOCAL_MQTT_FILE = os.path.join(APP_DIR, "mqtt.json")
 
 SCHEDULE_DT_FMT = "%Y-%m-%d %H:%M:%S"
 SCHEDULE_LINE_RE = re.compile(

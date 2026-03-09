@@ -77,16 +77,38 @@ class CannonWorkerQt(QThread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
         self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
+        self._last_frame_data = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
 
     def request_stop(self):
         self._stop = True
+
+    def _setup_command_listener(self):
+        if self._mqtt:
+            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
+            self._mqtt.command_received.connect(self._on_mqtt_command)
+            self._mqtt.subscribe_commands(cmd_topic)
+
+    def _on_mqtt_command(self, topic, payload):
+        if topic.endswith("/cmd/get_frame") and self._last_frame_data:
+            import base64
+            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+            frame_payload = json.dumps({
+                "camera_type": "cannon",
+                "instance_name": self.instance_name,
+                "format": "jpeg",
+                "data": base64.b64encode(self._last_frame_data).decode(),
+                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            self.log_msg.emit("Frame sent via MQTT", "info")
 
     def run(self):
         from cannon_driver import capture_image, get_camera_settings_info
@@ -95,6 +117,7 @@ class CannonWorkerQt(QThread):
         consecutive_errors = 0
         os.makedirs(self.status_dir, exist_ok=True)
 
+        self._setup_command_listener()
         self.log_msg.emit("Measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running")
@@ -135,6 +158,7 @@ class CannonWorkerQt(QThread):
                     img_data = capture_image(self.cam)
                     with open(filepath, "wb") as f:
                         f.write(img_data)
+                    self._last_frame_data = img_data
                     self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
                     consecutive_errors = 0
                     self._shots += 1
@@ -614,15 +638,49 @@ class SpttScheduledWorkerQt(QThread):
         self.instance_name = instance_name
         self.status_dir = status_dir
         self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
         self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
+        self._last_frame = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}_sptt.json")
 
     def request_stop(self):
         self._stop = True
+
+    def _setup_command_listener(self):
+        if self._mqtt:
+            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
+            self._mqtt.command_received.connect(self._on_mqtt_command)
+            self._mqtt.subscribe_commands(cmd_topic)
+
+    def _on_mqtt_command(self, topic, payload):
+        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
+            import base64
+            import io
+            from PIL import Image
+
+            frame = self._last_frame
+            if frame.dtype == np.uint16:
+                display = (frame.astype(np.float32) / frame.max() * 255).astype(np.uint8)
+            else:
+                display = frame
+            img = Image.fromarray(display, mode="L")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+
+            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+            frame_payload = json.dumps({
+                "camera_type": "sptt",
+                "instance_name": self.instance_name,
+                "format": "jpeg",
+                "data": base64.b64encode(buf.getvalue()).decode(),
+                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            self.log_msg.emit("Frame sent via MQTT", "info")
 
     def run(self):
         from sptt_driver import save_fits, ENCODING_12BPP, SPTT_CAPTURE_SECONDS
@@ -631,6 +689,7 @@ class SpttScheduledWorkerQt(QThread):
         consecutive_errors = 0
         os.makedirs(self.status_dir, exist_ok=True)
 
+        self._setup_command_listener()
         self.log_msg.emit("SPTT measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running")
@@ -672,6 +731,7 @@ class SpttScheduledWorkerQt(QThread):
                         metadata["SINKTEMP"] = cam_status.get("temp_sink", 0)
                         metadata["TRGTEMP"] = cam_status.get("temp_target", 0)
                     save_fits(filepath, frame, metadata)
+                    self._last_frame = frame
                     self.log_msg.emit(f"Frame saved: {os.path.basename(filepath)}", "info")
                     consecutive_errors = 0
                     self._shots += 1

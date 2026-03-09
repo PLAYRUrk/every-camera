@@ -516,20 +516,56 @@ class SpttWorkerConsole(threading.Thread):
         self.instance_name = instance_name
         self.status_dir = status_dir
         self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
         self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
         self._last_shot = None
+        self._last_frame = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
 
     def request_stop(self):
         self._stop_event.set()
 
+    def _on_mqtt_command(self, topic, payload):
+        """Handle incoming MQTT commands (e.g. get_frame)."""
+        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
+            import base64
+            import io
+            from PIL import Image
+
+            frame = self._last_frame
+            # Normalize to 8-bit for JPEG
+            if frame.dtype == np.uint16:
+                display = (frame.astype(np.float32) / frame.max() * 255).astype(np.uint8)
+            else:
+                display = frame
+            img = Image.fromarray(display, mode="L")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            jpeg_data = buf.getvalue()
+
+            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+            frame_payload = json.dumps({
+                "camera_type": "sptt",
+                "instance_name": self.instance_name,
+                "format": "jpeg",
+                "data": base64.b64encode(jpeg_data).decode(),
+                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            print("[INFO] Frame sent via MQTT")
+
     def run(self):
         last_fired = (-1, -1)
         consecutive_errors = 0
         os.makedirs(self.status_dir, exist_ok=True)
+
+        # Subscribe to command topic
+        if self._mqtt:
+            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
+            self._mqtt.subscribe_commands(cmd_topic, self._on_mqtt_command)
 
         print("[INFO] SPTT measurement started (captures at :00 and :30)")
         self._save_status("running")
@@ -593,6 +629,7 @@ class SpttWorkerConsole(threading.Thread):
                 metadata["TRGTEMP"] = cam_status.get("temp_target", 0)
 
             save_fits(filepath, frame, metadata)
+            self._last_frame = frame
             print(f"[INFO] Frame saved: {os.path.basename(filepath)} "
                   f"({frame.shape[1]}x{frame.shape[0]}, "
                   f"exp={self.cam.exposure}s, gain={self.cam.gain})")

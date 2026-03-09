@@ -3,7 +3,10 @@
     "instance_name": "",
     "output_dir": "",
     "schedule_file": "",
-    "capture_seconds": [0, 30],
+    "capture_seconds": [
+      0,
+      30
+    ],
     "camcfg_file": ""
   },
   "sptt": {
@@ -19,7 +22,7 @@
   "mqtt": {
     "enabled": false,
     "host": "broker.hivemq.com",
-    "port": 1883,
+    "port": "1883",
     "user": "",
     "password": "",
     "prefix": "every_camera",
