@@ -167,7 +167,7 @@ class SpttCamera:
         self.h = 0
         self.encoding = ENCODING_8BPP
         self.binning = 0
-        self.exposure = 880000
+        self.exposure = 0.88
         self.gain = 100
         self._running = False
 
@@ -206,15 +206,17 @@ class SpttCamera:
                 pass
             self.dev = None
 
-    def configure(self, exposure=880000, gain=100, binning=0, encoding=ENCODING_12BPP,
+    def configure(self, exposure=0.88, gain=100, binning=0, encoding=ENCODING_12BPP,
                   r_offset=None, g_offset=None, trigmode=0, period=75000,
                   draft=False, roi_org=None, roi_size=None, target_temp=None):
-        """Apply all camera parameters."""
+        """Apply all camera parameters. Exposure is in seconds."""
         wr = self._write_cmd
         self.exposure = exposure
         self.gain = gain
         self.binning = binning
         self.encoding = encoding
+
+        exposure_us = int(exposure * 1_000_000)
 
         wr(CMD_SET_BINNING, binning)
         if roi_org is not None:
@@ -227,7 +229,7 @@ class SpttCamera:
             wr(CMD_SET_ROI_SIZE, (h_size << 16) | v_size)
 
         wr(CMD_SET_ENCODING, encoding)
-        wr(CMD_SET_EXP, exposure)
+        wr(CMD_SET_EXP, exposure_us)
         wr(CMD_SET_GAIN, gain)
         if r_offset is not None:
             wr(CMD_SET_R_OFFSET, r_offset)
@@ -248,8 +250,9 @@ class SpttCamera:
         _usb_write_retry(self.ep_wr, make_command(cmd_id, value))
 
     def set_exposure(self, value):
+        """Set exposure in seconds."""
         self.exposure = value
-        _usb_write_retry(self.ep_wr, make_command(CMD_SET_EXP, value))
+        _usb_write_retry(self.ep_wr, make_command(CMD_SET_EXP, int(value * 1_000_000)))
 
     def set_gain(self, value):
         self.gain = value
@@ -297,7 +300,6 @@ class SpttCamera:
             self._running = False
 
     def grab_frame(self):
-        w, h = self.w, self.h
         for _ in range(500):
             try:
                 sb, _ = read_crb(self.ep_wr, self.ep_rd)
@@ -310,22 +312,17 @@ class SpttCamera:
         else:
             raise RuntimeError("FIFO timeout — no frame data")
 
+        # Update frame dimensions based on binning
+        BINNING_SIZES = {0: (744, 576), 1: (372, 288), 3: (188, 144)}
+        if self.binning in BINNING_SIZES:
+            self.w, self.h = BINNING_SIZES[self.binning]
+
+        w, h = self.w, self.h
+
         if self.encoding == ENCODING_12BPP:
             frame_size = w * h * 3 // 2
         else:
             frame_size = w * h
-
-        if self.binning == 0:
-            self.w = 744
-            self.h = 576
-
-        if self.binning == 1:
-            self.w = 372
-            self.h = 288
-        
-        if self.binning == 3:
-            self.w = 188
-            self.h = 144
 
         _usb_write_retry(self.ep_wr, make_command(CMD_READ_PREPARE, frame_size))
         raw_chunks = read_raw_frame(frame_size, self.ep_tr)
@@ -348,7 +345,7 @@ class SpttCamera:
                 "gain": sl[2],
                 "r_offset": sl[3],
                 "g_offset": sl[4],
-                "exposure_us": sl[5],
+                "exposure_s": sl[5] / 1_000_000.0,
                 "period_us": sl[6],
                 "binning": sl[7],
                 "roi_org_h": sl[8],
@@ -585,8 +582,7 @@ class SpttWorkerConsole(threading.Thread):
             metadata = {
                 "DATE-OBS": now.isoformat(),
                 "INSTRUME": "CSDU-429",
-                "EXPTIME": self.cam.exposure / 1_000_000.0,  # seconds
-                "EXPOSURE": self.cam.exposure,  # microseconds
+                "EXPTIME": self.cam.exposure,
                 "GAIN": self.cam.gain,
                 "BINNING": self.cam.binning,
                 "ENCODING": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
@@ -599,7 +595,7 @@ class SpttWorkerConsole(threading.Thread):
             save_fits(filepath, frame, metadata)
             print(f"[INFO] Frame saved: {os.path.basename(filepath)} "
                   f"({frame.shape[1]}x{frame.shape[0]}, "
-                  f"exp={self.cam.exposure}us, gain={self.cam.gain})")
+                  f"exp={self.cam.exposure}s, gain={self.cam.gain})")
             return True
         except Exception as exc:
             print(f"[ERROR] Capture error: {exc}")
@@ -622,7 +618,7 @@ class SpttWorkerConsole(threading.Thread):
             "last_shot": self._last_shot.isoformat() if self._last_shot else None,
             "errors": self._errors,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
-            "exposure_us": self.cam.exposure,
+            "exposure_s": self.cam.exposure,
             "gain": self.cam.gain,
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
@@ -666,7 +662,7 @@ def run_console_sptt(config_path=None):
     instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
     output_dir = sptt_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
-    exposure = sptt_cfg.get("exposure", 880000)
+    exposure = sptt_cfg.get("exposure", 0.88)
     gain = sptt_cfg.get("gain", 100)
     binning = sptt_cfg.get("binning", 0)
     encoding = sptt_cfg.get("encoding", ENCODING_12BPP)
@@ -675,7 +671,7 @@ def run_console_sptt(config_path=None):
     print("=" * 60)
     print("  Every Camera — SPTT (CSDU-429) Console Mode")
     print(f"  Instance  : {instance_name}")
-    print(f"  Exposure  : {exposure} us")
+    print(f"  Exposure  : {exposure} s")
     print(f"  Gain      : {gain}")
     print(f"  Binning   : {binning}")
     print(f"  Encoding  : {'12bit' if encoding == ENCODING_12BPP else '8bit'}")
@@ -683,7 +679,23 @@ def run_console_sptt(config_path=None):
     print("=" * 60)
 
     if not output_dir:
-        print("[ERROR] output_dir is empty in config. Set sptt.output_dir.")
+        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        from utils import configure_console_sptt
+        configure_console_sptt(cfg, config_path)
+        sptt_cfg = cfg.get("sptt", {})
+        instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
+        output_dir = sptt_cfg.get("output_dir", "")
+        exposure = sptt_cfg.get("exposure", 0.88)
+        gain = sptt_cfg.get("gain", 100)
+        binning = sptt_cfg.get("binning", 0)
+        encoding = sptt_cfg.get("encoding", ENCODING_12BPP)
+        target_temp = sptt_cfg.get("target_temp")
+        print(f"  Instance  : {instance_name}")
+        print(f"  Exposure  : {exposure} s")
+        print(f"  Gain      : {gain}")
+
+    if not output_dir:
+        print("[ERROR] output_dir is required.")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)

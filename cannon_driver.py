@@ -424,11 +424,23 @@ def run_console_cannon(config_path=None):
     print(f"  Capture at    : {capture_seconds} seconds of each minute")
     print("=" * 60)
 
+    if not output_dir or not schedule_file:
+        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        from utils import configure_console_cannon
+        configure_console_cannon(cfg, config_path)
+        cannon_cfg = cfg.get("cannon", {})
+        instance_name = cannon_cfg.get("instance_name") or get_instance_name("Cannon")
+        output_dir = cannon_cfg.get("output_dir", "")
+        schedule_file = cannon_cfg.get("schedule_file", "")
+        capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
+        print(f"  Instance      : {instance_name}")
+        print(f"  Capture at    : {capture_seconds} seconds of each minute")
+
     if not output_dir:
-        print("[ERROR] output_dir is empty in config. Set cannon.output_dir.")
+        print("[ERROR] output_dir is required.")
         sys.exit(1)
     if not schedule_file:
-        print("[ERROR] schedule_file is empty in config. Set cannon.schedule_file.")
+        print("[ERROR] schedule_file is required.")
         sys.exit(1)
     if not os.path.exists(schedule_file):
         print(f"[ERROR] Schedule file not found: {schedule_file}")

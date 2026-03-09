@@ -1,5 +1,5 @@
 """
-Shared utilities: config, schedule, encryption, instance naming, status files.
+Shared utilities: config, schedule, instance naming, status files.
 """
 import os
 import re
@@ -9,12 +9,6 @@ from datetime import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    from cryptography.fernet import Fernet
-    CRYPTO_AVAILABLE = True
-except ImportError:
-    CRYPTO_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -22,9 +16,6 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_STATUS_DIR = str(Path.home() / ".every_camera" / "status")
 HOME_CONFIG_FILE = str(Path.home() / ".every_camera" / "config.json")
 LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
-KEY_FILE = str(Path.home() / ".every_camera" / ".keyfile")
-ENC_PREFIX = "ENC:"
-ENCRYPTED_FIELDS = {"mqtt_password", "password"}
 
 SCHEDULE_DT_FMT = "%Y-%m-%d %H:%M:%S"
 SCHEDULE_LINE_RE = re.compile(
@@ -63,43 +54,6 @@ def get_instance_name(camera_name):
 
 
 # ---------------------------------------------------------------------------
-# Encryption helpers
-# ---------------------------------------------------------------------------
-def _get_or_create_key():
-    key_dir = os.path.dirname(KEY_FILE)
-    os.makedirs(key_dir, exist_ok=True)
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "rb") as fh:
-            return fh.read().strip()
-    key = Fernet.generate_key()
-    with open(KEY_FILE, "wb") as fh:
-        fh.write(key)
-    try:
-        os.chmod(KEY_FILE, 0o600)
-    except Exception:
-        pass
-    return key
-
-
-def encrypt_value(val):
-    if not CRYPTO_AVAILABLE or not val:
-        return val
-    try:
-        return ENC_PREFIX + Fernet(_get_or_create_key()).encrypt(val.encode()).decode()
-    except Exception:
-        return val
-
-
-def decrypt_value(val):
-    if not CRYPTO_AVAILABLE or not val or not str(val).startswith(ENC_PREFIX):
-        return val
-    try:
-        return Fernet(_get_or_create_key()).decrypt(val[len(ENC_PREFIX):].encode()).decode()
-    except Exception:
-        return val
-
-
-# ---------------------------------------------------------------------------
 # Config management
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
@@ -113,7 +67,7 @@ DEFAULT_CONFIG = {
     "sptt": {
         "instance_name": "",
         "output_dir": "",
-        "exposure": 880000,
+        "exposure": 0.88,
         "gain": 100,
         "binning": 0,
         "encoding": 1,
@@ -145,22 +99,13 @@ def load_config(path=None):
         save_config(cfg, path)
     except Exception:
         pass
-    # Decrypt sensitive fields
-    mqtt = cfg.get("mqtt", {})
-    for field in ENCRYPTED_FIELDS:
-        if field in mqtt:
-            mqtt[field] = decrypt_value(mqtt[field])
     return cfg
 
 
 def save_config(cfg, path=None):
-    """Save config to JSON file, encrypting sensitive fields."""
+    """Save config to JSON file."""
     path = path or LOCAL_CONFIG_FILE
     out = _deep_copy(cfg)
-    mqtt = out.get("mqtt", {})
-    for field in ENCRYPTED_FIELDS:
-        if field in mqtt and mqtt[field]:
-            mqtt[field] = encrypt_value(mqtt[field])
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp = path + ".tmp"
@@ -279,3 +224,100 @@ def get_system_info(output_dir=None):
         except Exception:
             pass
     return info
+
+
+# ---------------------------------------------------------------------------
+# Interactive console configuration
+# ---------------------------------------------------------------------------
+def _ask(prompt, default=""):
+    """Ask user for input with a default value."""
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{prompt}{suffix}: ").strip()
+    return val if val else default
+
+
+def _ask_bool(prompt, default=False):
+    """Ask user for yes/no."""
+    suffix = " [Y/n]" if default else " [y/N]"
+    val = input(f"{prompt}{suffix}: ").strip().lower()
+    if not val:
+        return default
+    return val in ("y", "yes", "1", "true", "да")
+
+
+def _ask_int(prompt, default=0):
+    """Ask user for integer."""
+    val = _ask(prompt, str(default))
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _ask_float(prompt, default=0.0):
+    """Ask user for float."""
+    val = _ask(prompt, str(default))
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+def configure_console_cannon(cfg, config_path=None):
+    """Interactive configuration for Canon camera console mode."""
+    cannon = cfg.get("cannon", {})
+    print("\n--- Canon Camera Configuration ---\n")
+
+    cannon["output_dir"] = _ask("Output directory for images", cannon.get("output_dir", ""))
+    cannon["schedule_file"] = _ask("Schedule file path", cannon.get("schedule_file", ""))
+    cannon["instance_name"] = _ask("Instance name (auto if empty)",
+                                    cannon.get("instance_name", ""))
+    secs_str = _ask("Capture seconds (comma-separated)",
+                     ", ".join(str(s) for s in cannon.get("capture_seconds", [0, 30])))
+    try:
+        cannon["capture_seconds"] = [int(s.strip()) for s in secs_str.split(",") if s.strip()]
+    except ValueError:
+        cannon["capture_seconds"] = [0, 30]
+
+    cfg["cannon"] = cannon
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
+def configure_console_sptt(cfg, config_path=None):
+    """Interactive configuration for SPTT camera console mode."""
+    sptt = cfg.get("sptt", {})
+    print("\n--- SPTT (CSDU-429) Camera Configuration ---\n")
+
+    sptt["output_dir"] = _ask("Output directory for FITS files", sptt.get("output_dir", ""))
+    sptt["instance_name"] = _ask("Instance name (auto if empty)",
+                                  sptt.get("instance_name", ""))
+    sptt["exposure"] = _ask_float("Exposure (seconds)", sptt.get("exposure", 0.88))
+    sptt["gain"] = _ask_int("Gain (0-1023)", sptt.get("gain", 100))
+    sptt["binning"] = _ask_int("Binning (0=1x1, 1=2x2, 3=4x4)", sptt.get("binning", 0))
+    enc = _ask_int("Encoding (0=8bit, 1=12bit)", sptt.get("encoding", 1))
+    sptt["encoding"] = enc if enc in (0, 1) else 1
+
+    cfg["sptt"] = sptt
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
+def _configure_mqtt(cfg):
+    """Interactive MQTT configuration (shared)."""
+    mqtt = cfg.get("mqtt", {})
+    if _ask_bool("Configure MQTT?", mqtt.get("enabled", False)):
+        mqtt["enabled"] = True
+        mqtt["host"] = _ask("MQTT broker host", mqtt.get("host", "broker.hivemq.com"))
+        mqtt["port"] = _ask_int("MQTT port", mqtt.get("port", 1883))
+        mqtt["user"] = _ask("MQTT username (optional)", mqtt.get("user", ""))
+        mqtt["password"] = _ask("MQTT password (optional)", mqtt.get("password", ""))
+        mqtt["prefix"] = _ask("MQTT topic prefix", mqtt.get("prefix", "every_camera"))
+        mqtt["tls"] = _ask_bool("Use TLS?", mqtt.get("tls", False))
+    else:
+        mqtt["enabled"] = False
+    cfg["mqtt"] = mqtt

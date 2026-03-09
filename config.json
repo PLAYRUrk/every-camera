@@ -1,32 +1,29 @@
 {
   "cannon": {
     "instance_name": "",
-    "output_dir": "/home/alex/output/",
+    "output_dir": "",
     "schedule_file": "",
-    "capture_seconds": [
-      0,
-      30
-    ],
+    "capture_seconds": [0, 30],
     "camcfg_file": ""
   },
   "sptt": {
     "instance_name": "",
-    "output_dir": "/home/alex/output/",
-    "exposure": 1000,
-    "gain": 1,
+    "output_dir": "",
+    "exposure": 0.88,
+    "gain": 100,
     "binning": 0,
     "encoding": 1,
     "target_temp": null,
     "firmware_dir": ""
   },
   "mqtt": {
-    "enabled": true,
-    "host": "92df86c5c516412c90f11f5d73473695.s1.eu.hivemq.cloud",
-    "port": "8883",
-    "user": "cannon_pub",
-    "password": "ENC:gAAAAABprPeUGhaECDiPFjOjZHAZLDjlmz81v4NGUj6RHXi7OOUchtV3ZEyYT9wQYzFjOJu4vqvcXiJtQSpV6Mwy7cZSB7r3VA==",
+    "enabled": false,
+    "host": "broker.hivemq.com",
+    "port": 1883,
+    "user": "",
+    "password": "",
     "prefix": "every_camera",
-    "tls": true
+    "tls": false
   },
   "status_dir": ""
 }

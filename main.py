@@ -9,8 +9,9 @@ Usage:
     python main.py --gui                   # GUI mode (all camera types)
     python main.py --gui --type cannon     # GUI mode, Canon only
     python main.py --gui --type sptt       # GUI mode, SPTT only
-    python main.py --gui --monitor         # Monitor-only GUI
     python main.py --config path.json      # Use custom config file
+
+Monitor is a separate program: python monitor_app.py
 """
 import argparse
 import sys
@@ -33,14 +34,13 @@ Camera types:
 
 In console mode (--type), the program runs headless.
 With a display available and no --type flag, GUI mode starts automatically.
+Monitor is a separate program: python monitor_app.py
         """,
     )
     parser.add_argument("--type", choices=["cannon", "sptt"],
                         help="Camera type (required for console mode)")
     parser.add_argument("--gui", action="store_true",
                         help="Force GUI mode")
-    parser.add_argument("--monitor", action="store_true",
-                        help="Open monitor only (GUI mode)")
     parser.add_argument("--config", default=None,
                         help="Path to config.json (default: config.json next to script)")
 
@@ -55,7 +55,7 @@ With a display available and no --type flag, GUI mode starts automatically.
         elif args.type == "sptt":
             from sptt_driver import run_console_sptt
             run_console_sptt(args.config)
-    elif args.gui or args.monitor or (can_use_gui() and not args.type):
+    elif args.gui or (can_use_gui() and not args.type):
         # GUI mode
         from gui_app import run_gui
         run_gui(args)

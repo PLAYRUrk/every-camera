@@ -97,8 +97,8 @@ def _extra_info(rec):
         if rec.get("shutterspeed"):
             parts.append(f"SS:{rec['shutterspeed']}")
     elif cam_type == "sptt":
-        if rec.get("exposure_us"):
-            parts.append(f"Exp:{rec['exposure_us']}us")
+        if rec.get("exposure_s") is not None:
+            parts.append(f"Exp:{rec['exposure_s']}s")
         if rec.get("gain") is not None:
             parts.append(f"G:{rec['gain']}")
         if rec.get("frame_size"):

@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QTextEdit,
-    QTableWidget, QTableWidgetItem, QComboBox, QSpinBox, QSlider,
+    QTableWidget, QTableWidgetItem, QComboBox, QSpinBox, QDoubleSpinBox, QSlider,
     QFileDialog, QHeaderView, QMessageBox, QGroupBox, QCheckBox,
     QAbstractItemView, QSizePolicy, QScrollArea, QStatusBar,
 )
@@ -662,8 +662,7 @@ class SpttScheduledWorkerQt(QThread):
                     metadata = {
                         "DATE-OBS": now.isoformat(),
                         "INSTRUME": "CSDU-429",
-                        "EXPTIME": self.cam.exposure / 1_000_000.0,
-                        "EXPOSURE": self.cam.exposure,
+                        "EXPTIME": self.cam.exposure,
                         "GAIN": self.cam.gain,
                         "BINNING": self.cam.binning,
                         "ENCODING": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
@@ -716,7 +715,7 @@ class SpttScheduledWorkerQt(QThread):
             "last_shot": self._last_shot.isoformat() if self._last_shot else None,
             "errors": self._errors,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
-            "exposure_us": self.cam.exposure,
+            "exposure_s": self.cam.exposure,
             "gain": self.cam.gain,
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
@@ -801,11 +800,12 @@ class SpttTab(QWidget):
         # Exposure / Gain
         grp_live = QGroupBox("Exposure / Gain")
         g = QGridLayout(grp_live)
-        g.addWidget(QLabel("Exposure (us):"), 0, 0)
-        self.spin_exp = QSpinBox()
-        self.spin_exp.setRange(6, 2_000_000_000)
-        self.spin_exp.setValue(880000)
-        self.spin_exp.setSingleStep(10000)
+        g.addWidget(QLabel("Exposure (s):"), 0, 0)
+        self.spin_exp = QDoubleSpinBox()
+        self.spin_exp.setRange(0.000006, 3600.0)
+        self.spin_exp.setValue(0.88)
+        self.spin_exp.setSingleStep(0.01)
+        self.spin_exp.setDecimals(6)
         g.addWidget(self.spin_exp, 0, 1)
         g.addWidget(QLabel("Gain:"), 1, 0)
         self.spin_gain = QSpinBox()
@@ -898,7 +898,7 @@ class SpttTab(QWidget):
         c = self._cfg.get("sptt", {})
         self.le_instance.setText(c.get("instance_name") or get_instance_name("SPTT"))
         self.le_output.setText(c.get("output_dir", ""))
-        self.spin_exp.setValue(c.get("exposure", 880000))
+        self.spin_exp.setValue(c.get("exposure", 0.88))
         self.spin_gain.setValue(c.get("gain", 100))
         self.combo_binning.setCurrentIndex(c.get("binning", 0))
         self.combo_encoding.setCurrentIndex(c.get("encoding", 1))
@@ -1253,17 +1253,7 @@ def run_gui(args):
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    if getattr(args, 'monitor', False):
-        # Monitor-only mode
-        from monitor import MonitorWidget
-        from PyQt5.QtWidgets import QMainWindow
-        win = QMainWindow()
-        win.setWindowTitle("Every Camera -- Monitor")
-        win.resize(1100, 500)
-        win.setCentralWidget(MonitorWidget(cfg.get("mqtt", {})))
-        win.show()
-    else:
-        win = MainWindow(cfg, camera_type)
-        win.show()
+    win = MainWindow(cfg, camera_type)
+    win.show()
 
     sys.exit(app.exec_())
