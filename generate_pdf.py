@@ -15,18 +15,42 @@ README_PATH = os.path.join(SCRIPT_DIR, "README.md")
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, "README.pdf")
 
 FONT_DIRS = [
+    # Linux
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/dejavu",
     "/usr/share/fonts/TTF",
+    # Windows
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
 ]
+
+# Font name mapping: try DejaVu first, fall back to Windows fonts
+FONT_CANDIDATES = {
+    "regular": ["DejaVuSans.ttf", "arial.ttf", "segoeui.ttf"],
+    "bold":    ["DejaVuSans-Bold.ttf", "arialbd.ttf", "segoeuib.ttf"],
+    "mono":    ["DejaVuSansMono.ttf", "consola.ttf", "cour.ttf"],
+}
 
 
 def find_font(name):
     for d in FONT_DIRS:
+        if not d:
+            continue
         path = os.path.join(d, name)
         if os.path.exists(path):
             return path
     return None
+
+
+def find_font_set():
+    """Find a matching set of regular/bold/mono fonts."""
+    for i in range(len(FONT_CANDIDATES["regular"])):
+        r = find_font(FONT_CANDIDATES["regular"][i])
+        b = find_font(FONT_CANDIDATES["bold"][i])
+        m = find_font(FONT_CANDIDATES["mono"][i])
+        if r and b and m:
+            return r, b, m
+    return None, None, None
 
 
 class DocPDF(FPDF):
@@ -69,14 +93,13 @@ def generate_pdf():
     with open(README_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    regular = find_font("DejaVuSans.ttf")
-    bold_f = find_font("DejaVuSans-Bold.ttf")
-    mono = find_font("DejaVuSansMono.ttf")
+    regular, bold_f, mono = find_font_set()
 
     if regular and bold_f and mono:
-        font_name = "DejaVu"
-        mono_name = "DejaVuMono"
+        font_name = "DocFont"
+        mono_name = "DocMono"
     else:
+        print("[WARN] No Unicode fonts found, PDF may have encoding issues")
         font_name = "Helvetica"
         mono_name = "Courier"
 
@@ -84,9 +107,9 @@ def generate_pdf():
     pdf.set_auto_page_break(auto=True, margin=15)
 
     if regular and bold_f and mono:
-        pdf.add_font("DejaVu", "", regular)
-        pdf.add_font("DejaVu", "B", bold_f)
-        pdf.add_font("DejaVuMono", "", mono)
+        pdf.add_font("DocFont", "", regular)
+        pdf.add_font("DocFont", "B", bold_f)
+        pdf.add_font("DocMono", "", mono)
 
     pdf.add_page()
 

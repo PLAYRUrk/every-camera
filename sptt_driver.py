@@ -1,6 +1,6 @@
 """
 SPTT (CSDU-429) camera driver: firmware loading, capture, FITS output, workers.
-Uses pyusb for camera control, imports firmware loader from SPTT-CAM submodule.
+Uses pyusb for camera control.
 """
 import os
 import sys
@@ -20,12 +20,7 @@ from utils import (
     write_status_file, get_instance_name, get_system_info, APP_DIR,
 )
 
-# Add SPTT-CAM to path for firmware loader
-_SPTT_DIR = os.path.join(APP_DIR, "SPTT-CAM")
-if _SPTT_DIR not in sys.path:
-    sys.path.insert(0, _SPTT_DIR)
-
-from load_firmware import (
+from sptt_load_firmware import (
     VID, PID_RAW, PID_CONFIGURED,
     find_libusb_backend, load_firmware_files, detach_kernel_driver,
     load_fx2_firmware, wait_for_configured_device, load_fpga_bitstream,
@@ -300,7 +295,10 @@ class SpttCamera:
             self._running = False
 
     def grab_frame(self):
-        for _ in range(500):
+        # Wait up to exposure_time + 5s for frame data in FIFO
+        max_wait = max(self.exposure + 5.0, 3.0)
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
             try:
                 sb, _ = read_crb(self.ep_wr, self.ep_rd)
             except usb.core.USBError:
@@ -308,7 +306,7 @@ class SpttCamera:
                 continue
             if not (sb & 0x08):
                 break
-            time.sleep(0.005)
+            time.sleep(0.05)
         else:
             raise RuntimeError("FIFO timeout — no frame data")
 
@@ -379,9 +377,8 @@ def ensure_firmware_loaded(backend):
         print("ERROR: No SPTT camera found!")
         return False
 
-    script_dir = _SPTT_DIR
     print("Loading firmware files...")
-    fx2_data, fpga_data = load_firmware_files(script_dir)
+    fx2_data, fpga_data = load_firmware_files()
 
     print(f"\nFound raw FX2 device: {VID:04x}:{PID_RAW:04x}")
     detach_kernel_driver(dev_raw)
