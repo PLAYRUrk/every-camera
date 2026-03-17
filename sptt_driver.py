@@ -56,7 +56,7 @@ ENCODING_12BPP = 1
 USB_CMD_TIMEOUT = 10000
 USB_READ_TIMEOUT = 10000
 
-# SPTT always captures at these seconds (no schedule)
+# Default capture seconds (can be overridden in config)
 SPTT_CAPTURE_SECONDS = [0, 30]
 
 
@@ -506,12 +506,13 @@ class SpttWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 mqtt_publisher=None, mqtt_prefix="every_camera"):
+                 capture_seconds=None, mqtt_publisher=None, mqtt_prefix="every_camera"):
         super().__init__(daemon=True)
         self.cam = cam
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
+        self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self._mqtt = mqtt_publisher
         self._mqtt_prefix = mqtt_prefix
         self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
@@ -579,7 +580,7 @@ class SpttWorkerConsole(threading.Thread):
             now = dt.now()
 
             fire_key = (now.minute, now.second)
-            if now.second in SPTT_CAPTURE_SECONDS and fire_key != last_fired:
+            if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 ok = self._capture_one(now)
                 if ok:
@@ -594,7 +595,7 @@ class SpttWorkerConsole(threading.Thread):
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         print(f"[ERROR] {consecutive_errors} consecutive errors, stopping")
                         break
-            elif now.second not in SPTT_CAPTURE_SECONDS:
+            elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
 
             self._stop_event.wait(0.1)
@@ -656,6 +657,7 @@ class SpttWorkerConsole(threading.Thread):
             "gain": self.cam.gain,
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
+            "capture_seconds": self.capture_seconds,
             "last_update": dt.now().isoformat(),
         }
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
@@ -701,6 +703,7 @@ def run_console_sptt(config_path=None):
     binning = sptt_cfg.get("binning", 0)
     encoding = sptt_cfg.get("encoding", ENCODING_12BPP)
     target_temp = sptt_cfg.get("target_temp")
+    capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
     print("=" * 60)
     print("  Every Camera — SPTT (CSDU-429) Console Mode")
@@ -709,7 +712,7 @@ def run_console_sptt(config_path=None):
     print(f"  Gain      : {gain}")
     print(f"  Binning   : {binning}")
     print(f"  Encoding  : {'12bit' if encoding == ENCODING_12BPP else '8bit'}")
-    print(f"  Captures at :00 and :30 of every minute")
+    print(f"  Capture at: {capture_seconds} seconds of each minute")
     print("=" * 60)
 
     if not output_dir:
@@ -724,6 +727,7 @@ def run_console_sptt(config_path=None):
         binning = sptt_cfg.get("binning", 0)
         encoding = sptt_cfg.get("encoding", ENCODING_12BPP)
         target_temp = sptt_cfg.get("target_temp")
+        capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
         print(f"  Instance  : {instance_name}")
         print(f"  Exposure  : {exposure} s")
         print(f"  Gain      : {gain}")
@@ -763,6 +767,7 @@ def run_console_sptt(config_path=None):
         output_dir=output_dir,
         instance_name=instance_name,
         status_dir=status_dir,
+        capture_seconds=capture_seconds,
         mqtt_publisher=mqtt_pub,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
     )

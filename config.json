@@ -17,7 +17,11 @@
     "binning": 0,
     "encoding": 1,
     "target_temp": null,
-    "firmware_dir": ""
+    "firmware_dir": "",
+    "capture_seconds": [
+      0,
+      30
+    ]
   },
   "mqtt": {
     "enabled": false,
