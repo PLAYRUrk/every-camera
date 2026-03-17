@@ -133,7 +133,13 @@ def get_changed_files(remote, branch):
 
 def get_local_modifications():
     """Get set of locally modified files (uncommitted changes)."""
-    output = run_git("status", "--porcelain")
+    try:
+        output = run_git("status", "--porcelain", "--ignore-submodules=all")
+    except RuntimeError:
+        # Broken submodule references can cause git status to fail;
+        # treat as no local modifications so the update can proceed.
+        print("[WARN] git status failed (broken submodule?), assuming no local changes.")
+        return set()
     modified = set()
     for line in output.splitlines():
         if len(line) < 4:
