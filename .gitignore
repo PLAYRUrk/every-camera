@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 camcfg_*.ini
 config.json
+.claude/
