@@ -29,6 +29,9 @@ SCHEDULE_LINE_RE = re.compile(
 # ---------------------------------------------------------------------------
 def can_use_gui():
     """Return True if a graphical display is available."""
+    import sys
+    if sys.platform in ("win32", "darwin"):
+        return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 

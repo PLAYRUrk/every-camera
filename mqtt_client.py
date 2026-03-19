@@ -120,8 +120,10 @@ try:
             self._host = host
             self._port = int(port)
             self._sub_topic = None
+            self._stopping = False
 
         def connect_broker(self):
+            self._stopping = False
             try:
                 self._client.reconnect_delay_set(min_delay=2, max_delay=30)
                 self._client.connect_async(self._host, self._port, keepalive=60)
@@ -130,6 +132,7 @@ try:
                 self.error.emit(str(e))
 
         def disconnect_broker(self):
+            self._stopping = True
             try:
                 self._client.loop_stop()
                 self._client.disconnect()
@@ -158,7 +161,8 @@ try:
 
         def _on_disconnect(self, client, userdata, disconnect_flags=None,
                            reason_code=None, properties=None):
-            self.disconnected.emit()
+            if self._stopping:
+                self.disconnected.emit()
 
         def _on_message(self, client, userdata, msg):
             try:
@@ -189,8 +193,10 @@ try:
             self._host = host
             self._port = int(port)
             self._topics = []
+            self._stopping = False
 
         def connect_broker(self, topic):
+            self._stopping = False
             self._topics = [topic] if isinstance(topic, str) else list(topic)
             try:
                 self._client.reconnect_delay_set(min_delay=2, max_delay=30)
@@ -214,6 +220,7 @@ try:
                 pass
 
         def disconnect_broker(self):
+            self._stopping = True
             try:
                 self._client.loop_stop()
                 self._client.disconnect()
@@ -230,7 +237,8 @@ try:
 
         def _on_disconnect(self, client, userdata, disconnect_flags=None,
                            reason_code=None, properties=None):
-            self.disconnected.emit()
+            if self._stopping:
+                self.disconnected.emit()
 
         def _on_message(self, client, userdata, msg):
             try:
