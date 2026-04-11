@@ -251,7 +251,13 @@ class CannonTab(QWidget):
         self._countdown_timer.start()
 
     def _build_ui(self):
-        lay = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
 
         # Camera connection
         cam_box = QGroupBox("Canon Camera")
@@ -299,8 +305,7 @@ class CannonTab(QWidget):
                                                      "End (YYYY-MM-DD HH:MM:SS)"])
         self.sched_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.sched_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.sched_table.setMinimumHeight(100)
-        sched_lay.addWidget(self.sched_table)
+        sched_lay.addWidget(self.sched_table, 1)
 
         sched_btns = QHBoxLayout()
         btn_add = QPushButton("+ Add")
@@ -317,7 +322,7 @@ class CannonTab(QWidget):
         sched_btns.addWidget(btn_load)
         sched_btns.addWidget(btn_save)
         sched_lay.addLayout(sched_btns)
-        lay.addWidget(sched_box)
+        lay.addWidget(sched_box, 1)
 
         # Control
         ctrl_box = QGroupBox("Control")
@@ -346,6 +351,9 @@ class CannonTab(QWidget):
         ctrl_lay.addStretch()
         ctrl_lay.addWidget(self.lbl_countdown)
         lay.addWidget(ctrl_box)
+
+        scroll.setWidget(panel)
+        outer.addWidget(scroll)
 
     def _load_config(self):
         c = self._cfg.get("cannon", {})
@@ -824,11 +832,12 @@ class SpttTab(QWidget):
 
     def _build_ui(self):
         main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(2, 2, 2, 2)
 
         # Left: image display
         self.image_label = QLabel("No image")
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(400, 300)
+        self.image_label.setMinimumSize(200, 150)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet("background-color: #1a1a1a; color: #888;")
         main_layout.addWidget(self.image_label, stretch=3)
@@ -836,9 +845,11 @@ class SpttTab(QWidget):
         # Right: controls
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumWidth(360)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll.setMinimumWidth(250)
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         # Connection
         grp_conn = QGroupBox("Connection")
@@ -1464,11 +1475,12 @@ class InfraTab(QWidget):
 
     def _build_ui(self):
         main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(2, 2, 2, 2)
 
         # Left: image display
         self.image_label = QLabel("Camera not connected")
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(640, 512)
+        self.image_label.setMinimumSize(200, 150)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet("background-color: #1a1a2e; color: #888; font-size: 14px;")
         main_layout.addWidget(self.image_label, stretch=3)
@@ -1476,9 +1488,11 @@ class InfraTab(QWidget):
         # Right: controls
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumWidth(380)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll.setMinimumWidth(250)
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
 
         # Connection
         grp_conn = QGroupBox("Infra Camera (SW1300)")
@@ -1946,6 +1960,7 @@ class MainWindow(QMainWindow):
     def __init__(self, cfg, camera_type=None):
         super().__init__()
         self.setWindowTitle("Every Camera")
+        self.setMinimumSize(700, 450)
         self.resize(1100, 750)
         self._cfg = cfg
         self._tabs = {}
@@ -1955,15 +1970,18 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(6)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(4)
+        root.setContentsMargins(6, 6, 6, 6)
 
-        # MQTT settings bar
+        # MQTT settings bar (collapsible)
         mqtt_box = QGroupBox("MQTT")
         mqtt_box.setCheckable(True)
-        mqtt_box.setChecked(self._cfg.get("mqtt", {}).get("enabled", False))
+        mqtt_enabled = self._cfg.get("mqtt", {}).get("enabled", False)
+        mqtt_box.setChecked(mqtt_enabled)
         self._mqtt_box = mqtt_box
-        mqtt_grid = QGridLayout(mqtt_box)
+        mqtt_content = QWidget()
+        mqtt_grid = QGridLayout(mqtt_content)
+        mqtt_grid.setContentsMargins(4, 2, 4, 2)
         mqtt_grid.setColumnStretch(1, 1)
         mqtt_grid.addWidget(QLabel("Host:"), 0, 0)
         self.le_mqtt_host = QLineEdit(self._cfg.get("mqtt", {}).get("host", "broker.hivemq.com"))
@@ -1988,6 +2006,11 @@ class MainWindow(QMainWindow):
         self.cb_mqtt_tls.stateChanged.connect(
             lambda s: self.le_mqtt_port.setText("8883" if s else "1883"))
         mqtt_grid.addWidget(self.cb_mqtt_tls, 1, 2)
+        mqtt_box_lay = QVBoxLayout(mqtt_box)
+        mqtt_box_lay.setContentsMargins(0, 0, 0, 0)
+        mqtt_box_lay.addWidget(mqtt_content)
+        mqtt_content.setVisible(mqtt_enabled)
+        mqtt_box.toggled.connect(mqtt_content.setVisible)
         root.addWidget(mqtt_box)
 
         # Tabs
@@ -2021,7 +2044,8 @@ class MainWindow(QMainWindow):
         log_lay.setContentsMargins(4, 4, 4, 4)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFixedHeight(120)
+        self.log_text.setMinimumHeight(60)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setFont(QFont("Monospace", 9))
         log_lay.addWidget(self.log_text)
         root.addWidget(log_box)
