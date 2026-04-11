@@ -31,13 +31,14 @@ def main():
 Camera types:
   cannon    Canon DSLR cameras via gphoto2 (schedule-based capture)
   sptt      CSDU-429 scientific camera via USB (captures at :00 and :30, FITS output)
+  infra     SW1300 SWIR camera (Tanho THCAMSW1300, schedule-based capture, TIFF/PNG)
 
 In console mode (--type), the program runs headless.
 With a display available and no --type flag, GUI mode starts automatically.
 Monitor is a separate program: python monitor_app.py
         """,
     )
-    parser.add_argument("--type", choices=["cannon", "sptt"],
+    parser.add_argument("--type", choices=["cannon", "sptt", "infra"],
                         help="Camera type (required for console mode)")
     parser.add_argument("--gui", action="store_true",
                         help="Force GUI mode")
@@ -55,13 +56,16 @@ Monitor is a separate program: python monitor_app.py
         elif args.type == "sptt":
             from sptt_driver import run_console_sptt
             run_console_sptt(args.config)
+        elif args.type == "infra":
+            from infra_driver import run_console_infra
+            run_console_infra(args.config)
     elif args.gui or (can_use_gui() and not args.type):
         # GUI mode
         from gui_app import run_gui
         run_gui(args)
     else:
         # No display, no --type
-        print("Error: No display available. Use --type <cannon|sptt> for console mode.")
+        print("Error: No display available. Use --type <cannon|sptt|infra> for console mode.")
         print("       Or use --gui to force GUI mode (requires DISPLAY).")
         parser.print_help()
         sys.exit(1)

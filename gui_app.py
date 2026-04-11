@@ -7,6 +7,7 @@ import sys
 import time
 import json
 import argparse
+import threading
 
 import numpy as np
 
@@ -1184,6 +1185,760 @@ class SpttTab(QWidget):
 
 
 # ===========================================================================
+# Infra (SW1300 SWIR) GUI components
+# ===========================================================================
+
+class InfraCaptureThread(QThread):
+    """Continuous frame capture thread for Infra camera live preview."""
+    frame_ready = pyqtSignal(np.ndarray)
+    fps_updated = pyqtSignal(float)
+    error_occurred = pyqtSignal(str)
+    roi_changed = pyqtSignal(int, int)
+
+    def __init__(self, camera):
+        super().__init__()
+        self.camera = camera
+        self._running = False
+        self._pending_exposure = None
+        self._pending_gain = None
+        self._pending_roi = None
+        self._lock = threading.Lock()
+
+    def run(self):
+        self._running = True
+        frame_count = 0
+        fps_timer = time.monotonic()
+        consecutive_errors = 0
+
+        while self._running:
+            try:
+                self._process_pending()
+                frame = self.camera.grab_frame()
+                self.frame_ready.emit(frame)
+                consecutive_errors = 0
+
+                frame_count += 1
+                now = time.monotonic()
+                elapsed = now - fps_timer
+                if elapsed >= 1.0:
+                    self.fps_updated.emit(frame_count / elapsed)
+                    frame_count = 0
+                    fps_timer = now
+
+            except Exception as e:
+                consecutive_errors += 1
+                self.error_occurred.emit(str(e))
+                if consecutive_errors >= 10:
+                    self.error_occurred.emit("10 consecutive errors, capture stopped")
+                    break
+
+    def stop(self):
+        self._running = False
+        self.wait(5000)
+
+    def request_exposure(self, microseconds):
+        with self._lock:
+            self._pending_exposure = microseconds
+
+    def request_gain(self, gain):
+        with self._lock:
+            self._pending_gain = gain
+
+    def request_roi(self, width, height):
+        with self._lock:
+            self._pending_roi = (width, height)
+
+    def _process_pending(self):
+        with self._lock:
+            exposure = self._pending_exposure
+            gain = self._pending_gain
+            roi = self._pending_roi
+            self._pending_exposure = None
+            self._pending_gain = None
+            self._pending_roi = None
+
+        if roi is not None:
+            self.camera.set_roi(*roi)
+            self.roi_changed.emit(*roi)
+        if exposure is not None:
+            self.camera.set_exposure(exposure)
+        if gain is not None:
+            self.camera.set_gain(gain)
+
+
+class InfraWorkerQt(QThread):
+    """Schedule-based capture worker for Infra camera (GUI mode)."""
+    log_msg = pyqtSignal(str, str)
+    shot_taken = pyqtSignal(int)
+    status_msg = pyqtSignal(str)
+    countdown = pyqtSignal(str)
+    error_count = pyqtSignal(int)
+    finished = pyqtSignal()
+
+    MAX_CONSECUTIVE_ERRORS = 5
+
+    def __init__(self, cam, schedule, output_dir, instance_name,
+                 status_dir, capture_seconds, save_format="tiff",
+                 mqtt_publisher=None, mqtt_prefix="every_camera"):
+        super().__init__()
+        self.cam = cam
+        self.schedule = schedule
+        self.output_dir = output_dir
+        self.instance_name = instance_name
+        self.status_dir = status_dir
+        self.capture_seconds = sorted(capture_seconds)
+        self.save_format = save_format
+        self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
+        self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
+        self._stop = False
+        self._shots = 0
+        self._errors = 0
+        self._last_shot = None
+        self._last_frame = None
+        self._active_until = None
+        self._status_path = os.path.join(status_dir, f"{os.getpid()}_infra.json")
+
+    def request_stop(self):
+        self._stop = True
+
+    def _setup_command_listener(self):
+        if self._mqtt:
+            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
+            self._mqtt.command_received.connect(self._on_mqtt_command)
+            self._mqtt.subscribe_commands(cmd_topic)
+
+    def _on_mqtt_command(self, topic, payload):
+        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
+            import base64
+            from infra_driver import frame_to_jpeg_bytes
+            jpeg_data = frame_to_jpeg_bytes(self._last_frame)
+            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+            frame_payload = json.dumps({
+                "camera_type": "infra",
+                "instance_name": self.instance_name,
+                "format": "jpeg",
+                "data": base64.b64encode(jpeg_data).decode(),
+                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            self.log_msg.emit("Frame sent via MQTT", "info")
+
+    def run(self):
+        from infra_driver import save_tiff, save_png
+
+        last_fired = (-1, -1)
+        consecutive_errors = 0
+        os.makedirs(self.status_dir, exist_ok=True)
+
+        self._setup_command_listener()
+        self.log_msg.emit("Infra measurement started", "info")
+        self.status_msg.emit("Running")
+        self._save_status("running")
+
+        while not self._stop:
+            now = dt.now()
+
+            active_end = None
+            for entry in self.schedule:
+                if entry.start <= now <= entry.end:
+                    active_end = entry.end
+                    break
+
+            if active_end is None:
+                self.status_msg.emit("Waiting for schedule")
+                self._save_status("waiting")
+                self.countdown.emit("--")
+                self.msleep(500)
+                continue
+
+            self._active_until = active_end
+
+            sec = now.second + now.microsecond / 1_000_000
+            next_secs = [s for s in self.capture_seconds if s > sec]
+            if next_secs:
+                remaining = next_secs[0] - sec
+            else:
+                remaining = (60 - sec) + self.capture_seconds[0]
+            self.countdown.emit(f"{remaining:.1f}s")
+
+            fire_key = (now.minute, now.second)
+            if now.second in self.capture_seconds and fire_key != last_fired:
+                last_fired = fire_key
+                timestamp = now.strftime("%Y%m%dT%H%M%S")
+                ext = "tiff" if self.save_format == "tiff" else "png"
+                filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
+                try:
+                    frame = self.cam.grab_frame()
+                    if self.save_format == "tiff":
+                        save_tiff(filepath, frame)
+                    else:
+                        save_png(filepath, frame)
+                    self._last_frame = frame
+                    self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
+                    consecutive_errors = 0
+                    self._shots += 1
+                    self._last_shot = now
+                    self.shot_taken.emit(self._shots)
+                    self.status_msg.emit("Running")
+                    self._save_status("running")
+                except Exception as e:
+                    self.log_msg.emit(f"Capture error: {e}", "error")
+                    consecutive_errors += 1
+                    self._errors += 1
+                    self.error_count.emit(self._errors)
+                    self._save_status("error")
+                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                        self.log_msg.emit(
+                            f"Stopped: {consecutive_errors} consecutive errors", "error")
+                        break
+            elif now.second not in self.capture_seconds:
+                last_fired = (-1, -1)
+
+            self.msleep(100)
+
+        self._save_status("stopped")
+        self._delete_status()
+        self.log_msg.emit("Infra measurement stopped", "info")
+        self.finished.emit()
+
+    def _save_status(self, status):
+        payload = {
+            "instance_name": self.instance_name,
+            "camera_type": "infra",
+            "pid": os.getpid(),
+            "status": status,
+            "shots_taken": self._shots,
+            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
+            "active_until": self._active_until.isoformat() if self._active_until else None,
+            "errors": self._errors,
+            "capture_seconds": self.capture_seconds,
+            "exposure_us": self.cam.exposure_us,
+            "gain": self.cam.gain,
+            "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
+            "last_update": dt.now().isoformat(),
+        }
+        try:
+            payload["system"] = get_system_info(self.output_dir)
+        except Exception:
+            pass
+        try:
+            write_status_file(self._status_path, payload)
+        except Exception:
+            pass
+        if self._mqtt:
+            try:
+                self._mqtt.publish(self._mqtt_topic, json.dumps(payload), retain=True)
+            except Exception:
+                pass
+
+    def _delete_status(self):
+        try:
+            os.remove(self._status_path)
+        except FileNotFoundError:
+            pass
+
+
+class InfraTab(QWidget):
+    """Infra camera (SW1300 SWIR) control tab: live preview + scheduled measurement."""
+
+    def __init__(self, cfg, log_fn):
+        super().__init__()
+        self._cfg = cfg
+        self._log = log_fn
+        self.cam = None
+        self.capture_thread = None
+        self.worker = None
+        self.last_frame = None
+        self.frame_count = 0
+        self.fps_time = time.time()
+        self.fps = 0.0
+        self._mqtt_pub = None
+        self._build_ui()
+        self._load_config()
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(200)
+        self._countdown_timer.timeout.connect(self._update_idle_countdown)
+        self._countdown_timer.start()
+
+    def _build_ui(self):
+        main_layout = QHBoxLayout(self)
+
+        # Left: image display
+        self.image_label = QLabel("Camera not connected")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumSize(640, 512)
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.image_label.setStyleSheet("background-color: #1a1a2e; color: #888; font-size: 14px;")
+        main_layout.addWidget(self.image_label, stretch=3)
+
+        # Right: controls
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumWidth(380)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        # Connection
+        grp_conn = QGroupBox("Infra Camera (SW1300)")
+        gl = QVBoxLayout(grp_conn)
+        self.btn_connect = QPushButton("Connect")
+        self.btn_connect.clicked.connect(self._on_connect)
+        gl.addWidget(self.btn_connect)
+        self.lbl_cam_status = QLabel("Not connected")
+        self.lbl_cam_status.setStyleSheet("color:#cc0000; font-weight:bold;")
+        gl.addWidget(self.lbl_cam_status)
+
+        h = QHBoxLayout()
+        self.btn_preview_start = QPushButton("Live Preview")
+        self.btn_preview_stop = QPushButton("Stop Preview")
+        self.btn_preview_start.setEnabled(False)
+        self.btn_preview_stop.setEnabled(False)
+        self.btn_preview_start.clicked.connect(self._on_preview_start)
+        self.btn_preview_stop.clicked.connect(self._on_preview_stop)
+        h.addWidget(self.btn_preview_start)
+        h.addWidget(self.btn_preview_stop)
+        gl.addLayout(h)
+
+        self.lbl_fps = QLabel("FPS: --")
+        self.lbl_fps.setStyleSheet("font-weight:bold;")
+        gl.addWidget(self.lbl_fps)
+        layout.addWidget(grp_conn)
+
+        # Exposure / Gain
+        grp_exp = QGroupBox("Exposure / Gain")
+        g = QGridLayout(grp_exp)
+
+        g.addWidget(QLabel("Exposure (us):"), 0, 0)
+        self.exp_slider = QSlider(Qt.Horizontal)
+        self.exp_slider.setRange(15, 100000)
+        self.exp_slider.setValue(1000)
+        g.addWidget(self.exp_slider, 1, 0, 1, 2)
+        self.exp_spinbox = QDoubleSpinBox()
+        self.exp_spinbox.setRange(15, 60_000_000)
+        self.exp_spinbox.setValue(1000)
+        self.exp_spinbox.setSuffix(" us")
+        self.exp_spinbox.setDecimals(1)
+        g.addWidget(self.exp_spinbox, 0, 1)
+        self.btn_set_exp = QPushButton("Set")
+        self.btn_set_exp.clicked.connect(self._on_set_exposure)
+        g.addWidget(self.btn_set_exp, 0, 2)
+
+        self.exp_slider.valueChanged.connect(lambda v: self.exp_spinbox.setValue(v))
+        self.exp_spinbox.valueChanged.connect(
+            lambda v: self.exp_slider.setValue(int(v)) if v <= self.exp_slider.maximum() else None
+        )
+
+        g.addWidget(QLabel("Gain (0-120):"), 2, 0)
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setRange(0, 120)
+        self.gain_slider.setValue(0)
+        g.addWidget(self.gain_slider, 3, 0, 1, 2)
+        self.gain_spinbox = QSpinBox()
+        self.gain_spinbox.setRange(0, 120)
+        self.gain_spinbox.setValue(0)
+        g.addWidget(self.gain_spinbox, 2, 1)
+        self.btn_set_gain = QPushButton("Set")
+        self.btn_set_gain.clicked.connect(self._on_set_gain)
+        g.addWidget(self.btn_set_gain, 2, 2)
+
+        self.gain_slider.valueChanged.connect(self.gain_spinbox.setValue)
+        self.gain_spinbox.valueChanged.connect(self.gain_slider.setValue)
+
+        layout.addWidget(grp_exp)
+
+        # ROI
+        grp_roi = QGroupBox("ROI")
+        roi_lay = QHBoxLayout(grp_roi)
+        self.roi_combo = QComboBox()
+        self.roi_combo.addItems(["1280x1024", "1280x256"])
+        roi_lay.addWidget(self.roi_combo)
+        self.btn_set_roi = QPushButton("Set ROI")
+        self.btn_set_roi.clicked.connect(self._on_set_roi)
+        roi_lay.addWidget(self.btn_set_roi)
+        layout.addWidget(grp_roi)
+
+        # Save format
+        grp_fmt = QGroupBox("Save Format")
+        fmt_lay = QHBoxLayout(grp_fmt)
+        self.combo_format = QComboBox()
+        self.combo_format.addItems(["tiff", "png"])
+        fmt_lay.addWidget(QLabel("Format:"))
+        fmt_lay.addWidget(self.combo_format)
+        layout.addWidget(grp_fmt)
+
+        # Scheduled measurement
+        grp_meas = QGroupBox("Scheduled Measurement")
+        meas_lay = QVBoxLayout(grp_meas)
+
+        m_grid = QGridLayout()
+        m_grid.addWidget(QLabel("Instance:"), 0, 0)
+        self.le_instance = QLineEdit()
+        m_grid.addWidget(self.le_instance, 0, 1)
+        m_grid.addWidget(QLabel("Output dir:"), 1, 0)
+        self.le_output = QLineEdit()
+        btn_browse = QPushButton("...")
+        btn_browse.setMaximumWidth(40)
+        btn_browse.clicked.connect(lambda: self._browse_dir(self.le_output))
+        m_grid.addWidget(self.le_output, 1, 1)
+        m_grid.addWidget(btn_browse, 1, 2)
+        m_grid.addWidget(QLabel("Capture seconds:"), 2, 0)
+        self.le_cap_seconds = QLineEdit("0, 30")
+        self.le_cap_seconds.setToolTip("Comma-separated seconds of each minute")
+        m_grid.addWidget(self.le_cap_seconds, 2, 1, 1, 2)
+        meas_lay.addLayout(m_grid)
+
+        # Schedule table
+        self.sched_table = QTableWidget(0, 2)
+        self.sched_table.setHorizontalHeaderLabels(["Start", "End"])
+        self.sched_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.sched_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sched_table.setMinimumHeight(80)
+        self.sched_table.setMaximumHeight(140)
+        meas_lay.addWidget(self.sched_table)
+
+        sched_btns = QHBoxLayout()
+        btn_add = QPushButton("+ Add")
+        btn_add.clicked.connect(self._add_schedule_row)
+        btn_del = QPushButton("- Remove")
+        btn_del.clicked.connect(self._del_schedule_row)
+        btn_load = QPushButton("Load...")
+        btn_load.clicked.connect(self._load_schedule)
+        btn_save_sched = QPushButton("Save...")
+        btn_save_sched.clicked.connect(self._save_schedule)
+        sched_btns.addWidget(btn_add)
+        sched_btns.addWidget(btn_del)
+        sched_btns.addStretch()
+        sched_btns.addWidget(btn_load)
+        sched_btns.addWidget(btn_save_sched)
+        meas_lay.addLayout(sched_btns)
+
+        meas_ctrl = QHBoxLayout()
+        self.btn_meas_start = QPushButton("START")
+        self.btn_meas_start.setEnabled(False)
+        self.btn_meas_start.setStyleSheet(
+            "background:#2a7a2a; color:white; font-weight:bold; padding:6px 18px;")
+        self.btn_meas_stop = QPushButton("STOP")
+        self.btn_meas_stop.setEnabled(False)
+        self.btn_meas_stop.setStyleSheet(
+            "background:#7a2a2a; color:white; font-weight:bold; padding:6px 18px;")
+        self.btn_meas_start.clicked.connect(self._on_meas_start)
+        self.btn_meas_stop.clicked.connect(self._on_meas_stop)
+        meas_ctrl.addWidget(self.btn_meas_start)
+        meas_ctrl.addWidget(self.btn_meas_stop)
+        meas_lay.addLayout(meas_ctrl)
+
+        self.lbl_meas_status = QLabel("Idle")
+        self.lbl_meas_status.setStyleSheet("font-weight:bold; color:#555;")
+        self.lbl_meas_shots = QLabel("Shots: 0")
+        self.lbl_meas_errors = QLabel("")
+        self.lbl_meas_countdown = QLabel("")
+        info_lay = QHBoxLayout()
+        info_lay.addWidget(QLabel("Status:"))
+        info_lay.addWidget(self.lbl_meas_status)
+        info_lay.addSpacing(8)
+        info_lay.addWidget(self.lbl_meas_shots)
+        info_lay.addWidget(self.lbl_meas_errors)
+        info_lay.addStretch()
+        info_lay.addWidget(self.lbl_meas_countdown)
+        meas_lay.addLayout(info_lay)
+
+        layout.addWidget(grp_meas)
+        layout.addStretch()
+
+        scroll.setWidget(panel)
+        main_layout.addWidget(scroll, stretch=1)
+
+    def _load_config(self):
+        c = self._cfg.get("infra", {})
+        self.le_instance.setText(c.get("instance_name") or get_instance_name("Infra"))
+        self.le_output.setText(c.get("output_dir", ""))
+        secs = c.get("capture_seconds", [0, 30])
+        self.le_cap_seconds.setText(", ".join(str(s) for s in secs))
+        self.exp_spinbox.setValue(c.get("exposure_us", 1000.0))
+        self.gain_spinbox.setValue(c.get("gain", 0))
+        roi = c.get("roi", "1280x1024")
+        idx = self.roi_combo.findText(roi)
+        if idx >= 0:
+            self.roi_combo.setCurrentIndex(idx)
+        fmt = c.get("save_format", "tiff")
+        idx_fmt = self.combo_format.findText(fmt)
+        if idx_fmt >= 0:
+            self.combo_format.setCurrentIndex(idx_fmt)
+
+    def _browse_dir(self, le):
+        d = QFileDialog.getExistingDirectory(self, "Select directory")
+        if d:
+            le.setText(d)
+
+    def _parse_capture_seconds(self):
+        text = self.le_cap_seconds.text()
+        try:
+            secs = [int(s.strip()) for s in text.split(",") if s.strip()]
+            return [s for s in secs if 0 <= s < 60]
+        except ValueError:
+            return [0, 30]
+
+    # --- Camera connection ---
+    def _on_connect(self):
+        self._log("Connecting to Infra camera...", "info")
+        self.btn_connect.setEnabled(False)
+        self.lbl_cam_status.setText("Connecting...")
+        self.lbl_cam_status.setStyleSheet("color:#888; font-weight:bold;")
+        QApplication.processEvents()
+
+        try:
+            from infra_driver import TanhoCamera
+            self.cam = TanhoCamera()
+            self.cam.connect()
+            self.cam.set_exposure(self.exp_spinbox.value())
+            self.cam.set_gain(self.gain_spinbox.value())
+            roi_text = self.roi_combo.currentText()
+            w, h = [int(x) for x in roi_text.split("x")]
+            self.cam.set_roi(w, h)
+
+            self.lbl_cam_status.setText(f"Connected: {self.cam.roi_width}x{self.cam.roi_height}")
+            self.lbl_cam_status.setStyleSheet("color:#007700; font-weight:bold;")
+            self.btn_preview_start.setEnabled(True)
+            self.btn_meas_start.setEnabled(True)
+            self._log(f"Infra camera connected: {self.cam.roi_width}x{self.cam.roi_height}", "info")
+        except Exception as e:
+            self.lbl_cam_status.setText("Connection failed")
+            self.lbl_cam_status.setStyleSheet("color:#cc0000; font-weight:bold;")
+            self.btn_connect.setEnabled(True)
+            QMessageBox.critical(self, "Connection Error", str(e))
+            self._log(f"Infra connection failed: {e}", "error")
+
+    # --- Live preview ---
+    def _on_preview_start(self):
+        if not self.cam:
+            return
+        self.capture_thread = InfraCaptureThread(self.cam)
+        self.capture_thread.frame_ready.connect(self._on_frame)
+        self.capture_thread.fps_updated.connect(self._on_fps)
+        self.capture_thread.error_occurred.connect(self._on_preview_error)
+        self.capture_thread.roi_changed.connect(self._on_roi_changed)
+        self.capture_thread.start()
+        self.btn_preview_start.setEnabled(False)
+        self.btn_preview_stop.setEnabled(True)
+        self._log("Live preview started", "info")
+
+    def _on_preview_stop(self):
+        if self.capture_thread:
+            self.capture_thread.stop()
+            self.capture_thread = None
+        self.btn_preview_start.setEnabled(self.cam is not None)
+        self.btn_preview_stop.setEnabled(False)
+
+    def _on_frame(self, frame_16):
+        from infra_driver import ADC_MAX
+        self.last_frame = frame_16
+        frame_8 = np.clip(frame_16 * (255.0 / ADC_MAX), 0, 255).astype(np.uint8)
+        h, w = frame_8.shape
+        qimg = QImage(frame_8.data, w, h, w, QImage.Format_Grayscale8)
+        label_size = self.image_label.size()
+        pixmap = QPixmap.fromImage(qimg).scaled(
+            label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setPixmap(pixmap)
+
+    def _on_fps(self, fps):
+        self.lbl_fps.setText(f"FPS: {fps:.1f}")
+
+    def _on_preview_error(self, msg):
+        self._log(f"Preview error: {msg}", "error")
+
+    def _on_roi_changed(self, w, h):
+        self.lbl_cam_status.setText(f"Connected: {w}x{h}")
+
+    # --- Camera controls ---
+    def _on_set_exposure(self):
+        value = self.exp_spinbox.value()
+        if self.capture_thread:
+            self.capture_thread.request_exposure(value)
+        elif self.cam:
+            self.cam.set_exposure(value)
+        self._log(f"Exposure set: {value} us", "info")
+
+    def _on_set_gain(self):
+        value = self.gain_spinbox.value()
+        if self.capture_thread:
+            self.capture_thread.request_gain(value)
+        elif self.cam:
+            self.cam.set_gain(value)
+        self._log(f"Gain set: {value}", "info")
+
+    def _on_set_roi(self):
+        roi_text = self.roi_combo.currentText()
+        w, h = [int(x) for x in roi_text.split("x")]
+        if self.capture_thread:
+            self.capture_thread.request_roi(w, h)
+        elif self.cam:
+            self.cam.set_roi(w, h)
+        self._log(f"ROI set: {w}x{h}", "info")
+
+    # --- Schedule helpers ---
+    def _add_schedule_row(self):
+        row = self.sched_table.rowCount()
+        self.sched_table.insertRow(row)
+        now = dt.now().replace(second=0, microsecond=0)
+        end = now.replace(hour=23, minute=59)
+        self.sched_table.setItem(row, 0, QTableWidgetItem(now.strftime(SCHEDULE_DT_FMT)))
+        self.sched_table.setItem(row, 1, QTableWidgetItem(end.strftime(SCHEDULE_DT_FMT)))
+
+    def _del_schedule_row(self):
+        rows = sorted({idx.row() for idx in self.sched_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.sched_table.removeRow(r)
+
+    def _load_schedule(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load schedule", "", "Text files (*.txt);;All (*)")
+        if not path:
+            return
+        entries, errors = load_schedule_file(path)
+        if errors:
+            QMessageBox.warning(self, "Parse errors", "\n".join(errors))
+        self.sched_table.setRowCount(0)
+        for e in entries:
+            row = self.sched_table.rowCount()
+            self.sched_table.insertRow(row)
+            self.sched_table.setItem(row, 0, QTableWidgetItem(e.start.strftime(SCHEDULE_DT_FMT)))
+            self.sched_table.setItem(row, 1, QTableWidgetItem(e.end.strftime(SCHEDULE_DT_FMT)))
+        self._log(f"Loaded {len(entries)} schedule intervals", "info")
+
+    def _save_schedule(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save schedule", "", "Text files (*.txt);;All (*)")
+        if not path:
+            return
+        entries, errors = parse_schedule_text(self._table_to_text())
+        if errors:
+            QMessageBox.warning(self, "Errors", "\n".join(errors))
+            return
+        save_schedule_file(path, entries)
+        self._log(f"Saved {len(entries)} intervals", "info")
+
+    def _table_to_text(self):
+        lines = []
+        for row in range(self.sched_table.rowCount()):
+            s = self.sched_table.item(row, 0)
+            e = self.sched_table.item(row, 1)
+            if s and e:
+                lines.append(f"{s.text().strip()} - {e.text().strip()}")
+        return "\n".join(lines)
+
+    # --- Scheduled measurement ---
+    def _on_meas_start(self):
+        if not self.cam:
+            QMessageBox.warning(self, "No camera", "Connect Infra camera first.")
+            return
+        output_dir = self.le_output.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "No output", "Select output directory.")
+            return
+
+        entries, errors = parse_schedule_text(self._table_to_text())
+        if errors:
+            QMessageBox.warning(self, "Schedule errors", "\n".join(errors))
+            return
+
+        # Stop preview if running
+        if self.capture_thread:
+            self._on_preview_stop()
+
+        status_dir = self._cfg.get("status_dir") or HOME_STATUS_DIR
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(status_dir, exist_ok=True)
+
+        instance_name = self.le_instance.text().strip() or get_instance_name("Infra")
+        capture_seconds = self._parse_capture_seconds()
+        save_format = self.combo_format.currentText()
+        mqtt_cfg = self._cfg.get("mqtt", {})
+
+        self._mqtt_pub = None
+        if mqtt_cfg.get("enabled") and MQTT_AVAILABLE:
+            try:
+                self._mqtt_pub = MqttPublisher(
+                    host=mqtt_cfg.get("host", ""),
+                    port=mqtt_cfg.get("port", 1883),
+                    user=mqtt_cfg.get("user", ""),
+                    password=mqtt_cfg.get("password", ""),
+                    use_tls=mqtt_cfg.get("tls", False),
+                )
+                self._mqtt_pub.connect_broker()
+            except Exception as e:
+                self._log(f"MQTT failed: {e}", "warn")
+                self._mqtt_pub = None
+
+        self.worker = InfraWorkerQt(
+            cam=self.cam,
+            schedule=entries,
+            output_dir=output_dir,
+            instance_name=instance_name,
+            status_dir=status_dir,
+            capture_seconds=capture_seconds,
+            save_format=save_format,
+            mqtt_publisher=self._mqtt_pub,
+            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+        )
+        self.worker.log_msg.connect(self._log)
+        self.worker.shot_taken.connect(lambda n: self.lbl_meas_shots.setText(f"Shots: {n}"))
+        self.worker.status_msg.connect(self._on_meas_status_msg)
+        self.worker.countdown.connect(lambda t: self.lbl_meas_countdown.setText(f"Next: {t}"))
+        self.worker.error_count.connect(
+            lambda n: self.lbl_meas_errors.setText(f"Errors: {n}" if n else ""))
+        self.worker.finished.connect(self._on_meas_finished)
+        self.worker.start()
+
+        self.btn_meas_start.setEnabled(False)
+        self.btn_meas_stop.setEnabled(True)
+        self.btn_preview_start.setEnabled(False)
+
+    def _on_meas_stop(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.request_stop()
+            self.worker.wait(5000)
+        if self._mqtt_pub:
+            self._mqtt_pub.disconnect_broker()
+            self._mqtt_pub = None
+        self.btn_meas_stop.setEnabled(False)
+        self.btn_meas_start.setEnabled(self.cam is not None)
+        self.btn_preview_start.setEnabled(self.cam is not None)
+        self._on_meas_status_msg("Idle")
+        self.lbl_meas_countdown.setText("")
+
+    def _on_meas_finished(self):
+        self.btn_meas_stop.setEnabled(False)
+        self.btn_meas_start.setEnabled(self.cam is not None)
+        self.btn_preview_start.setEnabled(self.cam is not None)
+        self._on_meas_status_msg("Idle")
+
+    def _on_meas_status_msg(self, msg):
+        colors = {"Running": "#007700", "Waiting for schedule": "#aa6600",
+                  "Idle": "#555", "Stopped": "#555"}
+        self.lbl_meas_status.setText(msg)
+        self.lbl_meas_status.setStyleSheet(f"font-weight:bold; color:{colors.get(msg, '#555')};")
+
+    def _update_idle_countdown(self):
+        if self.worker and self.worker.isRunning():
+            return
+        now = dt.now()
+        sec = now.second + now.microsecond / 1_000_000
+        cap_secs = self._parse_capture_seconds()
+        next_secs = [s for s in cap_secs if s > sec]
+        if next_secs:
+            remaining = next_secs[0] - sec
+        else:
+            remaining = (60 - sec) + (cap_secs[0] if cap_secs else 0)
+        self.lbl_meas_countdown.setText(f"Next: {remaining:.1f}s")
+
+    def cleanup(self):
+        self._on_meas_stop()
+        self._on_preview_stop()
+        if self.cam:
+            self.cam.disconnect()
+
+
+# ===========================================================================
 # Main Window
 # ===========================================================================
 
@@ -1247,6 +2002,11 @@ class MainWindow(QMainWindow):
             self._sptt_tab = SpttTab(self._cfg, self._log)
             self.tab_widget.addTab(self._sptt_tab, "SPTT Camera")
             self._tabs["sptt"] = self._sptt_tab
+
+        if camera_type is None or camera_type == "infra":
+            self._infra_tab = InfraTab(self._cfg, self._log)
+            self.tab_widget.addTab(self._infra_tab, "Infra Camera")
+            self._tabs["infra"] = self._infra_tab
 
         # Monitor tab
         mqtt_cfg = self._cfg.get("mqtt", {})

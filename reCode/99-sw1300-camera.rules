@@ -1,0 +1,3 @@
+# Tanho SW1300 SWIR Camera (Cypress FX3)
+# Скопируйте в /etc/udev/rules.d/ и выполните: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="aa55", ATTR{idProduct}=="8866", MODE="0666", GROUP="plugdev"

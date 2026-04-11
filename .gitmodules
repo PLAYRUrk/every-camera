@@ -1,6 +1,9 @@
 [submodule "cannon-camera"]
 	path = cannon-camera
-	url = https://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@github.com/PLAYRUrk/cannon-camera.git
+	url = https://github.com/PLAYRUrk/cannon-camera.git
 [submodule "SPTT-CAM"]
 	path = SPTT-CAM
-	url = https://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@github.com/PLAYRUrk/SPTT-CAM.git
+	url = https://github.com/PLAYRUrk/SPTT-CAM.git
+[submodule "infra-camera"]
+	path = infra-camera
+	url = https://github.com/PLAYRUrk/infra-camera.git

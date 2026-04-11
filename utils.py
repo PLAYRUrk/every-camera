@@ -78,6 +78,16 @@ DEFAULT_CONFIG = {
         "target_temp": None,
         "firmware_dir": "",
     },
+    "infra": {
+        "instance_name": "",
+        "output_dir": "",
+        "schedule_file": "",
+        "capture_seconds": [0, 30],
+        "exposure_us": 1000.0,
+        "gain": 0,
+        "roi": "1280x1024",
+        "save_format": "tiff",
+    },
     "mqtt": {
         "enabled": False,
         "host": "broker.hivemq.com",
@@ -305,6 +315,36 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["encoding"] = enc if enc in (0, 1) else 1
 
     cfg["sptt"] = sptt
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
+def configure_console_infra(cfg, config_path=None):
+    """Interactive configuration for Infra camera console mode."""
+    infra = cfg.get("infra", {})
+    print("\n--- Infra Camera (SW1300 SWIR) Configuration ---\n")
+
+    infra["output_dir"] = _ask("Output directory for images", infra.get("output_dir", ""))
+    infra["schedule_file"] = _ask("Schedule file path", infra.get("schedule_file", ""))
+    infra["instance_name"] = _ask("Instance name (auto if empty)",
+                                   infra.get("instance_name", ""))
+    secs_str = _ask("Capture seconds (comma-separated)",
+                     ", ".join(str(s) for s in infra.get("capture_seconds", [0, 30])))
+    try:
+        infra["capture_seconds"] = [int(s.strip()) for s in secs_str.split(",") if s.strip()]
+    except ValueError:
+        infra["capture_seconds"] = [0, 30]
+
+    infra["exposure_us"] = _ask_float("Exposure (microseconds)", infra.get("exposure_us", 1000.0))
+    infra["gain"] = _ask_int("Gain (0-120)", infra.get("gain", 0))
+    roi = _ask("ROI (1280x256 or 1280x1024)", infra.get("roi", "1280x1024"))
+    infra["roi"] = roi if roi in ("1280x256", "1280x1024") else "1280x1024"
+    fmt = _ask("Save format (tiff or png)", infra.get("save_format", "tiff"))
+    infra["save_format"] = fmt if fmt in ("tiff", "png") else "tiff"
+
+    cfg["infra"] = infra
     _configure_mqtt(cfg)
 
     save_config(cfg, config_path)

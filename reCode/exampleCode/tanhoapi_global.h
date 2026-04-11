@@ -1,0 +1,13 @@
+#ifndef TANHOAPI_GLOBAL_H
+#define TANHOAPI_GLOBAL_H
+
+#include <QtCore/qglobal.h>
+
+
+#if defined(TANHOAPI_LIBRARY)
+#  define TANHOAPISHARED_EXPORT Q_DECL_EXPORT
+#else
+#  define TANHOAPISHARED_EXPORT Q_DECL_IMPORT
+#endif
+
+#endif // TANHOAPI_GLOBAL_H
