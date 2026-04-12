@@ -1336,7 +1336,7 @@ class InfraWorkerQt(QThread):
             self.log_msg.emit("Frame sent via MQTT", "info")
 
     def run(self):
-        from infra_driver import save_tiff, save_png
+        from infra_driver import save_tiff, save_png, save_fits
 
         last_fired = (-1, -1)
         consecutive_errors = 0
@@ -1377,11 +1377,18 @@ class InfraWorkerQt(QThread):
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
-                ext = "tiff" if self.save_format == "tiff" else "png"
+                ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
+                ext = ext_map.get(self.save_format, "tiff")
                 filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
                 try:
                     frame = self.cam.grab_frame()
-                    if self.save_format == "tiff":
+                    if self.save_format == "fits":
+                        roi_str = f"{self.cam.roi_width}x{self.cam.roi_height}"
+                        save_fits(filepath, frame,
+                                  exposure_us=self.cam.exposure_us,
+                                  gain=self.cam.gain,
+                                  roi=roi_str)
+                    elif self.save_format == "tiff":
                         save_tiff(filepath, frame)
                     else:
                         save_png(filepath, frame)
@@ -1577,7 +1584,7 @@ class InfraTab(QWidget):
         grp_fmt = QGroupBox("Save Format")
         fmt_lay = QHBoxLayout(grp_fmt)
         self.combo_format = QComboBox()
-        self.combo_format.addItems(["tiff", "png"])
+        self.combo_format.addItems(["tiff", "png", "fits"])
         fmt_lay.addWidget(QLabel("Format:"))
         fmt_lay.addWidget(self.combo_format)
         layout.addWidget(grp_fmt)

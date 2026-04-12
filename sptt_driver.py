@@ -686,7 +686,52 @@ class SpttWorkerConsole(threading.Thread):
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_sptt(config_path=None):
+def run_preview_sptt(cam, instance_name):
+    """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
+    from PIL import Image
+
+    preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
+    tmp_path = preview_path + ".tmp"
+    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+
+    stop = threading.Event()
+
+    def _sigint(sig, frame):
+        print("\n[INFO] Stopping preview...")
+        stop.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    cam.start()
+    frames = 0
+    t0 = dt.now()
+    try:
+        while not stop.is_set():
+            try:
+                frame = cam.grab_frame()
+                if frame.dtype == np.uint16:
+                    fmax = int(frame.max())
+                    if fmax > 0:
+                        display = (frame.astype(np.float32) / fmax * 255).astype(np.uint8)
+                    else:
+                        display = frame.astype(np.uint8)
+                else:
+                    display = frame
+                img = Image.fromarray(display, mode="L")
+                img.save(tmp_path, format="PNG")
+                os.replace(tmp_path, preview_path)
+                frames += 1
+                if frames % 10 == 0:
+                    elapsed = (dt.now() - t0).total_seconds()
+                    fps = frames / elapsed if elapsed > 0 else 0
+                    print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+            except Exception as exc:
+                print(f"[ERROR] Preview frame error: {exc}")
+                time.sleep(0.1)
+    finally:
+        cam.stop()
+
+
+def run_console_sptt(config_path=None, preview=False):
     """Run SPTT camera measurement in console mode."""
     from utils import load_config
     from mqtt_client import create_console_publisher
@@ -706,14 +751,38 @@ def run_console_sptt(config_path=None):
     capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
     print("=" * 60)
-    print("  Every Camera — SPTT (CSDU-429) Console Mode")
+    print("  Every Camera — SPTT (CSDU-429) Console Mode" + ("  [PREVIEW]" if preview else ""))
     print(f"  Instance  : {instance_name}")
     print(f"  Exposure  : {exposure} s")
     print(f"  Gain      : {gain}")
     print(f"  Binning   : {binning}")
     print(f"  Encoding  : {'12bit' if encoding == ENCODING_12BPP else '8bit'}")
-    print(f"  Capture at: {capture_seconds} seconds of each minute")
+    if not preview:
+        print(f"  Capture at: {capture_seconds} seconds of each minute")
     print("=" * 60)
+
+    if preview:
+        print("[INFO] Initializing SPTT camera...")
+        backend = find_libusb_backend()
+        if not ensure_firmware_loaded(backend):
+            print("[ERROR] Failed to initialize camera.")
+            sys.exit(1)
+        time.sleep(1)
+        cam = SpttCamera(backend)
+        try:
+            cam.open()
+            cam.configure(exposure=exposure, gain=gain, binning=binning,
+                          encoding=encoding, target_temp=target_temp)
+            print(f"[INFO] Camera ready: {cam.w}x{cam.h}")
+        except Exception as exc:
+            print(f"[ERROR] Failed to configure camera: {exc}")
+            sys.exit(1)
+        try:
+            run_preview_sptt(cam, instance_name)
+        finally:
+            cam.close()
+        print("[INFO] Done.")
+        return
 
     if not output_dir:
         print("[INFO] Configuration incomplete. Starting setup wizard...")

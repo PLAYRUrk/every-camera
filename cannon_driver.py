@@ -426,7 +426,42 @@ class CannonWorkerConsole(threading.Thread):
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_cannon(config_path=None):
+def run_preview_cannon(cam, instance_name):
+    """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
+    preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
+    tmp_path = preview_path + ".tmp"
+    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+
+    stop = threading.Event()
+
+    def _sigint(sig, frame):
+        print("\n[INFO] Stopping preview...")
+        stop.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    from PIL import Image
+    frames = 0
+    t0 = dt.now()
+    while not stop.is_set():
+        try:
+            try:
+                jpeg_bytes = cam.get_preview()
+            except Exception:
+                jpeg_bytes = capture_image(cam)
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            img.save(tmp_path, format="PNG")
+            os.replace(tmp_path, preview_path)
+            frames += 1
+            if frames % 10 == 0:
+                elapsed = (dt.now() - t0).total_seconds()
+                fps = frames / elapsed if elapsed > 0 else 0
+                print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+        except Exception as exc:
+            print(f"[ERROR] Preview frame error: {exc}")
+            sleep(0.2)
+
+
+def run_console_cannon(config_path=None, preview=False):
     """Run Canon camera measurement in console mode."""
     from utils import load_config
     from mqtt_client import create_console_publisher
@@ -442,10 +477,27 @@ def run_console_cannon(config_path=None):
     capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
 
     print("=" * 60)
-    print("  Every Camera — Canon Console Mode")
+    print("  Every Camera — Canon Console Mode" + ("  [PREVIEW]" if preview else ""))
     print(f"  Instance      : {instance_name}")
-    print(f"  Capture at    : {capture_seconds} seconds of each minute")
+    if not preview:
+        print(f"  Capture at    : {capture_seconds} seconds of each minute")
     print("=" * 60)
+
+    if preview:
+        print("[INFO] Releasing camera USB...")
+        release_camera_usb()
+        try:
+            cam = gp.Camera()
+        except Exception as exc:
+            print(f"[ERROR] Failed to connect camera: {exc}")
+            sys.exit(1)
+        config = cam._get_config()
+        model_name = detect_model(config)
+        print(f"[INFO] Connected: {model_name}")
+        apply_camcfg(config, model_name)
+        run_preview_cannon(cam, instance_name)
+        print("[INFO] Done.")
+        return
 
     if not output_dir or not schedule_file:
         print("[INFO] Configuration incomplete. Starting setup wizard...")

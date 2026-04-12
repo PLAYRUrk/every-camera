@@ -341,8 +341,8 @@ def configure_console_infra(cfg, config_path=None):
     infra["gain"] = _ask_int("Gain (0-120)", infra.get("gain", 0))
     roi = _ask("ROI (1280x256 or 1280x1024)", infra.get("roi", "1280x1024"))
     infra["roi"] = roi if roi in ("1280x256", "1280x1024") else "1280x1024"
-    fmt = _ask("Save format (tiff or png)", infra.get("save_format", "tiff"))
-    infra["save_format"] = fmt if fmt in ("tiff", "png") else "tiff"
+    fmt = _ask("Save format (tiff, png or fits)", infra.get("save_format", "tiff"))
+    infra["save_format"] = fmt if fmt in ("tiff", "png", "fits") else "tiff"
 
     cfg["infra"] = infra
     _configure_mqtt(cfg)

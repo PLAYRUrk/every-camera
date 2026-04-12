@@ -356,6 +356,25 @@ class TanhoCamera:
 # ---------------------------------------------------------------------------
 # Image saving
 # ---------------------------------------------------------------------------
+def save_fits(filepath, frame_16, exposure_us=None, gain=None, roi=None):
+    """Save 16-bit frame as FITS with metadata header."""
+    from astropy.io import fits
+    hdu = fits.PrimaryHDU(data=frame_16)
+    hdr = hdu.header
+    hdr['INSTRUME'] = ('THCAMSW1300', 'Camera model')
+    hdr['SENSOR'] = ('IMX990-AABA-C', 'Sensor model')
+    hdr['BITPIX'] = (16, 'Bits per pixel')
+    hdr['DATE-OBS'] = (dt.utcnow().isoformat(), 'Observation date (UTC)')
+    if exposure_us is not None:
+        hdr['EXPTIME'] = (exposure_us / 1e6, 'Exposure time (seconds)')
+        hdr['EXPTUS'] = (exposure_us, 'Exposure time (microseconds)')
+    if gain is not None:
+        hdr['GAIN'] = (gain, 'Camera gain')
+    if roi is not None:
+        hdr['ROI'] = (roi, 'Region of interest')
+    hdu.writeto(filepath, overwrite=True)
+
+
 def save_tiff(filepath, frame_16):
     """Save 16-bit frame as TIFF using cv2 or PIL."""
     try:
@@ -511,11 +530,18 @@ class InfraWorkerConsole(threading.Thread):
 
     def _capture_one(self, now):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
-        ext = "tiff" if self.save_format == "tiff" else "png"
+        ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
+        ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
         try:
             frame = self.cam.grab_frame()
-            if self.save_format == "tiff":
+            if self.save_format == "fits":
+                roi_str = f"{self.cam.roi_width}x{self.cam.roi_height}"
+                save_fits(filepath, frame,
+                          exposure_us=self.cam.exposure_us,
+                          gain=self.cam.gain,
+                          roi=roi_str)
+            elif self.save_format == "tiff":
                 save_tiff(filepath, frame)
             else:
                 save_png(filepath, frame)
@@ -567,7 +593,37 @@ class InfraWorkerConsole(threading.Thread):
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_infra(config_path=None):
+def run_preview_infra(cam, instance_name):
+    """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
+    preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
+    tmp_path = preview_path + ".tmp"
+    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+
+    stop = threading.Event()
+
+    def _sigint(sig, frame):
+        print("\n[INFO] Stopping preview...")
+        stop.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    frames = 0
+    t0 = dt.now()
+    while not stop.is_set():
+        try:
+            frame = cam.grab_frame()
+            save_png(tmp_path, frame)
+            os.replace(tmp_path, preview_path)
+            frames += 1
+            if frames % 10 == 0:
+                elapsed = (dt.now() - t0).total_seconds()
+                fps = frames / elapsed if elapsed > 0 else 0
+                print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+        except Exception as exc:
+            print(f"[ERROR] Preview frame error: {exc}")
+            time.sleep(0.1)
+
+
+def run_console_infra(config_path=None, preview=False):
     """Run Infra camera measurement in console mode."""
     from utils import load_config
     from mqtt_client import create_console_publisher
@@ -587,14 +643,37 @@ def run_console_infra(config_path=None):
     save_format = infra_cfg.get("save_format", "tiff")
 
     print("=" * 60)
-    print("  Every Camera -- Infra (SW1300 SWIR) Console Mode")
+    print("  Every Camera -- Infra (SW1300 SWIR) Console Mode" + ("  [PREVIEW]" if preview else ""))
     print(f"  Instance      : {instance_name}")
-    print(f"  Capture at    : {capture_seconds} seconds of each minute")
+    if not preview:
+        print(f"  Capture at    : {capture_seconds} seconds of each minute")
     print(f"  Exposure      : {exposure_us} us")
     print(f"  Gain          : {gain_val}")
     print(f"  ROI           : {roi}")
-    print(f"  Save format   : {save_format}")
+    if not preview:
+        print(f"  Save format   : {save_format}")
     print("=" * 60)
+
+    if preview:
+        print("[INFO] Connecting to Infra camera...")
+        cam = TanhoCamera()
+        try:
+            cam.connect()
+        except Exception as exc:
+            print(f"[ERROR] Failed to connect camera: {exc}")
+            sys.exit(1)
+        cam.set_exposure(exposure_us)
+        cam.set_gain(gain_val)
+        if roi in ROI_MODES:
+            w, h = ROI_MODES[roi]
+            cam.set_roi(w, h)
+        print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height}")
+        try:
+            run_preview_infra(cam, instance_name)
+        finally:
+            cam.disconnect()
+        print("[INFO] Done.")
+        return
 
     if not output_dir or not schedule_file:
         print("[INFO] Configuration incomplete. Starting setup wizard...")

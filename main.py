@@ -44,6 +44,9 @@ Monitor is a separate program: python monitor_app.py
                         help="Force GUI mode")
     parser.add_argument("--config", default=None,
                         help="Path to config.json (default: config.json next to script)")
+    parser.add_argument("--preview", action="store_true",
+                        help="Focus/sharpness preview mode: continuously overwrite "
+                             "preview_{cam_name}.png at max FPS (console mode only)")
 
     args = parser.parse_args()
 
@@ -52,13 +55,13 @@ Monitor is a separate program: python monitor_app.py
         # Explicit console mode
         if args.type == "cannon":
             from cannon_driver import run_console_cannon
-            run_console_cannon(args.config)
+            run_console_cannon(args.config, preview=args.preview)
         elif args.type == "sptt":
             from sptt_driver import run_console_sptt
-            run_console_sptt(args.config)
+            run_console_sptt(args.config, preview=args.preview)
         elif args.type == "infra":
             from infra_driver import run_console_infra
-            run_console_infra(args.config)
+            run_console_infra(args.config, preview=args.preview)
     elif args.gui or (can_use_gui() and not args.type):
         # GUI mode
         from gui_app import run_gui
