@@ -71,12 +71,15 @@ INFRA_CAPTURE_SECONDS = [0, 30]
 def _find_library() -> str:
     """Find libTanhoAPI.so relative to this module."""
     base = Path(__file__).resolve().parent
+    # Prefer the real file first (symlinks may not work on all systems)
     candidates = [
-        base / "infra_lib" / "libTanhoAPI.so",
         base / "infra_lib" / "libTanhoAPI.so.1.0.0",
+        base / "infra_lib" / "libTanhoAPI.so",
     ]
     for path in candidates:
-        if path.exists():
+        if path.is_file() and not path.is_symlink() or (
+            path.is_symlink() and path.resolve().is_file()
+        ):
             return str(path)
     raise FileNotFoundError(
         "libTanhoAPI.so not found. Check infra_lib/ directory:\n"
@@ -116,12 +119,6 @@ class TanhoCamera:
 
     def _load_library(self):
         lib_path = _find_library()
-        # Add library directory to LD_LIBRARY_PATH
-        lib_dir = os.path.dirname(lib_path)
-        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if lib_dir not in ld_path:
-            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_path}"
-
         self._lib = ctypes.CDLL(lib_path)
 
         self._driver_init = self._lib._ZN8TanhoAPI19TanhoCam_DriverInitEj
