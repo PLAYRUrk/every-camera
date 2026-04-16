@@ -12,3 +12,8 @@ Pillow>=9.0
 # SPTT camera (CSDU-429)
 pyusb>=1.2
 astropy>=5.0
+
+# Infra camera (SW1300)
+# Python deps: numpy (already above), ctypes (stdlib)
+# System deps (install via apt):
+#   sudo apt install libusb-1.0-0 libqt5gui5 libqt5core5a libgl1-mesa-glx
