@@ -56,25 +56,30 @@ def compute_sun_on_off(date, location, angle):
     from astropy.coordinates import get_sun, AltAz
     from astropy.time import Time
 
+    # Shift search window to local solar day so sunrise always precedes sunset.
+    # Local solar time offset ≈ longitude / 15 hours.
+    lon_deg = location.lon.degree
+    utc_offset_hours = lon_deg / 15.0
+    search_start = date - timedelta(hours=utc_offset_hours)
+
     prev_alt = None
     sunrise_time = None
     sunset_time = None
 
-    for h in range(24):
-        for m in range(60):
-            t = date + timedelta(hours=h, minutes=m)
-            astro_time = Time(t, scale='utc')
-            altaz = AltAz(obstime=astro_time, location=location)
-            sun_alt = get_sun(astro_time).transform_to(altaz).alt.degree
+    for minutes in range(24 * 60):
+        t = search_start + timedelta(minutes=minutes)
+        astro_time = Time(t, scale='utc')
+        altaz = AltAz(obstime=astro_time, location=location)
+        sun_alt = get_sun(astro_time).transform_to(altaz).alt.degree
 
-            if prev_alt is not None:
-                rising = sun_alt > prev_alt
-                if rising and sunrise_time is None and sun_alt > angle and sun_alt < angle + 1:
-                    sunrise_time = t
-                if not rising and sunset_time is None and sun_alt < angle:
-                    sunset_time = t
+        if prev_alt is not None:
+            # Detect the moment the sun crosses the angle threshold
+            if sunrise_time is None and prev_alt <= angle and sun_alt > angle:
+                sunrise_time = t
+            if sunrise_time is not None and sunset_time is None and prev_alt >= angle and sun_alt < angle:
+                sunset_time = t
 
-            prev_alt = sun_alt
+        prev_alt = sun_alt
 
     return sunrise_time, sunset_time
 
