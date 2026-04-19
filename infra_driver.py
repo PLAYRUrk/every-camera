@@ -722,7 +722,7 @@ class InfraWorkerConsole(threading.Thread):
 def run_preview_infra(cam, instance_name):
     """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
-    tmp_path = preview_path + ".tmp"
+    tmp_path = preview_path
     print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
 
     stop = threading.Event()
