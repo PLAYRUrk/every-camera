@@ -245,21 +245,39 @@ class TanhoCamera:
 
         timeouts = 0
         errors = 0
+        data_chunks = 0
         first_data_idx = -1
+        last_data_idx = -1
         t_start = time.perf_counter()
         t_first_data = None
+        t_last_data = None
+        cur_to_run = 0
+        longest_to_run = 0
+        longest_to_run_start = -1
         for i in range(self._num_chunks):
             ret = self._bulk_transfer(
                 devh, USB_EP_IN, self._usb_chunk, USB_CHUNK_SIZE,
                 ctypes.byref(self._transferred), USB_TIMEOUT
             )
-            if ret == -7:  # LIBUSB_ERROR_TIMEOUT
+            got_data = (ret == 0 and self._transferred.value > 0)
+            if ret == -7 or (ret == 0 and self._transferred.value == 0):
                 timeouts += 1
+                cur_to_run += 1
+                if cur_to_run > longest_to_run:
+                    longest_to_run = cur_to_run
+                    longest_to_run_start = i - cur_to_run + 1
             elif ret != 0:
                 errors += 1
-            elif self._transferred.value > 0 and first_data_idx < 0:
-                first_data_idx = i
-                t_first_data = time.perf_counter()
+                cur_to_run = 0
+            else:
+                cur_to_run = 0
+            if got_data:
+                data_chunks += 1
+                if first_data_idx < 0:
+                    first_data_idx = i
+                    t_first_data = time.perf_counter()
+                last_data_idx = i
+                t_last_data = time.perf_counter()
             ctypes.memmove(
                 buf_addr + i * USB_CHUNK_SIZE,
                 self._usb_chunk,
@@ -270,11 +288,14 @@ class TanhoCamera:
         if verbose_timing:
             wait_ms = ((t_first_data or t_end) - t_start) * 1000.0
             total_ms = (t_end - t_start) * 1000.0
+            data_span_ms = ((t_last_data - t_first_data) * 1000.0
+                            if t_first_data and t_last_data else 0.0)
             print(f"[INFRA] _read_frame_usb: chunks={self._num_chunks} "
-                  f"timeouts={timeouts} errors={errors} "
-                  f"first_data_chunk={first_data_idx} "
-                  f"wait_until_data={wait_ms:.1f}ms total={total_ms:.1f}ms",
-                  flush=True)
+                  f"data={data_chunks} timeouts={timeouts} errors={errors} "
+                  f"first_data={first_data_idx} last_data={last_data_idx} "
+                  f"longest_timeout_run={longest_to_run}@{longest_to_run_start} "
+                  f"wait_until_data={wait_ms:.1f}ms data_span={data_span_ms:.1f}ms "
+                  f"total={total_ms:.1f}ms", flush=True)
 
         buf_bytes = ctypes.string_at(buf_addr, self._usb_buf_size)
         pos = buf_bytes.find(SYNC_MARKER)
@@ -539,19 +560,8 @@ class InfraWorkerConsole(threading.Thread):
         errors = []
         changed = False
         try:
-            if "exposure_us" in params:
-                self.cam.set_exposure(float(params["exposure_us"]))
-                applied["exposure_us"] = float(params["exposure_us"])
-                changed = True
-            elif "exposure" in params:
-                exp_us = float(params["exposure"]) * 1_000_000
-                self.cam.set_exposure(exp_us)
-                applied["exposure_us"] = exp_us
-                changed = True
-            if "gain" in params:
-                self.cam.set_gain(int(params["gain"]))
-                applied["gain"] = int(params["gain"])
-                changed = True
+            # ROI must be applied BEFORE exposure/gain — set_roi() resets the
+            # exposure register on this camera.
             if "roi_width" in params or "roi_height" in params:
                 w = int(params.get("roi_width", self.cam.roi_width))
                 h = int(params.get("roi_height", self.cam.roi_height))
@@ -559,6 +569,26 @@ class InfraWorkerConsole(threading.Thread):
                 applied["roi_width"] = w
                 applied["roi_height"] = h
                 changed = True
+                time.sleep(0.05)
+            exp_us = None
+            if "exposure_us" in params:
+                exp_us = float(params["exposure_us"])
+            elif "exposure" in params:
+                exp_us = float(params["exposure"]) * 1_000_000
+            if exp_us is not None:
+                self.cam.set_exposure(exp_us)
+                applied["exposure_us"] = exp_us
+                changed = True
+                time.sleep(0.05)
+            if "gain" in params:
+                self.cam.set_gain(int(params["gain"]))
+                applied["gain"] = int(params["gain"])
+                changed = True
+                time.sleep(0.05)
+            if exp_us is not None:
+                # Final re-apply guarantees the requested exposure is the last
+                # register write, regardless of earlier command side effects.
+                self.cam.set_exposure(exp_us)
         except Exception as e:
             errors.append(str(e))
         if changed:
@@ -606,6 +636,10 @@ class InfraWorkerConsole(threading.Thread):
             applied, errors = self._apply_params(params)
             for err in errors:
                 print(f"[WARN] Param apply: {err}")
+            try:
+                self.cam._flush_usb()
+            except Exception:
+                pass
             t_before = time.perf_counter()
             print(f"[INFRA] On-demand grab start: exposure_us={self.cam.exposure_us}",
                   flush=True)
@@ -743,6 +777,12 @@ class InfraWorkerConsole(threading.Thread):
         ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
         try:
+            # Reset USB pipeline between captures — after any idle period the
+            # host-side FIFO or the camera itself can stop cooperating.
+            try:
+                self.cam._flush_usb()
+            except Exception:
+                pass
             t_before = time.perf_counter()
             frame = self.cam.grab_frame(verbose_timing=True)
             delta_ms = (time.perf_counter() - t_before) * 1000.0
@@ -936,13 +976,24 @@ def run_console_infra(config_path=None, preview=False):
         print(f"[ERROR] Failed to connect camera: {exc}")
         sys.exit(1)
 
-    # Apply settings
-    cam.set_exposure(exposure_us)
-    cam.set_gain(gain_val)
+    # Apply settings: ORDER MATTERS — set_roi() on this camera resets the
+    # internal exposure/gain registers, so we must configure ROI FIRST and
+    # apply exposure/gain AFTER. Small sleeps give the firmware time to
+    # latch each command.
     if roi in ROI_MODES:
         w, h = ROI_MODES[roi]
         cam.set_roi(w, h)
-    print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height}")
+        time.sleep(0.05)
+    cam.set_exposure(exposure_us)
+    time.sleep(0.05)
+    cam.set_gain(gain_val)
+    time.sleep(0.05)
+    # Re-apply exposure as a final write to guarantee the camera ends in the
+    # requested state regardless of any prior persisted register values.
+    cam.set_exposure(exposure_us)
+    time.sleep(0.05)
+    print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height} "
+          f"exposure_us={exposure_us} gain={gain_val}")
 
     # Let the camera settle after exposure/gain/ROI so the first scheduled
     # frame is actually captured with the configured exposure, not a stale
