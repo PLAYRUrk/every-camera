@@ -232,8 +232,10 @@ class TanhoCamera:
         self._raw_w = raw_w
         self._raw_h = raw_h
         self._frame_size = self._roi_width * self._roi_height * BYTES_PER_PIXEL
-        chunks_per_frame = (self._frame_size + USB_CHUNK_SIZE - 1) // USB_CHUNK_SIZE
-        self._num_chunks = chunks_per_frame * 3
+        self._chunks_per_frame = (self._frame_size + USB_CHUNK_SIZE - 1) // USB_CHUNK_SIZE
+        # Allocate enough slack (×3) to guarantee a full frame is captured
+        # even when sync marker falls near a buffer boundary.
+        self._num_chunks = self._chunks_per_frame * 3
         self._usb_buf_size = self._num_chunks * USB_CHUNK_SIZE
         self._usb_buffer = (ctypes.c_ubyte * self._usb_buf_size)()
         self._usb_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
