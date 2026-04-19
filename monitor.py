@@ -373,7 +373,6 @@ class MqttTab(QWidget):
 
         self.btn_get_frame = QPushButton("View Last Frame")
         self.btn_get_frame.setEnabled(False)
-        self.btn_capture_frame.setEnabled(False)
         self.btn_get_frame.setToolTip("Request last frame from selected instance")
         self.btn_get_frame.clicked.connect(self._on_request_frame)
         footer_lay.addWidget(self.btn_get_frame)
