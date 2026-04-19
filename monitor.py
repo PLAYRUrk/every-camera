@@ -31,6 +31,7 @@ from utils import HOME_STATUS_DIR
 STALE_THRESHOLD_SECONDS = 30
 LOCAL_REFRESH_INTERVAL_MS = 5000
 FRAME_REQUEST_TIMEOUT_MS = 10000
+ON_DEMAND_TIMEOUT_MS = 60000
 
 TABLE_COLUMNS = [
     "Instance Name", "Type", "PID", "Status",
@@ -496,6 +497,7 @@ class MqttTab(QWidget):
 
         if self._subscriber:
             self._subscriber.publish(cmd_topic, b"", retain=False)
+            print(f"[monitor] Published cmd: {cmd_topic}", flush=True)
             self.lbl_footer.setText(f"Frame requested from {instance_name}...")
 
             # Open viewer dialog
@@ -538,8 +540,10 @@ class MqttTab(QWidget):
             return
         prefix = self.le_prefix.text().strip() or "every_camera"
         cmd_topic = f"{prefix}/{instance_name}/cmd/capture_frame"
-        self._subscriber.publish(
-            cmd_topic, json.dumps(params).encode("utf-8"), retain=False)
+        payload_bytes = json.dumps(params).encode("utf-8")
+        self._subscriber.publish(cmd_topic, payload_bytes, retain=False)
+        print(f"[monitor] Published cmd: {cmd_topic} payload={params}",
+              flush=True)
         self.lbl_footer.setText(
             f"On-demand capture requested from {instance_name}: {params or '(defaults)'}")
 
@@ -553,15 +557,19 @@ class MqttTab(QWidget):
 
         self._pending_frame_instance = instance_name
         # On-demand captures may take longer (exposure, reconfigure) — give more time.
-        self._frame_timeout_timer.start(max(FRAME_REQUEST_TIMEOUT_MS, 30000))
+        self._frame_timeout_timer.start(ON_DEMAND_TIMEOUT_MS)
 
     def _on_frame_timeout(self):
         instance_name = self._pending_frame_instance
         if not instance_name:
             return
         self._pending_frame_instance = None
-        msg = f"No response from {instance_name} within {FRAME_REQUEST_TIMEOUT_MS // 1000}s"
+        hint = ("Check that the worker is running, MQTT prefix matches, and "
+                "the instance name is correct.")
+        msg = (f"No response from {instance_name}. "
+               f"{hint}")
         self.lbl_footer.setText(msg)
+        print(f"[monitor] Timeout waiting for {instance_name}", flush=True)
         if self._frame_viewer and self._frame_viewer.isVisible():
             self._frame_viewer.lbl_image.setText(msg)
             self._frame_viewer.lbl_info.setText(f"Timeout: {instance_name}")
@@ -571,15 +579,44 @@ class MqttTab(QWidget):
         try:
             data = json.loads(payload)
         except json.JSONDecodeError as e:
-            self.lbl_footer.setText(f"Frame decode error: {e}")
+            msg = f"Frame decode error: {e}"
+            self.lbl_footer.setText(msg)
+            print(f"[monitor] {msg}", flush=True)
             return
 
         instance_name = data.get("instance_name", "?")
         camera_type = data.get("camera_type", "?")
         timestamp = data.get("timestamp")
         status = data.get("status", "ok")
+        note = data.get("note", "")
 
-        # Stop waiting-timeout since a response arrived.
+        print(f"[monitor] /frame from {instance_name} ({camera_type}): "
+              f"status={status} note={note!r}", flush=True)
+
+        # Intermediate statuses — keep the timeout running but refresh the UI.
+        if status == "accepted":
+            self.lbl_footer.setText(
+                f"{instance_name}: request accepted — {note}")
+            if self._frame_viewer and self._frame_viewer.isVisible():
+                self._frame_viewer.lbl_image.setText(
+                    f"Request accepted by {instance_name}\n{note}")
+                self._frame_viewer.lbl_info.setText(
+                    f"{instance_name} ({camera_type}) — accepted")
+            # Extend the window: camera will start capturing soon.
+            self._frame_timeout_timer.start(ON_DEMAND_TIMEOUT_MS)
+            return
+        if status == "capturing":
+            self.lbl_footer.setText(
+                f"{instance_name}: capturing — {note}")
+            if self._frame_viewer and self._frame_viewer.isVisible():
+                self._frame_viewer.lbl_image.setText(
+                    f"Capturing new frame on {instance_name}...\n{note}")
+                self._frame_viewer.lbl_info.setText(
+                    f"{instance_name} ({camera_type}) — capturing")
+            self._frame_timeout_timer.start(ON_DEMAND_TIMEOUT_MS)
+            return
+
+        # Terminal statuses — stop waiting-timeout.
         self._pending_frame_instance = None
         if self._frame_timeout_timer:
             self._frame_timeout_timer.stop()
@@ -588,6 +625,7 @@ class MqttTab(QWidget):
             err = data.get("error") or f"status={status}"
             msg = f"No frame from {instance_name}: {err}"
             self.lbl_footer.setText(msg)
+            print(f"[monitor] {msg}", flush=True)
             if self._frame_viewer and self._frame_viewer.isVisible():
                 self._frame_viewer.lbl_image.setText(msg)
                 self._frame_viewer.lbl_info.setText(

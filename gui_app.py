@@ -101,6 +101,8 @@ class CannonWorkerQt(QThread):
             cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
+            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
+                  flush=True)
 
     def _publish_frame(self, jpeg_bytes, timestamp_iso, on_demand=False, params=None):
         import base64
@@ -144,6 +146,8 @@ class CannonWorkerQt(QThread):
         }), retain=False)
 
     def _on_mqtt_command(self, topic, payload):
+        print(f"[cannon:{self.instance_name}] MQTT cmd received: {topic} "
+              f"({len(payload) if payload else 0} bytes)", flush=True)
         if topic.endswith("/cmd/get_frame"):
             if self._last_frame_data is None:
                 self._publish_frame_error("no_frame", "No frame captured yet")
@@ -165,9 +169,26 @@ class CannonWorkerQt(QThread):
                 params = {}
             with self._pending_capture_lock:
                 self._pending_capture = params
-            self.log_msg.emit(
-                f"On-demand capture queued with params: {params}", "info")
+            self._publish_frame_status("accepted",
+                                       f"Request queued with params: {params}")
+            msg = f"[cannon:{self.instance_name}] On-demand capture queued: {params}"
+            self.log_msg.emit(msg, "info")
+            print(msg, flush=True)
             return
+        # Unknown cmd — log for diagnostics
+        print(f"[cannon:{self.instance_name}] Unknown MQTT command: {topic}",
+              flush=True)
+
+    def _publish_frame_status(self, status, note=""):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "cannon",
+            "instance_name": self.instance_name,
+            "status": status,
+            "note": note,
+            "timestamp": dt.now().isoformat(),
+            "on_demand": True,
+        }), retain=False)
 
     def _apply_cannon_params(self, params):
         """Apply Cannon config values from params dict. Returns list of (key, err)."""
@@ -195,19 +216,28 @@ class CannonWorkerQt(QThread):
             self._pending_capture = None
         if params is None:
             return
+        msg = f"[cannon:{self.instance_name}] On-demand capture starting"
         self.log_msg.emit("On-demand capture starting", "info")
+        print(msg, flush=True)
+        self._publish_frame_status("capturing", f"Applying params: {params}")
         try:
             failures = self._apply_cannon_params(params)
             for key, err in failures:
                 self.log_msg.emit(f"Param '{key}' failed: {err}", "warn")
+                print(f"[cannon:{self.instance_name}] Param '{key}' failed: {err}",
+                      flush=True)
             img_data = capture_image(self.cam)
             now = dt.now()
             self._publish_frame(img_data, now.isoformat(),
                                 on_demand=True, params=params)
             self.log_msg.emit("On-demand frame sent via MQTT", "info")
+            print(f"[cannon:{self.instance_name}] On-demand frame published "
+                  f"({len(img_data)} bytes)", flush=True)
         except Exception as e:
             self._publish_frame_error("error", f"Capture failed: {e}", on_demand=True)
             self.log_msg.emit(f"On-demand capture error: {e}", "error")
+            print(f"[cannon:{self.instance_name}] On-demand capture error: {e}",
+                  flush=True)
 
     def run(self):
         from cannon_driver import capture_image, get_camera_settings_info
@@ -768,6 +798,8 @@ class SpttScheduledWorkerQt(QThread):
             cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
+            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
+                  flush=True)
 
     def _encode_sptt_jpeg(self, frame):
         """Convert a 2D frame to JPEG bytes with auto-downscale. Returns (bytes, w, h)."""
@@ -829,6 +861,8 @@ class SpttScheduledWorkerQt(QThread):
         }), retain=False)
 
     def _on_mqtt_command(self, topic, payload):
+        print(f"[sptt:{self.instance_name}] MQTT cmd received: {topic} "
+              f"({len(payload) if payload else 0} bytes)", flush=True)
         if topic.endswith("/cmd/get_frame"):
             frame = self._last_frame
             ts_iso = self._last_shot.isoformat() if self._last_shot else None
@@ -857,9 +891,25 @@ class SpttScheduledWorkerQt(QThread):
                 params = {}
             with self._pending_capture_lock:
                 self._pending_capture = params
-            self.log_msg.emit(
-                f"On-demand capture queued with params: {params}", "info")
+            self._publish_sptt_status("accepted",
+                                       f"Request queued with params: {params}")
+            msg = f"[sptt:{self.instance_name}] On-demand capture queued: {params}"
+            self.log_msg.emit(msg, "info")
+            print(msg, flush=True)
             return
+        print(f"[sptt:{self.instance_name}] Unknown MQTT command: {topic}",
+              flush=True)
+
+    def _publish_sptt_status(self, status, note=""):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "sptt",
+            "instance_name": self.instance_name,
+            "status": status,
+            "note": note,
+            "timestamp": dt.now().isoformat(),
+            "on_demand": True,
+        }), retain=False)
 
     def _apply_sptt_params(self, params):
         """Apply exposure/gain/binning to SPTT camera. Returns (applied, errors)."""
@@ -904,11 +954,16 @@ class SpttScheduledWorkerQt(QThread):
             self._pending_capture = None
         if params is None:
             return
+        msg = f"[sptt:{self.instance_name}] On-demand capture starting"
         self.log_msg.emit("On-demand SPTT capture starting", "info")
+        print(msg, flush=True)
+        self._publish_sptt_status("capturing", f"Applying params: {params}")
         try:
             applied, errors = self._apply_sptt_params(params)
             for err in errors:
                 self.log_msg.emit(f"Param apply warning: {err}", "warn")
+                print(f"[sptt:{self.instance_name}] Param apply warning: {err}",
+                      flush=True)
             frame = self.cam.grab_frame()
             now = dt.now()
             jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
@@ -916,9 +971,13 @@ class SpttScheduledWorkerQt(QThread):
                 jpeg_bytes, w, h, now.isoformat(),
                 on_demand=True, params=applied)
             self.log_msg.emit("On-demand SPTT frame sent via MQTT", "info")
+            print(f"[sptt:{self.instance_name}] On-demand frame published "
+                  f"({w}x{h}, {len(jpeg_bytes)} bytes)", flush=True)
         except Exception as e:
             self._publish_sptt_error("error", f"Capture failed: {e}", on_demand=True)
             self.log_msg.emit(f"On-demand capture error: {e}", "error")
+            print(f"[sptt:{self.instance_name}] On-demand capture error: {e}",
+                  flush=True)
 
     def run(self):
         from sptt_driver import save_fits, ENCODING_12BPP, SPTT_CAPTURE_SECONDS
@@ -1553,6 +1612,8 @@ class InfraWorkerQt(QThread):
             cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
+            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
+                  flush=True)
 
     def _publish_infra_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
         import base64
@@ -1622,11 +1683,16 @@ class InfraWorkerQt(QThread):
             self._pending_capture = None
         if params is None:
             return
+        msg = f"[infra:{self.instance_name}] On-demand capture starting"
         self.log_msg.emit("On-demand Infra capture starting", "info")
+        print(msg, flush=True)
+        self._publish_infra_status("capturing", f"Applying params: {params}")
         try:
             applied, errors = self._apply_infra_params(params)
             for err in errors:
                 self.log_msg.emit(f"Param apply warning: {err}", "warn")
+                print(f"[infra:{self.instance_name}] Param apply warning: {err}",
+                      flush=True)
             frame = self.cam.grab_frame()
             now = dt.now()
             jpeg_bytes = frame_to_jpeg_bytes(frame)
@@ -1634,12 +1700,18 @@ class InfraWorkerQt(QThread):
                 jpeg_bytes, now.isoformat(),
                 on_demand=True, params=applied)
             self.log_msg.emit("On-demand Infra frame sent via MQTT", "info")
+            print(f"[infra:{self.instance_name}] On-demand frame published "
+                  f"({len(jpeg_bytes)} bytes)", flush=True)
         except Exception as e:
             self._publish_infra_error("error", f"Capture failed: {e}",
                                       on_demand=True)
             self.log_msg.emit(f"On-demand capture error: {e}", "error")
+            print(f"[infra:{self.instance_name}] On-demand capture error: {e}",
+                  flush=True)
 
     def _on_mqtt_command(self, topic, payload):
+        print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
+              f"({len(payload) if payload else 0} bytes)", flush=True)
         if topic.endswith("/cmd/get_frame"):
             from infra_driver import frame_to_jpeg_bytes
             if self._last_frame is None:
@@ -1668,9 +1740,25 @@ class InfraWorkerQt(QThread):
                 params = {}
             with self._pending_capture_lock:
                 self._pending_capture = params
-            self.log_msg.emit(
-                f"On-demand capture queued with params: {params}", "info")
+            self._publish_infra_status("accepted",
+                                       f"Request queued with params: {params}")
+            msg = f"[infra:{self.instance_name}] On-demand capture queued: {params}"
+            self.log_msg.emit(msg, "info")
+            print(msg, flush=True)
             return
+        print(f"[infra:{self.instance_name}] Unknown MQTT command: {topic}",
+              flush=True)
+
+    def _publish_infra_status(self, status, note=""):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": status,
+            "note": note,
+            "timestamp": dt.now().isoformat(),
+            "on_demand": True,
+        }), retain=False)
 
     def run(self):
         from infra_driver import save_tiff, save_png, save_fits
