@@ -737,7 +737,8 @@ def run_preview_infra(cam, instance_name):
     while not stop.is_set():
         try:
             frame = cam.grab_frame()
-            save_png(tmp_path, frame)
+            #save_png(tmp_path, frame)
+            save_fits(tmp_path, frame)
             os.replace(tmp_path, preview_path)
             frames += 1
             if frames % 10 == 0:
