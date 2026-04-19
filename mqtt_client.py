@@ -46,12 +46,25 @@ class MqttPublisherConsole:
         self._on_command_cb = None
 
     def connect_broker(self):
+        print(f"[INFO] MQTT connecting to {self._host}:{self._port}...",
+              flush=True)
         try:
             self._client.reconnect_delay_set(min_delay=2, max_delay=30)
             self._client.connect_async(self._host, self._port, keepalive=60)
             self._client.loop_start()
         except Exception as exc:
-            print(f"[WARN] MQTT connect error: {exc}")
+            print(f"[WARN] MQTT connect error: {exc}", flush=True)
+            return
+        # Async — schedule a diagnostic check after a few seconds.
+        import threading as _th
+
+        def _check_connected():
+            if self._client.is_connected():
+                return
+            print(f"[WARN] MQTT still NOT connected to {self._host}:{self._port} "
+                  f"after 3s. Check network/firewall/credentials. "
+                  f"Commands from monitor will not be received.", flush=True)
+        _th.Timer(3.0, _check_connected).start()
 
     def disconnect_broker(self):
         try:

@@ -236,23 +236,45 @@ class TanhoCamera:
             if ret != 0:
                 break
 
-    def _read_frame_usb(self) -> bytes:
+    def _read_frame_usb(self, verbose_timing: bool = False) -> bytes:
         devh = self._devh_ref.value
         if not devh:
             raise RuntimeError("USB device handle not initialized")
 
         buf_addr = ctypes.addressof(self._usb_buffer)
 
+        timeouts = 0
+        errors = 0
+        first_data_idx = -1
+        t_start = time.perf_counter()
+        t_first_data = None
         for i in range(self._num_chunks):
-            self._bulk_transfer(
+            ret = self._bulk_transfer(
                 devh, USB_EP_IN, self._usb_chunk, USB_CHUNK_SIZE,
                 ctypes.byref(self._transferred), USB_TIMEOUT
             )
+            if ret == -7:  # LIBUSB_ERROR_TIMEOUT
+                timeouts += 1
+            elif ret != 0:
+                errors += 1
+            elif self._transferred.value > 0 and first_data_idx < 0:
+                first_data_idx = i
+                t_first_data = time.perf_counter()
             ctypes.memmove(
                 buf_addr + i * USB_CHUNK_SIZE,
                 self._usb_chunk,
                 USB_CHUNK_SIZE
             )
+
+        t_end = time.perf_counter()
+        if verbose_timing:
+            wait_ms = ((t_first_data or t_end) - t_start) * 1000.0
+            total_ms = (t_end - t_start) * 1000.0
+            print(f"[INFRA] _read_frame_usb: chunks={self._num_chunks} "
+                  f"timeouts={timeouts} errors={errors} "
+                  f"first_data_chunk={first_data_idx} "
+                  f"wait_until_data={wait_ms:.1f}ms total={total_ms:.1f}ms",
+                  flush=True)
 
         buf_bytes = ctypes.string_at(buf_addr, self._usb_buf_size)
         pos = buf_bytes.find(SYNC_MARKER)
@@ -266,20 +288,31 @@ class TanhoCamera:
 
         return buf_bytes[data_start:data_end]
 
-    def grab_frame(self) -> np.ndarray:
+    def grab_frame(self, verbose_timing: bool = False) -> np.ndarray:
         """Grab one frame, deinterlace. Returns uint16 (roi_height, roi_width)."""
         if not self._connected:
             raise RuntimeError("Camera not connected")
 
+        t_grab_start = time.perf_counter()
         for attempt in range(MAX_GRAB_RETRIES):
-            frame_bytes = self._read_frame_usb()
+            frame_bytes = self._read_frame_usb(verbose_timing=verbose_timing)
             if frame_bytes is not None:
                 break
+            if verbose_timing:
+                print(f"[INFRA] grab_frame: attempt {attempt+1} no sync marker, retrying",
+                      flush=True)
         else:
             raise RuntimeError(
                 f"Failed to grab frame after {MAX_GRAB_RETRIES} attempts "
                 "(sync marker not found)"
             )
+        if verbose_timing:
+            grab_ms = (time.perf_counter() - t_grab_start) * 1000.0
+            exp_ms = self._exposure_us / 1000.0
+            ratio = grab_ms / exp_ms if exp_ms > 0 else 0
+            print(f"[INFRA] grab_frame: total={grab_ms:.1f}ms "
+                  f"requested_exposure={exp_ms:.1f}ms "
+                  f"ratio={ratio:.2f}x", flush=True)
 
         raw_16 = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(
             self._raw_h, self._raw_w
@@ -295,6 +328,7 @@ class TanhoCamera:
         """Set exposure in microseconds."""
         if not self._connected:
             return
+        t0 = time.perf_counter()
         self._exposure_us = microseconds
         ticks = int(microseconds * 20)
         b = ticks.to_bytes(4, 'little')
@@ -308,6 +342,10 @@ class TanhoCamera:
         cmd2[4] = b[1]; cmd2[5] = b[0]
         cmd2[6] = b[3]; cmd2[7] = b[2]
         self._execute_raw_cmd(cmd2)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us ticks={ticks} "
+              f"bytes=[{b[1]:02X} {b[0]:02X} {b[3]:02X} {b[2]:02X}] "
+              f"cmd_time={dt_ms:.2f}ms", flush=True)
 
     def set_gain(self, gain: int):
         """Set gain (0-120)."""
@@ -532,7 +570,16 @@ class InfraWorkerConsole(threading.Thread):
             applied, errors = self._apply_params(params)
             for err in errors:
                 print(f"[WARN] Param apply: {err}")
-            frame = self.cam.grab_frame()
+            t_before = time.perf_counter()
+            print(f"[INFRA] On-demand grab start: exposure_us={self.cam.exposure_us}",
+                  flush=True)
+            frame = self.cam.grab_frame(verbose_timing=True)
+            t_after = time.perf_counter()
+            delta_ms = (t_after - t_before) * 1000.0
+            exp_ms = self.cam.exposure_us / 1000.0
+            print(f"[INFRA] On-demand grab done: wall_delta={delta_ms:.1f}ms "
+                  f"requested_exposure={exp_ms:.1f}ms "
+                  f"overhead={delta_ms - exp_ms:.1f}ms", flush=True)
             now = dt.now()
             jpeg_bytes = frame_to_jpeg_bytes(frame)
             self._publish_ok(jpeg_bytes, now.isoformat(),
@@ -660,7 +707,13 @@ class InfraWorkerConsole(threading.Thread):
         ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
         try:
-            frame = self.cam.grab_frame()
+            t_before = time.perf_counter()
+            frame = self.cam.grab_frame(verbose_timing=True)
+            delta_ms = (time.perf_counter() - t_before) * 1000.0
+            exp_ms = self.cam.exposure_us / 1000.0
+            print(f"[INFRA] Scheduled grab: wall_delta={delta_ms:.1f}ms "
+                  f"requested_exposure={exp_ms:.1f}ms "
+                  f"overhead={delta_ms - exp_ms:.1f}ms", flush=True)
             if self.save_format == "fits":
                 roi_str = f"{self.cam.roi_width}x{self.cam.roi_height}"
                 save_fits(filepath, frame,
