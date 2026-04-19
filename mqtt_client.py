@@ -72,25 +72,36 @@ class MqttPublisherConsole:
         self._on_command_cb = callback
         if self._client.is_connected():
             self._client.subscribe(self._sub_topic, qos=1)
+            print(f"[INFO] MQTT subscribed: {topic}", flush=True)
+        else:
+            print(f"[INFO] MQTT subscription pending (not connected yet): {topic}",
+                  flush=True)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
-            print("[INFO] MQTT connected")
+            print("[INFO] MQTT connected", flush=True)
             if self._sub_topic:
                 client.subscribe(self._sub_topic, qos=1)
+                print(f"[INFO] MQTT subscribed on connect: {self._sub_topic}",
+                      flush=True)
         else:
-            print(f"[WARN] MQTT connection refused (rc={reason_code})")
+            print(f"[WARN] MQTT connection refused (rc={reason_code})", flush=True)
 
     def _on_disconnect(self, client, userdata, disconnect_flags=None,
                        reason_code=None, properties=None):
-        pass  # auto-reconnect handles this
+        print(f"[WARN] MQTT disconnected (rc={reason_code})", flush=True)
 
     def _on_message(self, client, userdata, msg):
+        print(f"[INFO] MQTT message received: {msg.topic} "
+              f"({len(msg.payload)} bytes)", flush=True)
         if self._on_command_cb:
             try:
                 self._on_command_cb(msg.topic, msg.payload)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ERROR] MQTT callback error: {e}", flush=True)
+        else:
+            print("[WARN] MQTT message received but no callback registered",
+                  flush=True)
 
 
 # ---------------------------------------------------------------------------

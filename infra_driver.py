@@ -526,7 +526,8 @@ class InfraWorkerConsole(threading.Thread):
             self._pending_capture = None
         if params is None:
             return
-        print("[INFO] On-demand Infra capture starting")
+        print("[INFO] On-demand Infra capture starting", flush=True)
+        self._publish_status("capturing", f"Applying params: {params}")
         try:
             applied, errors = self._apply_params(params)
             for err in errors:
@@ -542,6 +543,8 @@ class InfraWorkerConsole(threading.Thread):
             print(f"[ERROR] On-demand capture error: {e}")
 
     def _on_mqtt_command(self, topic, payload):
+        print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
+              f"({len(payload) if payload else 0} bytes)", flush=True)
         if not self._mqtt:
             return
         if topic.endswith("/cmd/get_frame"):
@@ -570,8 +573,24 @@ class InfraWorkerConsole(threading.Thread):
                 params = {}
             with self._pending_capture_lock:
                 self._pending_capture = params
-            print(f"[INFO] On-demand capture queued with params: {params}")
+            self._publish_status("accepted", f"Request queued with params: {params}")
+            print(f"[INFO] On-demand capture queued with params: {params}",
+                  flush=True)
             return
+        print(f"[infra:{self.instance_name}] Unknown command: {topic}", flush=True)
+
+    def _publish_status(self, status, note=""):
+        if not self._mqtt:
+            return
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": status,
+            "note": note,
+            "timestamp": dt.now().isoformat(),
+            "on_demand": True,
+        }), retain=False)
 
     def run(self):
         last_fired = (-1, -1)
@@ -581,6 +600,11 @@ class InfraWorkerConsole(threading.Thread):
         if self._mqtt:
             cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
             self._mqtt.subscribe_commands(cmd_topic, self._on_mqtt_command)
+            print(f"[infra:{self.instance_name}] Subscribed to commands: "
+                  f"{cmd_topic}", flush=True)
+        else:
+            print(f"[infra:{self.instance_name}] No MQTT — remote commands disabled",
+                  flush=True)
 
         print("[INFO] Infra camera measurement started")
         self._save_status("running")
