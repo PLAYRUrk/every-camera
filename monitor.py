@@ -30,6 +30,7 @@ from utils import HOME_STATUS_DIR
 # ---------------------------------------------------------------------------
 STALE_THRESHOLD_SECONDS = 30
 LOCAL_REFRESH_INTERVAL_MS = 5000
+FRAME_REQUEST_TIMEOUT_MS = 10000
 
 TABLE_COLUMNS = [
     "Instance Name", "Type", "PID", "Status",
@@ -205,6 +206,10 @@ class MqttTab(QWidget):
         self._instances = {}
         self._mqtt_cfg = mqtt_cfg or {}
         self._frame_viewer = None
+        self._pending_frame_instance = None
+        self._frame_timeout_timer = QTimer(self)
+        self._frame_timeout_timer.setSingleShot(True)
+        self._frame_timeout_timer.timeout.connect(self._on_frame_timeout)
         self._build_ui()
         self._load_config()
 
@@ -357,7 +362,7 @@ class MqttTab(QWidget):
 
     def _on_message(self, topic, payload):
         # Handle frame responses
-        if "/frame" in topic and not topic.endswith("/status"):
+        if topic.endswith("/frame"):
             self._on_frame_received(topic, payload)
             return
         # Handle status messages
@@ -396,30 +401,69 @@ class MqttTab(QWidget):
             self._frame_viewer.show()
             self._frame_viewer.raise_()
 
+            self._pending_frame_instance = instance_name
+            self._frame_timeout_timer.start(FRAME_REQUEST_TIMEOUT_MS)
+
+    def _on_frame_timeout(self):
+        instance_name = self._pending_frame_instance
+        if not instance_name:
+            return
+        self._pending_frame_instance = None
+        msg = f"No response from {instance_name} within {FRAME_REQUEST_TIMEOUT_MS // 1000}s"
+        self.lbl_footer.setText(msg)
+        if self._frame_viewer and self._frame_viewer.isVisible():
+            self._frame_viewer.lbl_image.setText(msg)
+            self._frame_viewer.lbl_info.setText(f"Timeout: {instance_name}")
+
     def _on_frame_received(self, topic, payload):
         """Handle incoming frame data."""
         try:
             data = json.loads(payload)
-            jpeg_b64 = data.get("data")
-            if not jpeg_b64:
-                return
-            jpeg_data = base64.b64decode(jpeg_b64)
-            instance_name = data.get("instance_name", "?")
-            camera_type = data.get("camera_type", "?")
-            timestamp = data.get("timestamp")
+        except json.JSONDecodeError as e:
+            self.lbl_footer.setText(f"Frame decode error: {e}")
+            return
 
-            if not self._frame_viewer or not self._frame_viewer.isVisible():
-                self._frame_viewer = FrameViewerDialog(self)
-                self._frame_viewer.show()
+        instance_name = data.get("instance_name", "?")
+        camera_type = data.get("camera_type", "?")
+        timestamp = data.get("timestamp")
+        status = data.get("status", "ok")
 
+        # Stop waiting-timeout since a response arrived.
+        self._pending_frame_instance = None
+        if self._frame_timeout_timer:
+            self._frame_timeout_timer.stop()
+
+        if status != "ok" or not data.get("data"):
+            err = data.get("error") or f"status={status}"
+            msg = f"No frame from {instance_name}: {err}"
+            self.lbl_footer.setText(msg)
+            if self._frame_viewer and self._frame_viewer.isVisible():
+                self._frame_viewer.lbl_image.setText(msg)
+                self._frame_viewer.lbl_info.setText(
+                    f"{instance_name} ({camera_type}) — {status}")
+            return
+
+        try:
+            jpeg_data = base64.b64decode(data["data"])
+        except (ValueError, TypeError) as e:
+            self.lbl_footer.setText(f"Frame base64 decode error: {e}")
+            return
+
+        if not self._frame_viewer or not self._frame_viewer.isVisible():
+            self._frame_viewer = FrameViewerDialog(self)
+            self._frame_viewer.show()
+
+        try:
             self._frame_viewer.show_frame(
                 instance_name, camera_type, jpeg_data, timestamp)
-            self._frame_viewer.raise_()
-            self.lbl_footer.setText(
-                f"Frame received from {instance_name} at "
-                f"{dt.now().strftime('%H:%M:%S')}")
-        except Exception:
-            pass
+        except Exception as e:
+            self.lbl_footer.setText(f"Frame display error: {e}")
+            return
+
+        self._frame_viewer.raise_()
+        self.lbl_footer.setText(
+            f"Frame received from {instance_name} at "
+            f"{dt.now().strftime('%H:%M:%S')}")
 
     def _refresh_table(self):
         records = [rec for rec, _ in self._instances.values()]

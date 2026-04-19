@@ -34,6 +34,9 @@ from utils import (
 from mqtt_client import MQTT_AVAILABLE, MqttPublisher
 from monitor import MonitorWidget
 
+# HiveMQ free tier limits messages to ~256 KB — leave headroom for JSON envelope.
+MQTT_MAX_PAYLOAD_BYTES = 240_000
+
 
 # ===========================================================================
 # Canon GUI components
@@ -98,18 +101,45 @@ class CannonWorkerQt(QThread):
             self._mqtt.subscribe_commands(cmd_topic)
 
     def _on_mqtt_command(self, topic, payload):
-        if topic.endswith("/cmd/get_frame") and self._last_frame_data:
-            import base64
-            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        if not topic.endswith("/cmd/get_frame"):
+            return
+        import base64
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        if self._last_frame_data is None:
             frame_payload = json.dumps({
                 "camera_type": "cannon",
                 "instance_name": self.instance_name,
-                "format": "jpeg",
-                "data": base64.b64encode(self._last_frame_data).decode(),
+                "status": "no_frame",
+                "error": "No frame captured yet",
+                "timestamp": None,
+            })
+            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            self.log_msg.emit("Frame requested but no frame available yet", "warn")
+            return
+        jpeg_b64 = base64.b64encode(self._last_frame_data).decode()
+        frame_payload = json.dumps({
+            "camera_type": "cannon",
+            "instance_name": self.instance_name,
+            "status": "ok",
+            "format": "jpeg",
+            "data": jpeg_b64,
+            "timestamp": self._last_shot.isoformat() if self._last_shot else None,
+        })
+        if len(frame_payload) > MQTT_MAX_PAYLOAD_BYTES:
+            frame_payload = json.dumps({
+                "camera_type": "cannon",
+                "instance_name": self.instance_name,
+                "status": "too_large",
+                "error": f"Frame payload {len(frame_payload)} bytes exceeds broker limit",
                 "timestamp": self._last_shot.isoformat() if self._last_shot else None,
             })
             self._mqtt.publish(frame_topic, frame_payload, retain=False)
-            self.log_msg.emit("Frame sent via MQTT", "info")
+            self.log_msg.emit(
+                f"Frame too large for MQTT ({len(jpeg_b64)} b64 bytes); not sent",
+                "warn")
+            return
+        self._mqtt.publish(frame_topic, frame_payload, retain=False)
+        self.log_msg.emit("Frame sent via MQTT", "info")
 
     def run(self):
         from cannon_driver import capture_image, get_camera_settings_info
@@ -666,30 +696,73 @@ class SpttScheduledWorkerQt(QThread):
             self._mqtt.subscribe_commands(cmd_topic)
 
     def _on_mqtt_command(self, topic, payload):
-        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
-            import base64
-            import io
-            from PIL import Image
+        if not topic.endswith("/cmd/get_frame"):
+            return
+        import base64
+        import io
+        from PIL import Image
 
-            frame = self._last_frame
-            if frame.dtype == np.uint16:
-                display = (frame.astype(np.float32) / frame.max() * 255).astype(np.uint8)
-            else:
-                display = frame
-            img = Image.fromarray(display, mode="L")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        frame = self._last_frame
+        ts_iso = self._last_shot.isoformat() if self._last_shot else None
 
-            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-            frame_payload = json.dumps({
+        if frame is None:
+            self._mqtt.publish(frame_topic, json.dumps({
                 "camera_type": "sptt",
                 "instance_name": self.instance_name,
-                "format": "jpeg",
-                "data": base64.b64encode(buf.getvalue()).decode(),
-                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
-            self.log_msg.emit("Frame sent via MQTT", "info")
+                "status": "no_frame",
+                "error": "No frame captured yet",
+                "timestamp": None,
+            }), retain=False)
+            self.log_msg.emit("Frame requested but no frame available yet", "warn")
+            return
+
+        try:
+            if frame.ndim != 2:
+                raise ValueError(f"Unexpected frame shape: {frame.shape}")
+            if frame.dtype == np.uint16:
+                peak = int(frame.max()) or 1
+                display = (frame.astype(np.float32) / peak * 255).astype(np.uint8)
+            else:
+                display = frame.astype(np.uint8, copy=False)
+            img = Image.fromarray(display, mode="L")
+            buf = io.BytesIO()
+            quality = 85
+            img.save(buf, format="JPEG", quality=quality)
+            # Downscale if payload too big (broker limits).
+            while True:
+                jpeg_b64 = base64.b64encode(buf.getvalue()).decode()
+                payload_size = len(jpeg_b64) + 256  # JSON envelope estimate
+                if payload_size <= MQTT_MAX_PAYLOAD_BYTES:
+                    break
+                if min(img.size) <= 320:
+                    raise ValueError(
+                        f"Frame payload still {payload_size} bytes after downscale")
+                img = img.resize((img.size[0] // 2, img.size[1] // 2))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality)
+        except Exception as e:
+            self._mqtt.publish(frame_topic, json.dumps({
+                "camera_type": "sptt",
+                "instance_name": self.instance_name,
+                "status": "error",
+                "error": str(e),
+                "timestamp": ts_iso,
+            }), retain=False)
+            self.log_msg.emit(f"Frame encode error: {e}", "error")
+            return
+
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "sptt",
+            "instance_name": self.instance_name,
+            "status": "ok",
+            "format": "jpeg",
+            "width": img.size[0],
+            "height": img.size[1],
+            "data": jpeg_b64,
+            "timestamp": ts_iso,
+        }), retain=False)
+        self.log_msg.emit("Frame sent via MQTT", "info")
 
     def run(self):
         from sptt_driver import save_fits, ENCODING_12BPP, SPTT_CAPTURE_SECONDS
