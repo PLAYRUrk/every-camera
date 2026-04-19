@@ -65,12 +65,20 @@ MAX_GRAB_RETRIES = 3
 INFRA_CAPTURE_SECONDS = [0, 30]
 
 # Empirical calibration: the camera's exposure register is clocked much slower
-# than the naive 20 MHz assumption would suggest. Measured by comparing
-# requested vs actual integration time via USB data-span:
-#   requested 150000us -> actual ~22000ms -> scale factor ~146.8x overshoot.
-# That implies the effective clock is ~136 kHz, i.e. 1 tick ~= 7.35 us.
-# The resulting multiplier (ticks per microsecond) is:
-EXPOSURE_TICKS_PER_US = 20.0 / 146.8  # ~= 0.1362
+# than the naive 20 MHz assumption would suggest. Calibrated against measured
+# USB data-span across 50ms / 150ms / 300ms exposures:
+#   50ms  -> 6810 ticks -> 55.4ms  (~8us/tick, small-tick noise)
+#   150ms -> 20430 ticks -> 125.6ms (~6us/tick)
+#   300ms -> 40860 ticks -> 245.7ms (~6us/tick)
+# Effective clock is ~167 kHz, i.e. 1 tick == ~6 us. A scale of 1/6 matches
+# actual exposure to requested value to within ~3% in the 150-300ms range.
+EXPOSURE_TICKS_PER_US = 1.0 / 6.0  # ~= 0.1667
+
+# Exposure register appears to be effectively 16-bit (low word) with an
+# additional high word that does not behave linearly. Requests whose tick
+# count exceeds 0xFFFF start to overflow / wrap. Warn the user when this
+# happens so they know the resulting exposure may not match the request.
+EXPOSURE_TICKS_LINEAR_MAX = 0xFFFF  # ~393 ms of exposure at 6us/tick
 
 
 # ---------------------------------------------------------------------------
@@ -354,28 +362,51 @@ class TanhoCamera:
         return frame
 
     def set_exposure(self, microseconds: float):
-        """Set exposure in microseconds."""
+        """Set exposure in microseconds.
+
+        Hypothesis: CMD_EXPOSURE (0xFF) is the fine (sub-millisecond) register
+        in ~6us units, and CMD_EXPOSURE_ALT (0xF5) is the coarse register in
+        1-ms units. The camera sums them to form the total integration time.
+        Using separate encoding lets us request exposures up to tens of seconds
+        without overflowing the 16-bit fine register.
+        """
         if not self._connected:
             return
         t0 = time.perf_counter()
         self._exposure_us = microseconds
-        ticks = max(1, int(microseconds * EXPOSURE_TICKS_PER_US))
-        b = ticks.to_bytes(4, 'little')
+
+        total_us = int(microseconds)
+        coarse_ms = total_us // 1000
+        fine_us = total_us - coarse_ms * 1000
+        fine_ticks = max(0, int(fine_us * EXPOSURE_TICKS_PER_US))
+        coarse_ticks = max(0, coarse_ms)
+        # Guarantee at least one tick of integration even for tiny requests.
+        if fine_ticks == 0 and coarse_ticks == 0:
+            fine_ticks = 1
+
+        fb = fine_ticks.to_bytes(4, 'little')
+        cb = coarse_ticks.to_bytes(4, 'little')
 
         cmd1 = self._make_cmd_packet(CMD_EXPOSURE)
-        cmd1[4] = b[1]; cmd1[5] = b[0]
-        cmd1[6] = b[3]; cmd1[7] = b[2]
+        cmd1[4] = fb[1]; cmd1[5] = fb[0]
+        cmd1[6] = fb[3]; cmd1[7] = fb[2]
         self._execute_raw_cmd(cmd1)
 
         cmd2 = self._make_cmd_packet(CMD_EXPOSURE_ALT)
-        cmd2[4] = b[1]; cmd2[5] = b[0]
-        cmd2[6] = b[3]; cmd2[7] = b[2]
+        cmd2[4] = cb[1]; cmd2[5] = cb[0]
+        cmd2[6] = cb[3]; cmd2[7] = cb[2]
         self._execute_raw_cmd(cmd2)
+
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us "
-              f"scale={EXPOSURE_TICKS_PER_US:.4f} ticks={ticks} "
-              f"bytes=[{b[1]:02X} {b[0]:02X} {b[3]:02X} {b[2]:02X}] "
+        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us -> "
+              f"coarse_ms={coarse_ms} (bytes [{cb[1]:02X} {cb[0]:02X} "
+              f"{cb[3]:02X} {cb[2]:02X}]) + fine_ticks={fine_ticks} "
+              f"(bytes [{fb[1]:02X} {fb[0]:02X} {fb[3]:02X} {fb[2]:02X}]) "
               f"cmd_time={dt_ms:.2f}ms", flush=True)
+        if coarse_ticks > 0xFFFF or fine_ticks > 0xFFFF:
+            print(f"[WARN] Exposure encoding overflows 16-bit "
+                  f"(coarse={coarse_ticks}, fine={fine_ticks}). "
+                  f"Camera may clamp.", flush=True)
 
     def set_gain(self, gain: int):
         """Set gain (0-120)."""
@@ -607,15 +638,21 @@ class InfraWorkerConsole(threading.Thread):
                 errors.append(f"resync: {e}")
         return applied, errors
 
-    def _resync_camera(self, skip_frames: int = 3):
+    def _resync_camera(self, skip_frames: int = None):
         """Flush USB buffer and discard a few frames after config change so
-        subsequent grab_frame() returns a frame with the NEW exposure/gain/ROI."""
+        subsequent grab_frame() returns a frame with the NEW exposure/gain/ROI.
+
+        For long exposures the settle/skip times become dominant, so we scale
+        them adaptively: short settle capped at 1s, and skip_frames reduced
+        to 1 when a single frame already takes >1 second.
+        """
         t0 = time.perf_counter()
-        # After set_exposure the camera briefly stops streaming while applying
-        # the new integration time. Wait at least one full exposure period plus
-        # a small margin before flushing, otherwise flush+grab will race with
-        # the camera's own reconfiguration and hit USB timeouts.
-        settle_s = max(0.15, self.cam.exposure_us / 1e6 + 0.1)
+        exp_s = self.cam.exposure_us / 1e6
+        # Cap settle at 1s so 60s exposures don't block the worker for a minute
+        # just to apply a command. One flushed frame is enough to clear the pipe.
+        settle_s = max(0.15, min(exp_s + 0.1, 1.0))
+        if skip_frames is None:
+            skip_frames = 3 if exp_s < 1.0 else 1
         time.sleep(settle_s)
         try:
             self.cam._flush_usb()
@@ -1006,19 +1043,22 @@ def run_console_infra(config_path=None, preview=False):
 
     # Let the camera settle after exposure/gain/ROI so the first scheduled
     # frame is actually captured with the configured exposure, not a stale
-    # frame already in the USB pipeline.
-    settle_s = max(0.15, exposure_us / 1e6 + 0.1)
+    # frame already in the USB pipeline. Capped to 1s + 1 skip frame for long
+    # exposures to avoid minute-long startup delays.
+    exp_s = exposure_us / 1e6
+    settle_s = max(0.15, min(exp_s + 0.1, 1.0))
+    skip_n = 3 if exp_s < 1.0 else 1
     time.sleep(settle_s)
     try:
         cam._flush_usb()
     except Exception:
         pass
-    for i in range(3):
+    for i in range(skip_n):
         try:
             cam.grab_frame(verbose_timing=False)
         except Exception as exc:
             print(f"[WARN] Warm-up frame {i} failed: {exc}")
-    print(f"[INFO] Warm-up done (settle={settle_s*1000:.0f}ms + 3 skip frames)")
+    print(f"[INFO] Warm-up done (settle={settle_s*1000:.0f}ms + {skip_n} skip frames)")
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg)
