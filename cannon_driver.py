@@ -291,24 +291,116 @@ class CannonWorkerConsole(threading.Thread):
         self._last_frame_data = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
 
     def request_stop(self):
         self._stop_event.set()
 
+    # HiveMQ free tier limits messages to ~256 KB — leave headroom.
+    _MQTT_MAX_PAYLOAD_BYTES = 240_000
+
+    def _publish_frame(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
+        import base64
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        b64 = base64.b64encode(jpeg_bytes).decode()
+        body = {
+            "camera_type": "cannon",
+            "instance_name": self.instance_name,
+            "status": "ok",
+            "format": "jpeg",
+            "data": b64,
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }
+        if params:
+            body["params"] = params
+        payload = json.dumps(body)
+        if len(payload) > self._MQTT_MAX_PAYLOAD_BYTES:
+            self._publish_frame_error(
+                "too_large",
+                f"Frame payload {len(payload)} bytes exceeds broker limit",
+                on_demand=on_demand, ts_iso=ts_iso)
+            print(f"[WARN] Frame too large ({len(b64)} b64 bytes); not sent")
+            return
+        self._mqtt.publish(frame_topic, payload, retain=False)
+
+    def _publish_frame_error(self, status, error, on_demand=False, ts_iso=None):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "cannon",
+            "instance_name": self.instance_name,
+            "status": status,
+            "error": error,
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }), retain=False)
+
     def _on_mqtt_command(self, topic, payload):
-        """Handle incoming MQTT commands (e.g. get_frame)."""
-        if topic.endswith("/cmd/get_frame") and self._last_frame_data:
-            import base64
-            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-            frame_payload = json.dumps({
-                "camera_type": "cannon",
-                "instance_name": self.instance_name,
-                "format": "jpeg",
-                "data": base64.b64encode(self._last_frame_data).decode(),
-                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+        """Handle incoming MQTT commands (e.g. get_frame, capture_frame)."""
+        if not self._mqtt:
+            return
+        if topic.endswith("/cmd/get_frame"):
+            if self._last_frame_data is None:
+                self._publish_frame_error("no_frame", "No frame captured yet")
+                print("[WARN] Frame requested but no frame available yet")
+                return
+            ts = self._last_shot.isoformat() if self._last_shot else None
+            self._publish_frame(self._last_frame_data, ts)
             print("[INFO] Frame sent via MQTT")
+            return
+        if topic.endswith("/cmd/capture_frame"):
+            try:
+                params = json.loads(payload) if payload else {}
+            except json.JSONDecodeError as e:
+                self._publish_frame_error("bad_request", f"Invalid JSON: {e}",
+                                          on_demand=True)
+                return
+            if not isinstance(params, dict):
+                params = {}
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            print(f"[INFO] On-demand capture queued with params: {params}")
+            return
+
+    def _apply_cannon_params(self, params):
+        failures = []
+        for key, value in params.items():
+            applied = False
+            for section in self.config:
+                if section in SKIP_SECTIONS:
+                    continue
+                if key in self.config[section]:
+                    try:
+                        self.config[section][key].set(str(value))
+                        applied = True
+                    except Exception as e:
+                        failures.append((key, str(e)))
+                    break
+            if not applied and key not in [f[0] for f in failures]:
+                failures.append((key, "param not found in camera config"))
+        return failures
+
+    def _handle_pending_capture(self):
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        if params is None:
+            return
+        print("[INFO] On-demand capture starting")
+        try:
+            failures = self._apply_cannon_params(params)
+            for key, err in failures:
+                print(f"[WARN] Param '{key}' failed: {err}")
+            img_data = capture_image(self.cam)
+            now = dt.now()
+            self._publish_frame(img_data, now.isoformat(),
+                                on_demand=True, params=params)
+            print("[INFO] On-demand frame sent via MQTT")
+        except Exception as e:
+            self._publish_frame_error("error", f"Capture failed: {e}",
+                                      on_demand=True)
+            print(f"[ERROR] On-demand capture error: {e}")
 
     def run(self):
         last_fired = (-1, -1)
@@ -324,6 +416,10 @@ class CannonWorkerConsole(threading.Thread):
         self._save_status("running")
 
         while not self._stop_event.is_set():
+            # Handle on-demand capture requests (outside schedule)
+            if self._pending_capture is not None:
+                self._handle_pending_capture()
+
             now = dt.now()
 
             # Find active schedule interval

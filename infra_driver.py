@@ -453,24 +453,125 @@ class InfraWorkerConsole(threading.Thread):
         self._last_frame = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
 
     def request_stop(self):
         self._stop_event.set()
 
+    _MQTT_MAX_PAYLOAD_BYTES = 240_000
+
+    def _publish_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
+        import base64
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        body = {
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": "ok",
+            "format": "jpeg",
+            "data": base64.b64encode(jpeg_bytes).decode(),
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }
+        if params:
+            body["params"] = params
+        payload = json.dumps(body)
+        if len(payload) > self._MQTT_MAX_PAYLOAD_BYTES:
+            self._publish_error(
+                "too_large",
+                f"Frame payload {len(payload)} bytes exceeds broker limit",
+                ts_iso=ts_iso, on_demand=on_demand)
+            print(f"[WARN] Frame too large ({len(payload)} bytes)")
+            return
+        self._mqtt.publish(frame_topic, payload, retain=False)
+
+    def _publish_error(self, status, error, ts_iso=None, on_demand=False):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": status,
+            "error": error,
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }), retain=False)
+
+    def _apply_params(self, params):
+        applied = {}
+        errors = []
+        try:
+            if "exposure_us" in params:
+                self.cam.set_exposure(float(params["exposure_us"]))
+                applied["exposure_us"] = float(params["exposure_us"])
+            elif "exposure" in params:
+                exp_us = float(params["exposure"]) * 1_000_000
+                self.cam.set_exposure(exp_us)
+                applied["exposure_us"] = exp_us
+            if "gain" in params:
+                self.cam.set_gain(int(params["gain"]))
+                applied["gain"] = int(params["gain"])
+            if "roi_width" in params or "roi_height" in params:
+                w = int(params.get("roi_width", self.cam.roi_width))
+                h = int(params.get("roi_height", self.cam.roi_height))
+                self.cam.set_roi(width=w, height=h)
+                applied["roi_width"] = w
+                applied["roi_height"] = h
+        except Exception as e:
+            errors.append(str(e))
+        return applied, errors
+
+    def _handle_pending_capture(self):
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        if params is None:
+            return
+        print("[INFO] On-demand Infra capture starting")
+        try:
+            applied, errors = self._apply_params(params)
+            for err in errors:
+                print(f"[WARN] Param apply: {err}")
+            frame = self.cam.grab_frame()
+            now = dt.now()
+            jpeg_bytes = frame_to_jpeg_bytes(frame)
+            self._publish_ok(jpeg_bytes, now.isoformat(),
+                             on_demand=True, params=applied)
+            print("[INFO] On-demand frame sent via MQTT")
+        except Exception as e:
+            self._publish_error("error", f"Capture failed: {e}", on_demand=True)
+            print(f"[ERROR] On-demand capture error: {e}")
+
     def _on_mqtt_command(self, topic, payload):
-        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
-            import base64
-            jpeg_data = frame_to_jpeg_bytes(self._last_frame)
-            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-            frame_payload = json.dumps({
-                "camera_type": "infra",
-                "instance_name": self.instance_name,
-                "format": "jpeg",
-                "data": base64.b64encode(jpeg_data).decode(),
-                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+        if not self._mqtt:
+            return
+        if topic.endswith("/cmd/get_frame"):
+            if self._last_frame is None:
+                self._publish_error("no_frame", "No frame captured yet")
+                print("[WARN] Frame requested but no frame available yet")
+                return
+            ts = self._last_shot.isoformat() if self._last_shot else None
+            try:
+                jpeg_data = frame_to_jpeg_bytes(self._last_frame)
+            except Exception as e:
+                self._publish_error("error", str(e), ts)
+                print(f"[ERROR] Frame encode error: {e}")
+                return
+            self._publish_ok(jpeg_data, ts)
             print("[INFO] Frame sent via MQTT")
+            return
+        if topic.endswith("/cmd/capture_frame"):
+            try:
+                params = json.loads(payload) if payload else {}
+            except json.JSONDecodeError as e:
+                self._publish_error("bad_request", f"Invalid JSON: {e}",
+                                    on_demand=True)
+                return
+            if not isinstance(params, dict):
+                params = {}
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            print(f"[INFO] On-demand capture queued with params: {params}")
+            return
 
     def run(self):
         last_fired = (-1, -1)
@@ -485,6 +586,10 @@ class InfraWorkerConsole(threading.Thread):
         self._save_status("running")
 
         while not self._stop_event.is_set():
+            # Handle on-demand capture requests (outside schedule)
+            if self._pending_capture is not None:
+                self._handle_pending_capture()
+
             now = dt.now()
 
             active_end = None

@@ -90,6 +90,8 @@ class CannonWorkerQt(QThread):
         self._last_frame_data = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
 
     def request_stop(self):
         self._stop = True
@@ -100,46 +102,112 @@ class CannonWorkerQt(QThread):
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
 
-    def _on_mqtt_command(self, topic, payload):
-        if not topic.endswith("/cmd/get_frame"):
-            return
+    def _publish_frame(self, jpeg_bytes, timestamp_iso, on_demand=False, params=None):
         import base64
         frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        if self._last_frame_data is None:
-            frame_payload = json.dumps({
-                "camera_type": "cannon",
-                "instance_name": self.instance_name,
-                "status": "no_frame",
-                "error": "No frame captured yet",
-                "timestamp": None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
-            self.log_msg.emit("Frame requested but no frame available yet", "warn")
-            return
-        jpeg_b64 = base64.b64encode(self._last_frame_data).decode()
-        frame_payload = json.dumps({
+        jpeg_b64 = base64.b64encode(jpeg_bytes).decode()
+        payload = {
             "camera_type": "cannon",
             "instance_name": self.instance_name,
             "status": "ok",
             "format": "jpeg",
             "data": jpeg_b64,
-            "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-        })
+            "timestamp": timestamp_iso,
+            "on_demand": on_demand,
+        }
+        if params:
+            payload["params"] = params
+        frame_payload = json.dumps(payload)
         if len(frame_payload) > MQTT_MAX_PAYLOAD_BYTES:
-            frame_payload = json.dumps({
+            err = f"Frame payload {len(frame_payload)} bytes exceeds broker limit"
+            self._mqtt.publish(frame_topic, json.dumps({
                 "camera_type": "cannon",
                 "instance_name": self.instance_name,
                 "status": "too_large",
-                "error": f"Frame payload {len(frame_payload)} bytes exceeds broker limit",
-                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
-            self.log_msg.emit(
-                f"Frame too large for MQTT ({len(jpeg_b64)} b64 bytes); not sent",
-                "warn")
+                "error": err,
+                "timestamp": timestamp_iso,
+                "on_demand": on_demand,
+            }), retain=False)
+            self.log_msg.emit(f"Frame too large for MQTT ({len(jpeg_b64)} b64 bytes)", "warn")
             return
         self._mqtt.publish(frame_topic, frame_payload, retain=False)
-        self.log_msg.emit("Frame sent via MQTT", "info")
+
+    def _publish_frame_error(self, status, error, on_demand=False):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "cannon",
+            "instance_name": self.instance_name,
+            "status": status,
+            "error": error,
+            "timestamp": None,
+            "on_demand": on_demand,
+        }), retain=False)
+
+    def _on_mqtt_command(self, topic, payload):
+        if topic.endswith("/cmd/get_frame"):
+            if self._last_frame_data is None:
+                self._publish_frame_error("no_frame", "No frame captured yet")
+                self.log_msg.emit("Frame requested but no frame available yet", "warn")
+                return
+            ts = self._last_shot.isoformat() if self._last_shot else None
+            self._publish_frame(self._last_frame_data, ts, on_demand=False)
+            self.log_msg.emit("Frame sent via MQTT", "info")
+            return
+
+        if topic.endswith("/cmd/capture_frame"):
+            try:
+                params = json.loads(payload) if payload else {}
+            except json.JSONDecodeError as e:
+                self._publish_frame_error("bad_request", f"Invalid JSON: {e}",
+                                          on_demand=True)
+                return
+            if not isinstance(params, dict):
+                params = {}
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            self.log_msg.emit(
+                f"On-demand capture queued with params: {params}", "info")
+            return
+
+    def _apply_cannon_params(self, params):
+        """Apply Cannon config values from params dict. Returns list of (key, err)."""
+        failures = []
+        for key, value in params.items():
+            applied = False
+            for section in self.config:
+                if section in ("status", "actions", ""):
+                    continue
+                if key in self.config[section]:
+                    try:
+                        self.config[section][key].set(str(value))
+                        applied = True
+                    except Exception as e:
+                        failures.append((key, str(e)))
+                    break
+            if not applied and not failures or (not applied and key not in [f[0] for f in failures]):
+                failures.append((key, "param not found in camera config"))
+        return failures
+
+    def _handle_pending_capture(self):
+        from cannon_driver import capture_image
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        if params is None:
+            return
+        self.log_msg.emit("On-demand capture starting", "info")
+        try:
+            failures = self._apply_cannon_params(params)
+            for key, err in failures:
+                self.log_msg.emit(f"Param '{key}' failed: {err}", "warn")
+            img_data = capture_image(self.cam)
+            now = dt.now()
+            self._publish_frame(img_data, now.isoformat(),
+                                on_demand=True, params=params)
+            self.log_msg.emit("On-demand frame sent via MQTT", "info")
+        except Exception as e:
+            self._publish_frame_error("error", f"Capture failed: {e}", on_demand=True)
+            self.log_msg.emit(f"On-demand capture error: {e}", "error")
 
     def run(self):
         from cannon_driver import capture_image, get_camera_settings_info
@@ -154,6 +222,10 @@ class CannonWorkerQt(QThread):
         self._save_status("running")
 
         while not self._stop:
+            # Handle on-demand capture requests (outside schedule)
+            if self._pending_capture is not None:
+                self._handle_pending_capture()
+
             now = dt.now()
 
             active_end = None
@@ -685,6 +757,8 @@ class SpttScheduledWorkerQt(QThread):
         self._last_shot = None
         self._last_frame = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}_sptt.json")
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
 
     def request_stop(self):
         self._stop = True
@@ -695,74 +769,156 @@ class SpttScheduledWorkerQt(QThread):
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
 
-    def _on_mqtt_command(self, topic, payload):
-        if not topic.endswith("/cmd/get_frame"):
-            return
+    def _encode_sptt_jpeg(self, frame):
+        """Convert a 2D frame to JPEG bytes with auto-downscale. Returns (bytes, w, h)."""
         import base64
         import io
         from PIL import Image
 
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        frame = self._last_frame
-        ts_iso = self._last_shot.isoformat() if self._last_shot else None
-
-        if frame is None:
-            self._mqtt.publish(frame_topic, json.dumps({
-                "camera_type": "sptt",
-                "instance_name": self.instance_name,
-                "status": "no_frame",
-                "error": "No frame captured yet",
-                "timestamp": None,
-            }), retain=False)
-            self.log_msg.emit("Frame requested but no frame available yet", "warn")
-            return
-
-        try:
-            if frame.ndim != 2:
-                raise ValueError(f"Unexpected frame shape: {frame.shape}")
-            if frame.dtype == np.uint16:
-                peak = int(frame.max()) or 1
-                display = (frame.astype(np.float32) / peak * 255).astype(np.uint8)
-            else:
-                display = frame.astype(np.uint8, copy=False)
-            img = Image.fromarray(display, mode="L")
+        if frame.ndim != 2:
+            raise ValueError(f"Unexpected frame shape: {frame.shape}")
+        if frame.dtype == np.uint16:
+            peak = int(frame.max()) or 1
+            display = (frame.astype(np.float32) / peak * 255).astype(np.uint8)
+        else:
+            display = frame.astype(np.uint8, copy=False)
+        img = Image.fromarray(display, mode="L")
+        buf = io.BytesIO()
+        quality = 85
+        img.save(buf, format="JPEG", quality=quality)
+        while True:
+            jpeg_bytes = buf.getvalue()
+            payload_size = len(base64.b64encode(jpeg_bytes)) + 512
+            if payload_size <= MQTT_MAX_PAYLOAD_BYTES:
+                return jpeg_bytes, img.size[0], img.size[1]
+            if min(img.size) <= 320:
+                raise ValueError(
+                    f"Frame payload still {payload_size} bytes after downscale")
+            img = img.resize((img.size[0] // 2, img.size[1] // 2))
             buf = io.BytesIO()
-            quality = 85
             img.save(buf, format="JPEG", quality=quality)
-            # Downscale if payload too big (broker limits).
-            while True:
-                jpeg_b64 = base64.b64encode(buf.getvalue()).decode()
-                payload_size = len(jpeg_b64) + 256  # JSON envelope estimate
-                if payload_size <= MQTT_MAX_PAYLOAD_BYTES:
-                    break
-                if min(img.size) <= 320:
-                    raise ValueError(
-                        f"Frame payload still {payload_size} bytes after downscale")
-                img = img.resize((img.size[0] // 2, img.size[1] // 2))
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=quality)
-        except Exception as e:
-            self._mqtt.publish(frame_topic, json.dumps({
-                "camera_type": "sptt",
-                "instance_name": self.instance_name,
-                "status": "error",
-                "error": str(e),
-                "timestamp": ts_iso,
-            }), retain=False)
-            self.log_msg.emit(f"Frame encode error: {e}", "error")
-            return
 
-        self._mqtt.publish(frame_topic, json.dumps({
+    def _publish_sptt_frame(self, jpeg_bytes, w, h, ts_iso,
+                             on_demand=False, params=None):
+        import base64
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        body = {
             "camera_type": "sptt",
             "instance_name": self.instance_name,
             "status": "ok",
             "format": "jpeg",
-            "width": img.size[0],
-            "height": img.size[1],
-            "data": jpeg_b64,
+            "width": w,
+            "height": h,
+            "data": base64.b64encode(jpeg_bytes).decode(),
             "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }
+        if params:
+            body["params"] = params
+        self._mqtt.publish(frame_topic, json.dumps(body), retain=False)
+
+    def _publish_sptt_error(self, status, error, ts_iso=None, on_demand=False):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "sptt",
+            "instance_name": self.instance_name,
+            "status": status,
+            "error": error,
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
         }), retain=False)
-        self.log_msg.emit("Frame sent via MQTT", "info")
+
+    def _on_mqtt_command(self, topic, payload):
+        if topic.endswith("/cmd/get_frame"):
+            frame = self._last_frame
+            ts_iso = self._last_shot.isoformat() if self._last_shot else None
+            if frame is None:
+                self._publish_sptt_error("no_frame", "No frame captured yet")
+                self.log_msg.emit("Frame requested but no frame available yet", "warn")
+                return
+            try:
+                jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
+            except Exception as e:
+                self._publish_sptt_error("error", str(e), ts_iso)
+                self.log_msg.emit(f"Frame encode error: {e}", "error")
+                return
+            self._publish_sptt_frame(jpeg_bytes, w, h, ts_iso)
+            self.log_msg.emit("Frame sent via MQTT", "info")
+            return
+
+        if topic.endswith("/cmd/capture_frame"):
+            try:
+                params = json.loads(payload) if payload else {}
+            except json.JSONDecodeError as e:
+                self._publish_sptt_error("bad_request", f"Invalid JSON: {e}",
+                                         on_demand=True)
+                return
+            if not isinstance(params, dict):
+                params = {}
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            self.log_msg.emit(
+                f"On-demand capture queued with params: {params}", "info")
+            return
+
+    def _apply_sptt_params(self, params):
+        """Apply exposure/gain/binning to SPTT camera. Returns (applied, errors)."""
+        applied = {}
+        errors = []
+        from sptt_driver import ENCODING_12BPP, ENCODING_8BPP
+        try:
+            if "exposure" in params:
+                self.cam.set_exposure(float(params["exposure"]))
+                applied["exposure"] = float(params["exposure"])
+            if "gain" in params:
+                self.cam.set_gain(int(params["gain"]))
+                applied["gain"] = int(params["gain"])
+            # Binning/encoding require full reconfigure + restart
+            need_reconfig = "binning" in params or "encoding" in params
+            if need_reconfig:
+                binning = int(params.get("binning", self.cam.binning))
+                enc_param = params.get("encoding")
+                if enc_param in ("12bit", "12", 12):
+                    encoding = ENCODING_12BPP
+                elif enc_param in ("8bit", "8", 8):
+                    encoding = ENCODING_8BPP
+                else:
+                    encoding = self.cam.encoding
+                self.cam.stop()
+                self.cam.configure(
+                    exposure=self.cam.exposure,
+                    gain=self.cam.gain,
+                    binning=binning,
+                    encoding=encoding,
+                )
+                self.cam.start()
+                applied["binning"] = binning
+                applied["encoding"] = "12bit" if encoding == ENCODING_12BPP else "8bit"
+        except Exception as e:
+            errors.append(str(e))
+        return applied, errors
+
+    def _handle_pending_capture(self):
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        if params is None:
+            return
+        self.log_msg.emit("On-demand SPTT capture starting", "info")
+        try:
+            applied, errors = self._apply_sptt_params(params)
+            for err in errors:
+                self.log_msg.emit(f"Param apply warning: {err}", "warn")
+            frame = self.cam.grab_frame()
+            now = dt.now()
+            jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
+            self._publish_sptt_frame(
+                jpeg_bytes, w, h, now.isoformat(),
+                on_demand=True, params=applied)
+            self.log_msg.emit("On-demand SPTT frame sent via MQTT", "info")
+        except Exception as e:
+            self._publish_sptt_error("error", f"Capture failed: {e}", on_demand=True)
+            self.log_msg.emit(f"On-demand capture error: {e}", "error")
 
     def run(self):
         from sptt_driver import save_fits, ENCODING_12BPP, SPTT_CAPTURE_SECONDS
@@ -785,6 +941,10 @@ class SpttScheduledWorkerQt(QThread):
             return
 
         while not self._stop:
+            # Handle on-demand capture requests (outside schedule)
+            if self._pending_capture is not None:
+                self._handle_pending_capture()
+
             now = dt.now()
 
             sec = now.second + now.microsecond / 1_000_000
@@ -1382,6 +1542,8 @@ class InfraWorkerQt(QThread):
         self._last_frame = None
         self._active_until = None
         self._status_path = os.path.join(status_dir, f"{os.getpid()}_infra.json")
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
 
     def request_stop(self):
         self._stop = True
@@ -1392,21 +1554,123 @@ class InfraWorkerQt(QThread):
             self._mqtt.command_received.connect(self._on_mqtt_command)
             self._mqtt.subscribe_commands(cmd_topic)
 
+    def _publish_infra_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
+        import base64
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        body = {
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": "ok",
+            "format": "jpeg",
+            "data": base64.b64encode(jpeg_bytes).decode(),
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }
+        if params:
+            body["params"] = params
+        payload = json.dumps(body)
+        if len(payload) > MQTT_MAX_PAYLOAD_BYTES:
+            self._publish_infra_error(
+                "too_large",
+                f"Frame payload {len(payload)} bytes exceeds broker limit",
+                ts_iso=ts_iso, on_demand=on_demand)
+            self.log_msg.emit(
+                f"Frame too large for MQTT ({len(payload)} bytes)", "warn")
+            return
+        self._mqtt.publish(frame_topic, payload, retain=False)
+
+    def _publish_infra_error(self, status, error, ts_iso=None, on_demand=False):
+        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
+        self._mqtt.publish(frame_topic, json.dumps({
+            "camera_type": "infra",
+            "instance_name": self.instance_name,
+            "status": status,
+            "error": error,
+            "timestamp": ts_iso,
+            "on_demand": on_demand,
+        }), retain=False)
+
+    def _apply_infra_params(self, params):
+        applied = {}
+        errors = []
+        try:
+            if "exposure_us" in params:
+                self.cam.set_exposure(float(params["exposure_us"]))
+                applied["exposure_us"] = float(params["exposure_us"])
+            elif "exposure" in params:
+                # Accept seconds for convenience
+                exp_us = float(params["exposure"]) * 1_000_000
+                self.cam.set_exposure(exp_us)
+                applied["exposure_us"] = exp_us
+            if "gain" in params:
+                self.cam.set_gain(int(params["gain"]))
+                applied["gain"] = int(params["gain"])
+            if "roi_width" in params or "roi_height" in params:
+                w = int(params.get("roi_width", self.cam.roi_width))
+                h = int(params.get("roi_height", self.cam.roi_height))
+                self.cam.set_roi(width=w, height=h)
+                applied["roi_width"] = w
+                applied["roi_height"] = h
+        except Exception as e:
+            errors.append(str(e))
+        return applied, errors
+
+    def _handle_pending_capture(self):
+        from infra_driver import frame_to_jpeg_bytes
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        if params is None:
+            return
+        self.log_msg.emit("On-demand Infra capture starting", "info")
+        try:
+            applied, errors = self._apply_infra_params(params)
+            for err in errors:
+                self.log_msg.emit(f"Param apply warning: {err}", "warn")
+            frame = self.cam.grab_frame()
+            now = dt.now()
+            jpeg_bytes = frame_to_jpeg_bytes(frame)
+            self._publish_infra_ok(
+                jpeg_bytes, now.isoformat(),
+                on_demand=True, params=applied)
+            self.log_msg.emit("On-demand Infra frame sent via MQTT", "info")
+        except Exception as e:
+            self._publish_infra_error("error", f"Capture failed: {e}",
+                                      on_demand=True)
+            self.log_msg.emit(f"On-demand capture error: {e}", "error")
+
     def _on_mqtt_command(self, topic, payload):
-        if topic.endswith("/cmd/get_frame") and self._last_frame is not None:
-            import base64
+        if topic.endswith("/cmd/get_frame"):
             from infra_driver import frame_to_jpeg_bytes
-            jpeg_data = frame_to_jpeg_bytes(self._last_frame)
-            frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-            frame_payload = json.dumps({
-                "camera_type": "infra",
-                "instance_name": self.instance_name,
-                "format": "jpeg",
-                "data": base64.b64encode(jpeg_data).decode(),
-                "timestamp": self._last_shot.isoformat() if self._last_shot else None,
-            })
-            self._mqtt.publish(frame_topic, frame_payload, retain=False)
+            if self._last_frame is None:
+                self._publish_infra_error("no_frame", "No frame captured yet")
+                self.log_msg.emit("Frame requested but no frame available yet", "warn")
+                return
+            ts = self._last_shot.isoformat() if self._last_shot else None
+            try:
+                jpeg_data = frame_to_jpeg_bytes(self._last_frame)
+            except Exception as e:
+                self._publish_infra_error("error", str(e), ts)
+                self.log_msg.emit(f"Frame encode error: {e}", "error")
+                return
+            self._publish_infra_ok(jpeg_data, ts)
             self.log_msg.emit("Frame sent via MQTT", "info")
+            return
+
+        if topic.endswith("/cmd/capture_frame"):
+            try:
+                params = json.loads(payload) if payload else {}
+            except json.JSONDecodeError as e:
+                self._publish_infra_error("bad_request", f"Invalid JSON: {e}",
+                                          on_demand=True)
+                return
+            if not isinstance(params, dict):
+                params = {}
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            self.log_msg.emit(
+                f"On-demand capture queued with params: {params}", "info")
+            return
 
     def run(self):
         from infra_driver import save_tiff, save_png, save_fits
@@ -1421,6 +1685,10 @@ class InfraWorkerQt(QThread):
         self._save_status("running")
 
         while not self._stop:
+            # Handle on-demand capture requests (outside schedule)
+            if self._pending_capture is not None:
+                self._handle_pending_capture()
+
             now = dt.now()
 
             active_end = None

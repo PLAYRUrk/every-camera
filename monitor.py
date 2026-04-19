@@ -97,6 +97,101 @@ class FrameViewerDialog(QDialog):
                           Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 
+class CaptureParamsDialog(QDialog):
+    """Dialog to enter capture params for on-demand frame request."""
+
+    def __init__(self, instance_name, camera_type, parent=None):
+        super().__init__(parent)
+        self.camera_type = (camera_type or "").lower()
+        self.setWindowTitle(f"Capture from {instance_name}")
+        self.resize(360, 220)
+        from PyQt5.QtWidgets import QFormLayout, QDialogButtonBox
+
+        lay = QVBoxLayout(self)
+        lbl = QLabel(
+            f"<b>{instance_name}</b> ({self.camera_type.upper() or 'unknown'})"
+            "<br>Leave a field blank to keep current value.")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        form = QFormLayout()
+        self._fields = {}
+
+        if self.camera_type == "cannon":
+            for key, placeholder in [
+                ("iso", "e.g. 100, 400, 1600"),
+                ("shutterspeed", "e.g. 1/125, 1, 30"),
+                ("aperture", "e.g. 5.6"),
+                ("imageformat", "e.g. Large Fine JPEG"),
+                ("whitebalance", "e.g. Daylight"),
+            ]:
+                le = QLineEdit()
+                le.setPlaceholderText(placeholder)
+                form.addRow(key, le)
+                self._fields[key] = le
+        elif self.camera_type == "sptt":
+            for key, placeholder in [
+                ("exposure", "seconds, e.g. 0.88"),
+                ("gain", "0..255, e.g. 100"),
+                ("binning", "0 (1x1), 1 (2x2), 3 (4x4)"),
+                ("encoding", "8bit or 12bit"),
+            ]:
+                le = QLineEdit()
+                le.setPlaceholderText(placeholder)
+                form.addRow(key, le)
+                self._fields[key] = le
+        elif self.camera_type == "infra":
+            for key, placeholder in [
+                ("exposure_us", "microseconds, e.g. 10000"),
+                ("gain", "e.g. 1"),
+                ("roi_width", "pixels, e.g. 1280"),
+                ("roi_height", "pixels, e.g. 1024"),
+            ]:
+                le = QLineEdit()
+                le.setPlaceholderText(placeholder)
+                form.addRow(key, le)
+                self._fields[key] = le
+        else:
+            form.addRow(QLabel("Unknown camera type — no fields available."))
+
+        lay.addLayout(form)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def get_params(self):
+        params = {}
+        for key, field in self._fields.items():
+            val = field.text().strip()
+            if not val:
+                continue
+            # Type coercion for numeric fields
+            int_keys = {
+                "sptt": {"gain", "binning"},
+                "infra": {"gain", "roi_width", "roi_height"},
+            }.get(self.camera_type, set())
+            float_keys = {
+                "sptt": {"exposure"},
+                "infra": {"exposure_us"},
+            }.get(self.camera_type, set())
+            if key in int_keys:
+                try:
+                    params[key] = int(val)
+                except ValueError:
+                    params[key] = val
+            elif key in float_keys:
+                try:
+                    params[key] = float(val)
+                except ValueError:
+                    params[key] = val
+            else:
+                params[key] = val
+        return params
+
+
 # ---------------------------------------------------------------------------
 # Shared table logic
 # ---------------------------------------------------------------------------
@@ -278,9 +373,17 @@ class MqttTab(QWidget):
 
         self.btn_get_frame = QPushButton("View Last Frame")
         self.btn_get_frame.setEnabled(False)
+        self.btn_capture_frame.setEnabled(False)
         self.btn_get_frame.setToolTip("Request last frame from selected instance")
         self.btn_get_frame.clicked.connect(self._on_request_frame)
         footer_lay.addWidget(self.btn_get_frame)
+
+        self.btn_capture_frame = QPushButton("Capture with Params…")
+        self.btn_capture_frame.setEnabled(False)
+        self.btn_capture_frame.setToolTip(
+            "Capture a new frame outside schedule with custom exposure/gain/ISO")
+        self.btn_capture_frame.clicked.connect(self._on_capture_frame)
+        footer_lay.addWidget(self.btn_capture_frame)
 
         lay.addLayout(footer_lay)
 
@@ -339,12 +442,14 @@ class MqttTab(QWidget):
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_get_frame.setEnabled(False)
+        self.btn_capture_frame.setEnabled(False)
 
     def _on_broker_connected(self):
         self.lbl_conn.setText(f"Connected to {self.le_host.text().strip()}")
         self.lbl_conn.setStyleSheet("color:#007700; font-weight:bold;")
         self.btn_disconnect.setEnabled(True)
         self.btn_get_frame.setEnabled(True)
+        self.btn_capture_frame.setEnabled(True)
 
     def _on_broker_disconnected(self):
         self.lbl_conn.setText("Disconnected")
@@ -352,6 +457,7 @@ class MqttTab(QWidget):
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_get_frame.setEnabled(False)
+        self.btn_capture_frame.setEnabled(False)
 
     def _on_broker_error(self, msg):
         self.lbl_conn.setText(f"Error: {msg}")
@@ -359,6 +465,7 @@ class MqttTab(QWidget):
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
         self.btn_get_frame.setEnabled(False)
+        self.btn_capture_frame.setEnabled(False)
 
     def _on_message(self, topic, payload):
         # Handle frame responses
@@ -403,6 +510,51 @@ class MqttTab(QWidget):
 
             self._pending_frame_instance = instance_name
             self._frame_timeout_timer.start(FRAME_REQUEST_TIMEOUT_MS)
+
+    def _on_capture_frame(self):
+        """Request an on-demand frame with custom exposure/gain params."""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No selection",
+                                    "Select an instance in the table first.")
+            return
+        instance_item = self.table.item(row, 0)
+        if not instance_item:
+            return
+        instance_name = instance_item.text()
+
+        # Look up camera_type from cached status
+        camera_type = None
+        for (data, _) in self._instances.values():
+            if data.get("instance_name") == instance_name:
+                camera_type = data.get("camera_type")
+                break
+
+        dlg = CaptureParamsDialog(instance_name, camera_type, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        params = dlg.get_params()
+
+        if not self._subscriber:
+            return
+        prefix = self.le_prefix.text().strip() or "every_camera"
+        cmd_topic = f"{prefix}/{instance_name}/cmd/capture_frame"
+        self._subscriber.publish(
+            cmd_topic, json.dumps(params).encode("utf-8"), retain=False)
+        self.lbl_footer.setText(
+            f"On-demand capture requested from {instance_name}: {params or '(defaults)'}")
+
+        if not self._frame_viewer or not self._frame_viewer.isVisible():
+            self._frame_viewer = FrameViewerDialog(self)
+        self._frame_viewer.lbl_image.setText(
+            f"Capturing new frame from {instance_name}...\nParams: {params}")
+        self._frame_viewer.lbl_info.setText(f"On-demand: {instance_name}")
+        self._frame_viewer.show()
+        self._frame_viewer.raise_()
+
+        self._pending_frame_instance = instance_name
+        # On-demand captures may take longer (exposure, reconfigure) — give more time.
+        self._frame_timeout_timer.start(max(FRAME_REQUEST_TIMEOUT_MS, 30000))
 
     def _on_frame_timeout(self):
         instance_name = self._pending_frame_instance
