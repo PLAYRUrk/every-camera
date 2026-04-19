@@ -64,21 +64,24 @@ MAX_GRAB_RETRIES = 3
 
 INFRA_CAPTURE_SECONDS = [0, 30]
 
-# Empirical calibration: the camera's exposure register is clocked much slower
-# than the naive 20 MHz assumption would suggest. Calibrated against measured
-# USB data-span across 50ms / 150ms / 300ms exposures:
-#   50ms  -> 6810 ticks -> 55.4ms  (~8us/tick, small-tick noise)
-#   150ms -> 20430 ticks -> 125.6ms (~6us/tick)
-#   300ms -> 40860 ticks -> 245.7ms (~6us/tick)
-# Effective clock is ~167 kHz, i.e. 1 tick == ~6 us. A scale of 1/6 matches
-# actual exposure to requested value to within ~3% in the 150-300ms range.
-EXPOSURE_TICKS_PER_US = 1.0 / 6.0  # ~= 0.1667
+# Vendor protocol (reverse-engineered from Wireshark capture, infra-camera/
+# reCode/data/exp_100_*): exposure is set via a TWO-COMMAND sequence.
+#   1) CMD_EXPOSURE (0xFF) carries a constant 0x00000001 — acts as a "use
+#      long-exposure register" enable / mode-set handshake.
+#   2) CMD_EXPOSURE_ALT (0xF5) carries the exposure duration expressed in
+#      ticks of the camera's low-rate clock. For the captured exposure of
+#      100 ms the payload was 13332, giving a tick of exactly 7.5 us
+#      (= 133.33 kHz clock). This matches our earlier "scale hunt" where
+#      150 ms with the old `* 20` formula produced ~22 s of actual
+#      integration: 3_000_000 ticks * 7.5 us = 22.5 s.
+# Using this protocol removes the 16-bit register overflow problem — the
+# camera accepts ~32-bit tick counts, covering exposures up to ~32 seconds
+# at the 7.5 us tick plus even longer once we verify the full register width.
+EXPOSURE_TICKS_PER_US = 1.0 / 7.5  # ~= 0.1333
 
-# Exposure register appears to be effectively 16-bit (low word) with an
-# additional high word that does not behave linearly. Requests whose tick
-# count exceeds 0xFFFF start to overflow / wrap. Warn the user when this
-# happens so they know the resulting exposure may not match the request.
-EXPOSURE_TICKS_LINEAR_MAX = 0xFFFF  # ~393 ms of exposure at 6us/tick
+# Fixed payload for CMD_EXPOSURE (0xFF) — sent unchanged before every
+# CMD_EXPOSURE_ALT to select the long-exposure register path.
+CMD_EXPOSURE_ENABLE_VALUE = 1
 
 
 # ---------------------------------------------------------------------------
@@ -362,51 +365,37 @@ class TanhoCamera:
         return frame
 
     def set_exposure(self, microseconds: float):
-        """Set exposure in microseconds.
+        """Set exposure via the vendor's two-command protocol.
 
-        Hypothesis: CMD_EXPOSURE (0xFF) is the fine (sub-millisecond) register
-        in ~6us units, and CMD_EXPOSURE_ALT (0xF5) is the coarse register in
-        1-ms units. The camera sums them to form the total integration time.
-        Using separate encoding lets us request exposures up to tens of seconds
-        without overflowing the 16-bit fine register.
-        """
+        Command 1 (0xFF): fixed enable/handshake payload of 0x00000001.
+        Command 2 (0xF5): exposure duration as uint32 ticks, 1 tick = 7.5 us.
+
+        Byte order in both packets uses the firmware's word-swap convention:
+        cmd[4..7] = [b1, b0, b3, b2] where b is the little-endian uint32."""
         if not self._connected:
             return
         t0 = time.perf_counter()
         self._exposure_us = microseconds
 
-        total_us = int(microseconds)
-        coarse_ms = total_us // 1000
-        fine_us = total_us - coarse_ms * 1000
-        fine_ticks = max(0, int(fine_us * EXPOSURE_TICKS_PER_US))
-        coarse_ticks = max(0, coarse_ms)
-        # Guarantee at least one tick of integration even for tiny requests.
-        if fine_ticks == 0 and coarse_ticks == 0:
-            fine_ticks = 1
-
-        fb = fine_ticks.to_bytes(4, 'little')
-        cb = coarse_ticks.to_bytes(4, 'little')
-
+        enable_val = CMD_EXPOSURE_ENABLE_VALUE
+        eb = enable_val.to_bytes(4, 'little')
         cmd1 = self._make_cmd_packet(CMD_EXPOSURE)
-        cmd1[4] = fb[1]; cmd1[5] = fb[0]
-        cmd1[6] = fb[3]; cmd1[7] = fb[2]
+        cmd1[4] = eb[1]; cmd1[5] = eb[0]
+        cmd1[6] = eb[3]; cmd1[7] = eb[2]
         self._execute_raw_cmd(cmd1)
 
+        ticks = max(1, int(round(microseconds * EXPOSURE_TICKS_PER_US)))
+        tb = ticks.to_bytes(4, 'little')
         cmd2 = self._make_cmd_packet(CMD_EXPOSURE_ALT)
-        cmd2[4] = cb[1]; cmd2[5] = cb[0]
-        cmd2[6] = cb[3]; cmd2[7] = cb[2]
+        cmd2[4] = tb[1]; cmd2[5] = tb[0]
+        cmd2[6] = tb[3]; cmd2[7] = tb[2]
         self._execute_raw_cmd(cmd2)
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us -> "
-              f"coarse_ms={coarse_ms} (bytes [{cb[1]:02X} {cb[0]:02X} "
-              f"{cb[3]:02X} {cb[2]:02X}]) + fine_ticks={fine_ticks} "
-              f"(bytes [{fb[1]:02X} {fb[0]:02X} {fb[3]:02X} {fb[2]:02X}]) "
+        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us "
+              f"-> enable=1 (0xFF) + ticks={ticks} @7.5us (0xF5) "
+              f"bytes=[{tb[1]:02X} {tb[0]:02X} {tb[3]:02X} {tb[2]:02X}] "
               f"cmd_time={dt_ms:.2f}ms", flush=True)
-        if coarse_ticks > 0xFFFF or fine_ticks > 0xFFFF:
-            print(f"[WARN] Exposure encoding overflows 16-bit "
-                  f"(coarse={coarse_ticks}, fine={fine_ticks}). "
-                  f"Camera may clamp.", flush=True)
 
     def set_gain(self, gain: int):
         """Set gain (0-120)."""
@@ -452,22 +441,27 @@ class TanhoCamera:
 # ---------------------------------------------------------------------------
 # Image saving
 # ---------------------------------------------------------------------------
-def save_fits(filepath, frame_16, exposure_us=None, gain=None, roi=None):
-    """Save 16-bit frame as FITS with metadata header."""
+def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
+              stack_n=1, sub_exposure_us=None):
+    """Save frame as FITS with metadata header. Supports uint16 and uint32
+    (stacked) frames."""
     from astropy.io import fits
-    hdu = fits.PrimaryHDU(data=frame_16)
+    hdu = fits.PrimaryHDU(data=frame)
     hdr = hdu.header
     hdr['INSTRUME'] = ('THCAMSW1300', 'Camera model')
     hdr['SENSOR'] = ('IMX990-AABA-C', 'Sensor model')
-    hdr['BITPIX'] = (16, 'Bits per pixel')
     hdr['DATE-OBS'] = (dt.utcnow().isoformat(), 'Observation date (UTC)')
     if exposure_us is not None:
-        hdr['EXPTIME'] = (exposure_us / 1e6, 'Exposure time (seconds)')
-        hdr['EXPTUS'] = (exposure_us, 'Exposure time (microseconds)')
+        hdr['EXPTIME'] = (exposure_us / 1e6, 'Total integration time (seconds)')
+        hdr['EXPTUS'] = (exposure_us, 'Total integration time (microseconds)')
     if gain is not None:
         hdr['GAIN'] = (gain, 'Camera gain')
     if roi is not None:
         hdr['ROI'] = (roi, 'Region of interest')
+    if stack_n > 1:
+        hdr['STACK_N'] = (stack_n, 'Number of stacked sub-frames')
+        if sub_exposure_us is not None:
+            hdr['SUB_EXP'] = (sub_exposure_us / 1e6, 'Sub-frame exposure (s)')
     hdu.writeto(filepath, overwrite=True)
 
 
@@ -508,9 +502,13 @@ def save_png(filepath, frame_16):
         raise RuntimeError("Install opencv-python or Pillow to save PNG images")
 
 
-def frame_to_jpeg_bytes(frame_16):
-    """Convert 16-bit frame to JPEG bytes for MQTT transmission."""
-    clipped = np.clip(frame_16 * (255.0 / ADC_MAX), 0, 255).astype(np.uint8)
+def frame_to_jpeg_bytes(frame):
+    """Convert 16-bit or stacked uint32 frame to 8-bit JPEG for MQTT."""
+    if frame.dtype == np.uint32:
+        fmax = int(frame.max()) or 1
+        clipped = np.clip(frame * (255.0 / fmax), 0, 255).astype(np.uint8)
+    else:
+        clipped = np.clip(frame * (255.0 / ADC_MAX), 0, 255).astype(np.uint8)
     try:
         import cv2
         _, buf = cv2.imencode('.jpg', clipped, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -626,8 +624,6 @@ class InfraWorkerConsole(threading.Thread):
                 changed = True
                 time.sleep(0.05)
             if exp_us is not None:
-                # Final re-apply guarantees the requested exposure is the last
-                # register write, regardless of earlier command side effects.
                 self.cam.set_exposure(exp_us)
         except Exception as e:
             errors.append(str(e))
@@ -823,8 +819,6 @@ class InfraWorkerConsole(threading.Thread):
         ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
         try:
-            # Reset USB pipeline between captures — after any idle period the
-            # host-side FIFO or the camera itself can stop cooperating.
             try:
                 self.cam._flush_usb()
             except Exception:
@@ -1034,8 +1028,6 @@ def run_console_infra(config_path=None, preview=False):
     time.sleep(0.05)
     cam.set_gain(gain_val)
     time.sleep(0.05)
-    # Re-apply exposure as a final write to guarantee the camera ends in the
-    # requested state regardless of any prior persisted register values.
     cam.set_exposure(exposure_us)
     time.sleep(0.05)
     print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height} "
