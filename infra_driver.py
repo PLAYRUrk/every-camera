@@ -537,26 +537,62 @@ class InfraWorkerConsole(threading.Thread):
     def _apply_params(self, params):
         applied = {}
         errors = []
+        changed = False
         try:
             if "exposure_us" in params:
                 self.cam.set_exposure(float(params["exposure_us"]))
                 applied["exposure_us"] = float(params["exposure_us"])
+                changed = True
             elif "exposure" in params:
                 exp_us = float(params["exposure"]) * 1_000_000
                 self.cam.set_exposure(exp_us)
                 applied["exposure_us"] = exp_us
+                changed = True
             if "gain" in params:
                 self.cam.set_gain(int(params["gain"]))
                 applied["gain"] = int(params["gain"])
+                changed = True
             if "roi_width" in params or "roi_height" in params:
                 w = int(params.get("roi_width", self.cam.roi_width))
                 h = int(params.get("roi_height", self.cam.roi_height))
                 self.cam.set_roi(width=w, height=h)
                 applied["roi_width"] = w
                 applied["roi_height"] = h
+                changed = True
         except Exception as e:
             errors.append(str(e))
+        if changed:
+            try:
+                self._resync_camera()
+            except Exception as e:
+                errors.append(f"resync: {e}")
         return applied, errors
+
+    def _resync_camera(self, skip_frames: int = 3):
+        """Flush USB buffer and discard a few frames after config change so
+        subsequent grab_frame() returns a frame with the NEW exposure/gain/ROI."""
+        t0 = time.perf_counter()
+        # After set_exposure the camera briefly stops streaming while applying
+        # the new integration time. Wait at least one full exposure period plus
+        # a small margin before flushing, otherwise flush+grab will race with
+        # the camera's own reconfiguration and hit USB timeouts.
+        settle_s = max(0.15, self.cam.exposure_us / 1e6 + 0.1)
+        time.sleep(settle_s)
+        try:
+            self.cam._flush_usb()
+        except Exception as e:
+            print(f"[INFRA] resync flush error: {e}", flush=True)
+        discarded = 0
+        for i in range(skip_frames):
+            try:
+                self.cam.grab_frame(verbose_timing=False)
+                discarded += 1
+            except Exception as e:
+                print(f"[INFRA] resync skip-frame {i} error: {e}", flush=True)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[INFRA] resync: settle={settle_s*1000:.0f}ms + flush + "
+              f"discarded {discarded}/{skip_frames} frames, total={dt_ms:.1f}ms "
+              f"(exposure_us={self.cam.exposure_us})", flush=True)
 
     def _handle_pending_capture(self):
         with self._pending_capture_lock:
@@ -907,6 +943,22 @@ def run_console_infra(config_path=None, preview=False):
         w, h = ROI_MODES[roi]
         cam.set_roi(w, h)
     print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height}")
+
+    # Let the camera settle after exposure/gain/ROI so the first scheduled
+    # frame is actually captured with the configured exposure, not a stale
+    # frame already in the USB pipeline.
+    settle_s = max(0.15, exposure_us / 1e6 + 0.1)
+    time.sleep(settle_s)
+    try:
+        cam._flush_usb()
+    except Exception:
+        pass
+    for i in range(3):
+        try:
+            cam.grab_frame(verbose_timing=False)
+        except Exception as exc:
+            print(f"[WARN] Warm-up frame {i} failed: {exc}")
+    print(f"[INFO] Warm-up done (settle={settle_s*1000:.0f}ms + 3 skip frames)")
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg)
