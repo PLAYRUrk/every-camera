@@ -241,21 +241,39 @@ class TanhoCamera:
         self._usb_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
         self._transferred = ctypes.c_int(0)
 
-    def _flush_usb(self):
+    def _flush_usb(self, max_chunks: int = 4096, idle_streak: int = 3,
+                   verbose: bool = False):
+        """Drain USB FIFO until it stays idle for `idle_streak` consecutive
+        short reads. Prevents accumulation of backlog frames between captures
+        during long-interval scheduled runs."""
         if not self._devh_ref:
-            return
+            return 0
         devh = self._devh_ref.value
         if not devh:
-            return
+            return 0
         flush_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
         transferred = ctypes.c_int(0)
-        for _ in range(20):
+        drained_chunks = 0
+        drained_bytes = 0
+        idle = 0
+        for _ in range(max_chunks):
             ret = self._bulk_transfer(
                 devh, USB_EP_IN, flush_chunk, USB_CHUNK_SIZE,
-                ctypes.byref(transferred), 10
+                ctypes.byref(transferred), 5
             )
-            if ret != 0:
-                break
+            got = (ret == 0 and transferred.value > 0)
+            if got:
+                drained_chunks += 1
+                drained_bytes += transferred.value
+                idle = 0
+            else:
+                idle += 1
+                if idle >= idle_streak:
+                    break
+        if verbose and drained_chunks:
+            print(f"[INFRA] _flush_usb: drained {drained_chunks} chunks "
+                  f"({drained_bytes} bytes)", flush=True)
+        return drained_chunks
 
     def _read_frame_usb(self, verbose_timing: bool = False) -> bytes:
         devh = self._devh_ref.value

@@ -50,7 +50,7 @@ class MqttPublisherConsole:
               flush=True)
         try:
             self._client.reconnect_delay_set(min_delay=2, max_delay=30)
-            self._client.connect_async(self._host, self._port, keepalive=60)
+            self._client.connect_async(self._host, self._port, keepalive=120)
             self._client.loop_start()
         except Exception as exc:
             print(f"[WARN] MQTT connect error: {exc}", flush=True)
@@ -150,7 +150,7 @@ try:
             self._stopping = False
             try:
                 self._client.reconnect_delay_set(min_delay=2, max_delay=30)
-                self._client.connect_async(self._host, self._port, keepalive=60)
+                self._client.connect_async(self._host, self._port, keepalive=120)
                 self._client.loop_start()
             except Exception as e:
                 self.error.emit(str(e))
@@ -224,7 +224,7 @@ try:
             self._topics = [topic] if isinstance(topic, str) else list(topic)
             try:
                 self._client.reconnect_delay_set(min_delay=2, max_delay=30)
-                self._client.connect_async(self._host, self._port, keepalive=60)
+                self._client.connect_async(self._host, self._port, keepalive=120)
                 self._client.loop_start()
             except Exception as e:
                 self.error.emit(str(e))
