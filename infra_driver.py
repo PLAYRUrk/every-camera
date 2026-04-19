@@ -64,6 +64,14 @@ MAX_GRAB_RETRIES = 3
 
 INFRA_CAPTURE_SECONDS = [0, 30]
 
+# Empirical calibration: the camera's exposure register is clocked much slower
+# than the naive 20 MHz assumption would suggest. Measured by comparing
+# requested vs actual integration time via USB data-span:
+#   requested 150000us -> actual ~22000ms -> scale factor ~146.8x overshoot.
+# That implies the effective clock is ~136 kHz, i.e. 1 tick ~= 7.35 us.
+# The resulting multiplier (ticks per microsecond) is:
+EXPOSURE_TICKS_PER_US = 20.0 / 146.8  # ~= 0.1362
+
 
 # ---------------------------------------------------------------------------
 # Library discovery
@@ -351,7 +359,7 @@ class TanhoCamera:
             return
         t0 = time.perf_counter()
         self._exposure_us = microseconds
-        ticks = int(microseconds * 20)
+        ticks = max(1, int(microseconds * EXPOSURE_TICKS_PER_US))
         b = ticks.to_bytes(4, 'little')
 
         cmd1 = self._make_cmd_packet(CMD_EXPOSURE)
@@ -364,7 +372,8 @@ class TanhoCamera:
         cmd2[6] = b[3]; cmd2[7] = b[2]
         self._execute_raw_cmd(cmd2)
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us ticks={ticks} "
+        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us "
+              f"scale={EXPOSURE_TICKS_PER_US:.4f} ticks={ticks} "
               f"bytes=[{b[1]:02X} {b[0]:02X} {b[3]:02X} {b[2]:02X}] "
               f"cmd_time={dt_ms:.2f}ms", flush=True)
 
