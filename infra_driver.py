@@ -442,6 +442,20 @@ class TanhoCamera:
         frame[:, :self._raw_w] = raw_16[0::2]
         frame[:, self._raw_w:] = raw_16[1::2]
 
+        if verbose_timing:
+            # Fingerprint: MD5 of raw bytes + stats. If two consecutive
+            # captures print the SAME md5 the pipeline is replaying the same
+            # buffer; if md5 differs but stats are near-identical the sensor
+            # is just seeing a stable scene dominated by fixed-pattern noise.
+            import hashlib
+            md5 = hashlib.md5(frame_bytes).hexdigest()[:12]
+            print(f"[INFRA] frame-stats: md5={md5} "
+                  f"mean={frame.mean():.1f} std={frame.std():.1f} "
+                  f"min={int(frame.min())} max={int(frame.max())} "
+                  f"first4={frame_bytes[:4].hex()} "
+                  f"mid4={frame_bytes[len(frame_bytes)//2:len(frame_bytes)//2+4].hex()}",
+                  flush=True)
+
         return frame
 
     def set_exposure(self, microseconds: float):
