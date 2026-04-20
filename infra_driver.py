@@ -352,10 +352,15 @@ class TanhoCamera:
                 markers.append((pos, ci, chunk_ts[ci]))
             search = pos + 1
 
-        # Pick the first marker whose full payload lies in contiguous valid
-        # chunks. Fall back to scanning further markers if the first is gappy.
+        # Pick the first marker whose full payload (a) lies in contiguous
+        # valid chunks and (b) decodes to plausible 12-bit pixel data. The
+        # 12-bit check filters out spurious sync-marker matches inside image
+        # payload: the real sync header is always followed by pixels whose
+        # top 4 bits are zero (ADC_MAX=4094), so a misaligned extraction
+        # fails the `(pixels & 0xF000) == 0` test almost immediately.
         frame_bytes = None
         chosen_idx = -1
+        rejected_misaligned = 0
         for m_idx, (pos, ci, _ts) in enumerate(markers):
             data_start = pos + SYNC_HEADER_SIZE
             data_end = data_start + self._frame_size
@@ -363,10 +368,19 @@ class TanhoCamera:
                 continue
             c0 = data_start // USB_CHUNK_SIZE
             c1 = (data_end - 1) // USB_CHUNK_SIZE
-            if all(valid[c] for c in range(c0, c1 + 1)):
-                frame_bytes = buf_bytes[data_start:data_end]
-                chosen_idx = m_idx
-                break
+            if not all(valid[c] for c in range(c0, c1 + 1)):
+                continue
+            candidate = buf_bytes[data_start:data_end]
+            pixels = np.frombuffer(candidate, dtype=np.uint16)
+            bad = int(np.count_nonzero(pixels & 0xF000))
+            # Allow a handful of corrupted pixels; more than that means the
+            # window is shifted (spurious sync marker).
+            if bad > 16:
+                rejected_misaligned += 1
+                continue
+            frame_bytes = candidate
+            chosen_idx = m_idx
+            break
 
         # Estimate real frame period from sync markers spaced at least one
         # full frame apart (4-byte SYNC_MARKER sometimes appears spuriously
@@ -393,7 +407,8 @@ class TanhoCamera:
             print(f"[INFRA] usb-read: valid={data_chunks}/{self._num_chunks} "
                   f"timeouts={timeouts} errors={errors} "
                   f"first@{first_data_idx} last@{last_data_idx} "
-                  f"sync_markers={len(real_markers)} (raw={len(markers)}) "
+                  f"sync_markers={len(real_markers)} (raw={len(markers)}, "
+                  f"misaligned_rejected={rejected_misaligned}) "
                   f"chosen={chosen_str} wait={wait_ms:.0f}ms "
                   f"span={data_span_ms:.0f}ms total={total_ms:.0f}ms "
                   f"frame_period={period_str}", flush=True)
