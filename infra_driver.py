@@ -368,12 +368,19 @@ class TanhoCamera:
                 chosen_idx = m_idx
                 break
 
-        # Estimate real frame period from consecutive sync markers.
+        # Estimate real frame period from sync markers spaced at least one
+        # full frame apart (4-byte SYNC_MARKER sometimes appears spuriously
+        # inside image data, so adjacent markers in the same chunk are bogus).
         frame_period_s = None
-        if len(markers) >= 2:
-            frame_period_s = markers[1][2] - markers[0][2]
+        real_markers = []
+        for m in markers:
+            if not real_markers or (m[0] - real_markers[-1][0]) >= self._frame_size:
+                real_markers.append(m)
+        if len(real_markers) >= 2:
+            frame_period_s = real_markers[1][2] - real_markers[0][2]
         self._last_frame_period_s = frame_period_s
         self._last_sync_count = len(markers)
+        self._last_real_sync_count = len(real_markers)
 
         if verbose_timing:
             wait_ms = ((t_first_data or t_end) - t_start) * 1000.0
@@ -386,10 +393,10 @@ class TanhoCamera:
             print(f"[INFRA] usb-read: valid={data_chunks}/{self._num_chunks} "
                   f"timeouts={timeouts} errors={errors} "
                   f"first@{first_data_idx} last@{last_data_idx} "
-                  f"sync_markers={len(markers)} chosen={chosen_str} "
-                  f"wait={wait_ms:.0f}ms span={data_span_ms:.0f}ms "
-                  f"total={total_ms:.0f}ms frame_period={period_str}",
-                  flush=True)
+                  f"sync_markers={len(real_markers)} (raw={len(markers)}) "
+                  f"chosen={chosen_str} wait={wait_ms:.0f}ms "
+                  f"span={data_span_ms:.0f}ms total={total_ms:.0f}ms "
+                  f"frame_period={period_str}", flush=True)
 
         return frame_bytes
 
@@ -424,7 +431,7 @@ class TanhoCamera:
                       flush=True)
             else:
                 print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
-                      f"measured_frame_period=n/a (only 1 sync marker) "
+                      f"measured_frame_period=n/a (only 1 real frame in stream) "
                       f"grab_total={grab_ms:.0f}ms", flush=True)
 
         raw_16 = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(
