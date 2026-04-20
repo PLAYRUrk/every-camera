@@ -241,11 +241,13 @@ class TanhoCamera:
         self._usb_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
         self._transferred = ctypes.c_int(0)
 
-    def _flush_usb(self, max_chunks: int = 4096, idle_streak: int = 3,
-                   verbose: bool = False):
+    def _flush_usb(self, max_chunks: int = 4096, idle_streak: int = 10,
+                   chunk_timeout_ms: int = 20, verbose: bool = False):
         """Drain USB FIFO until it stays idle for `idle_streak` consecutive
-        short reads. Prevents accumulation of backlog frames between captures
-        during long-interval scheduled runs."""
+        empty reads at `chunk_timeout_ms` each. Previous 5ms/3-streak was
+        too aggressive — it exited the moment the camera had a momentary
+        pause mid-stream, leaving the tail of an old frame in the pipe that
+        then became the "first sync marker" on the next read."""
         if not self._devh_ref:
             return 0
         devh = self._devh_ref.value
@@ -259,7 +261,7 @@ class TanhoCamera:
         for _ in range(max_chunks):
             ret = self._bulk_transfer(
                 devh, USB_EP_IN, flush_chunk, USB_CHUNK_SIZE,
-                ctypes.byref(transferred), 5
+                ctypes.byref(transferred), chunk_timeout_ms
             )
             got = (ret == 0 and transferred.value > 0)
             if got:
@@ -271,16 +273,36 @@ class TanhoCamera:
                 if idle >= idle_streak:
                     break
         if verbose and drained_chunks:
-            print(f"[INFRA] _flush_usb: drained {drained_chunks} chunks "
-                  f"({drained_bytes} bytes)", flush=True)
+            print(f"[INFRA] flush: drained {drained_chunks} chunks "
+                  f"({drained_bytes/1024:.0f} KiB)", flush=True)
         return drained_chunks
 
     def _read_frame_usb(self, verbose_timing: bool = False) -> bytes:
+        """Read one frame worth of USB data and extract the freshest complete
+        frame.
+
+        Critical fix vs. the old implementation: chunks that time out are NOT
+        copied into the shared buffer. Previously, on timeout we still memmoved
+        `self._usb_chunk` (which still held bytes from the PREVIOUS successful
+        transfer) into the next slot — that duplicated good data into every
+        idle slot and produced phantom sync markers pointing at stale frames.
+        Now invalid slots stay zero and we only accept a sync marker if the
+        whole frame payload falls in contiguous valid chunks.
+
+        Also measures per-chunk timestamps so we can estimate the real
+        frame period (≈ exposure + readout) from the spacing between
+        consecutive sync markers in the stream.
+        """
         devh = self._devh_ref.value
         if not devh:
             raise RuntimeError("USB device handle not initialized")
 
         buf_addr = ctypes.addressof(self._usb_buffer)
+        # Zero the buffer so timed-out slots cannot impersonate fresh data.
+        ctypes.memset(buf_addr, 0, self._usb_buf_size)
+
+        valid = bytearray(self._num_chunks)
+        chunk_ts = [0.0] * self._num_chunks
 
         timeouts = 0
         errors = 0
@@ -290,63 +312,86 @@ class TanhoCamera:
         t_start = time.perf_counter()
         t_first_data = None
         t_last_data = None
-        cur_to_run = 0
-        longest_to_run = 0
-        longest_to_run_start = -1
+
         for i in range(self._num_chunks):
             ret = self._bulk_transfer(
                 devh, USB_EP_IN, self._usb_chunk, USB_CHUNK_SIZE,
                 ctypes.byref(self._transferred), USB_TIMEOUT
             )
             got_data = (ret == 0 and self._transferred.value > 0)
-            if ret == -7 or (ret == 0 and self._transferred.value == 0):
-                timeouts += 1
-                cur_to_run += 1
-                if cur_to_run > longest_to_run:
-                    longest_to_run = cur_to_run
-                    longest_to_run_start = i - cur_to_run + 1
-            elif ret != 0:
-                errors += 1
-                cur_to_run = 0
-            else:
-                cur_to_run = 0
             if got_data:
+                n = self._transferred.value
+                ctypes.memmove(buf_addr + i * USB_CHUNK_SIZE,
+                               self._usb_chunk, n)
+                valid[i] = 1
+                now = time.perf_counter()
+                chunk_ts[i] = now
                 data_chunks += 1
                 if first_data_idx < 0:
                     first_data_idx = i
-                    t_first_data = time.perf_counter()
+                    t_first_data = now
                 last_data_idx = i
-                t_last_data = time.perf_counter()
-            ctypes.memmove(
-                buf_addr + i * USB_CHUNK_SIZE,
-                self._usb_chunk,
-                USB_CHUNK_SIZE
-            )
+                t_last_data = now
+            elif ret == -7 or (ret == 0 and self._transferred.value == 0):
+                timeouts += 1
+            else:
+                errors += 1
 
         t_end = time.perf_counter()
+
+        # Find all sync markers, keep only those sitting in valid chunks.
+        buf_bytes = ctypes.string_at(buf_addr, self._usb_buf_size)
+        markers = []  # (byte_pos, chunk_idx, timestamp)
+        search = 0
+        while True:
+            pos = buf_bytes.find(SYNC_MARKER, search)
+            if pos < 0:
+                break
+            ci = pos // USB_CHUNK_SIZE
+            if valid[ci]:
+                markers.append((pos, ci, chunk_ts[ci]))
+            search = pos + 1
+
+        # Pick the first marker whose full payload lies in contiguous valid
+        # chunks. Fall back to scanning further markers if the first is gappy.
+        frame_bytes = None
+        chosen_idx = -1
+        for m_idx, (pos, ci, _ts) in enumerate(markers):
+            data_start = pos + SYNC_HEADER_SIZE
+            data_end = data_start + self._frame_size
+            if data_end > self._usb_buf_size:
+                continue
+            c0 = data_start // USB_CHUNK_SIZE
+            c1 = (data_end - 1) // USB_CHUNK_SIZE
+            if all(valid[c] for c in range(c0, c1 + 1)):
+                frame_bytes = buf_bytes[data_start:data_end]
+                chosen_idx = m_idx
+                break
+
+        # Estimate real frame period from consecutive sync markers.
+        frame_period_s = None
+        if len(markers) >= 2:
+            frame_period_s = markers[1][2] - markers[0][2]
+        self._last_frame_period_s = frame_period_s
+        self._last_sync_count = len(markers)
+
         if verbose_timing:
             wait_ms = ((t_first_data or t_end) - t_start) * 1000.0
             total_ms = (t_end - t_start) * 1000.0
             data_span_ms = ((t_last_data - t_first_data) * 1000.0
                             if t_first_data and t_last_data else 0.0)
-            print(f"[INFRA] _read_frame_usb: chunks={self._num_chunks} "
-                  f"data={data_chunks} timeouts={timeouts} errors={errors} "
-                  f"first_data={first_data_idx} last_data={last_data_idx} "
-                  f"longest_timeout_run={longest_to_run}@{longest_to_run_start} "
-                  f"wait_until_data={wait_ms:.1f}ms data_span={data_span_ms:.1f}ms "
-                  f"total={total_ms:.1f}ms", flush=True)
+            period_str = (f"{frame_period_s*1000:.1f}ms"
+                          if frame_period_s is not None else "n/a")
+            chosen_str = f"#{chosen_idx}" if chosen_idx >= 0 else "NONE"
+            print(f"[INFRA] usb-read: valid={data_chunks}/{self._num_chunks} "
+                  f"timeouts={timeouts} errors={errors} "
+                  f"first@{first_data_idx} last@{last_data_idx} "
+                  f"sync_markers={len(markers)} chosen={chosen_str} "
+                  f"wait={wait_ms:.0f}ms span={data_span_ms:.0f}ms "
+                  f"total={total_ms:.0f}ms frame_period={period_str}",
+                  flush=True)
 
-        buf_bytes = ctypes.string_at(buf_addr, self._usb_buf_size)
-        pos = buf_bytes.find(SYNC_MARKER)
-        if pos < 0:
-            return None
-
-        data_start = pos + SYNC_HEADER_SIZE
-        data_end = data_start + self._frame_size
-        if data_end > self._usb_buf_size:
-            return None
-
-        return buf_bytes[data_start:data_end]
+        return frame_bytes
 
     def grab_frame(self, verbose_timing: bool = False) -> np.ndarray:
         """Grab one frame, deinterlace. Returns uint16 (roi_height, roi_width)."""
@@ -359,20 +404,28 @@ class TanhoCamera:
             if frame_bytes is not None:
                 break
             if verbose_timing:
-                print(f"[INFRA] grab_frame: attempt {attempt+1} no sync marker, retrying",
-                      flush=True)
+                print(f"[INFRA] grab: attempt {attempt+1}/{MAX_GRAB_RETRIES} "
+                      "no valid frame, retrying", flush=True)
         else:
             raise RuntimeError(
                 f"Failed to grab frame after {MAX_GRAB_RETRIES} attempts "
-                "(sync marker not found)"
+                "(no valid sync marker found)"
             )
         if verbose_timing:
             grab_ms = (time.perf_counter() - t_grab_start) * 1000.0
             exp_ms = self._exposure_us / 1000.0
-            ratio = grab_ms / exp_ms if exp_ms > 0 else 0
-            print(f"[INFRA] grab_frame: total={grab_ms:.1f}ms "
-                  f"requested_exposure={exp_ms:.1f}ms "
-                  f"ratio={ratio:.2f}x", flush=True)
+            period_s = getattr(self, "_last_frame_period_s", None)
+            if period_s is not None:
+                measured_ms = period_s * 1000.0
+                delta_ms = measured_ms - exp_ms
+                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
+                      f"measured_frame_period={measured_ms:.1f}ms "
+                      f"(delta={delta_ms:+.1f}ms) grab_total={grab_ms:.0f}ms",
+                      flush=True)
+            else:
+                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
+                      f"measured_frame_period=n/a (only 1 sync marker) "
+                      f"grab_total={grab_ms:.0f}ms", flush=True)
 
         raw_16 = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(
             self._raw_h, self._raw_w
@@ -394,7 +447,6 @@ class TanhoCamera:
         cmd[4..7] = [b1, b0, b3, b2] where b is the little-endian uint32."""
         if not self._connected:
             return
-        t0 = time.perf_counter()
         self._exposure_us = microseconds
 
         enable_val = CMD_EXPOSURE_ENABLE_VALUE
@@ -411,11 +463,8 @@ class TanhoCamera:
         cmd2[6] = tb[3]; cmd2[7] = tb[2]
         self._execute_raw_cmd(cmd2)
 
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] set_exposure: requested={microseconds:.1f}us "
-              f"-> enable=1 (0xFF) + ticks={ticks} @7.5us (0xF5) "
-              f"bytes=[{tb[1]:02X} {tb[0]:02X} {tb[3]:02X} {tb[2]:02X}] "
-              f"cmd_time={dt_ms:.2f}ms", flush=True)
+        print(f"[INFRA] set_exposure: {microseconds/1000:.1f}ms "
+              f"({ticks} ticks @ 7.5us)", flush=True)
 
     def set_gain(self, gain: int):
         """Set gain (0-120)."""
@@ -643,8 +692,6 @@ class InfraWorkerConsole(threading.Thread):
                 applied["gain"] = int(params["gain"])
                 changed = True
                 time.sleep(0.05)
-            if exp_us is not None:
-                self.cam.set_exposure(exp_us)
         except Exception as e:
             errors.append(str(e))
         if changed:
@@ -682,9 +729,9 @@ class InfraWorkerConsole(threading.Thread):
             except Exception as e:
                 print(f"[INFRA] resync skip-frame {i} error: {e}", flush=True)
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] resync: settle={settle_s*1000:.0f}ms + flush + "
-              f"discarded {discarded}/{skip_frames} frames, total={dt_ms:.1f}ms "
-              f"(exposure_us={self.cam.exposure_us})", flush=True)
+        print(f"[INFRA] resync done: settle={settle_s*1000:.0f}ms, "
+              f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
+              f"(exposure={self.cam.exposure_us/1000:.1f}ms)", flush=True)
 
     def _handle_pending_capture(self):
         with self._pending_capture_lock:
@@ -702,16 +749,8 @@ class InfraWorkerConsole(threading.Thread):
                 self.cam._flush_usb()
             except Exception:
                 pass
-            t_before = time.perf_counter()
-            print(f"[INFRA] On-demand grab start: exposure_us={self.cam.exposure_us}",
-                  flush=True)
+            print(f"[INFRA] === on-demand capture ===", flush=True)
             frame = self.cam.grab_frame(verbose_timing=True)
-            t_after = time.perf_counter()
-            delta_ms = (t_after - t_before) * 1000.0
-            exp_ms = self.cam.exposure_us / 1000.0
-            print(f"[INFRA] On-demand grab done: wall_delta={delta_ms:.1f}ms "
-                  f"requested_exposure={exp_ms:.1f}ms "
-                  f"overhead={delta_ms - exp_ms:.1f}ms", flush=True)
             now = dt.now()
             jpeg_bytes = frame_to_jpeg_bytes(frame)
             self._publish_ok(jpeg_bytes, now.isoformat(),
@@ -839,17 +878,12 @@ class InfraWorkerConsole(threading.Thread):
         ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
         try:
+            print(f"[INFRA] === scheduled capture {timestamp} ===", flush=True)
             try:
                 self.cam._flush_usb()
             except Exception:
                 pass
-            t_before = time.perf_counter()
             frame = self.cam.grab_frame(verbose_timing=True)
-            delta_ms = (time.perf_counter() - t_before) * 1000.0
-            exp_ms = self.cam.exposure_us / 1000.0
-            print(f"[INFRA] Scheduled grab: wall_delta={delta_ms:.1f}ms "
-                  f"requested_exposure={exp_ms:.1f}ms "
-                  f"overhead={delta_ms - exp_ms:.1f}ms", flush=True)
             if self.save_format == "fits":
                 roi_str = f"{self.cam.roi_width}x{self.cam.roi_height}"
                 save_fits(filepath, frame,
@@ -1036,16 +1070,12 @@ def run_console_infra(config_path=None, preview=False):
         print(f"[ERROR] Failed to connect camera: {exc}")
         sys.exit(1)
 
-    # Apply settings: ORDER MATTERS — set_roi() on this camera resets the
-    # internal exposure/gain registers, so we must configure ROI FIRST and
-    # apply exposure/gain AFTER. Small sleeps give the firmware time to
-    # latch each command.
+    # Order matters: set_roi() resets exposure/gain registers, so ROI first,
+    # then exposure/gain. Small sleeps give the firmware time to latch.
     if roi in ROI_MODES:
         w, h = ROI_MODES[roi]
         cam.set_roi(w, h)
         time.sleep(0.05)
-    cam.set_exposure(exposure_us)
-    time.sleep(0.05)
     cam.set_gain(gain_val)
     time.sleep(0.05)
     cam.set_exposure(exposure_us)
