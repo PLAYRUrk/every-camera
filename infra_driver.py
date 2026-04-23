@@ -544,6 +544,101 @@ class TanhoCamera:
 
 
 # ---------------------------------------------------------------------------
+# Camera stream thread
+# ---------------------------------------------------------------------------
+class _CameraStreamThread(threading.Thread):
+    """Непрерывный захват кадров для поддержания FX3 FIFO в чистом состоянии.
+
+    Принцип работы идентичен preview-режиму: grab_frame() вызывается без
+    пауз, хост всегда читает быстрее, чем FX3 накапливает данные. Рабочий
+    поток (InfraWorkerConsole) ждёт кадр через wait_for_frame() по расписанию
+    — без flush и без skip-кадров на каждый снимок.
+    """
+
+    def __init__(self, cam: "TanhoCamera"):
+        super().__init__(daemon=True)
+        self._cam = cam
+        self._cond = threading.Condition()
+        self._latest_frame = None
+        self._latest_ts = None
+        self._frame_counter = 0
+        self._stop_event = threading.Event()
+        self._paused = threading.Event()
+        self._pause_ack = threading.Event()
+        self._error_count = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            if self._paused.is_set():
+                self._pause_ack.set()
+                self._stop_event.wait(0.05)
+                continue
+            self._pause_ack.clear()
+            try:
+                frame = self._cam.grab_frame(verbose_timing=False)
+                ts = dt.now()
+                with self._cond:
+                    self._latest_frame = frame
+                    self._latest_ts = ts
+                    self._frame_counter += 1
+                    self._cond.notify_all()
+                self._error_count = 0
+            except Exception as exc:
+                self._error_count += 1
+                print(f"[INFRA] stream: error #{self._error_count}: {exc}", flush=True)
+                if self._error_count >= 5:
+                    self._stop_event.wait(1.0)
+
+    def wait_for_frame(self, timeout: float = None,
+                       stop_event: threading.Event = None):
+        """Ждёт следующий полный кадр от потока.
+
+        Возвращает (frame, timestamp) или (None, None) при таймауте/остановке.
+        """
+        deadline = time.monotonic() + (timeout if timeout is not None else 1e9)
+        with self._cond:
+            base_count = self._frame_counter
+            while self._frame_counter == base_count:
+                if stop_event and stop_event.is_set():
+                    return None, None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, None
+                self._cond.wait(timeout=min(remaining, 0.5))
+            return self._latest_frame, self._latest_ts
+
+    def get_latest_frame(self):
+        """Возвращает последний захваченный кадр без ожидания."""
+        with self._cond:
+            return self._latest_frame, self._latest_ts
+
+    def pause(self, timeout: float = 65.0) -> bool:
+        """Ставит поток на паузу, ожидая завершения текущего grab_frame().
+
+        Нужен перед изменением параметров камеры (set_roi меняет размер буфера).
+        Для 60-секундных экспозиций ожидание может занять до 60 с.
+        """
+        self._pause_ack.clear()
+        self._paused.set()
+        ok = self._pause_ack.wait(timeout=timeout)
+        if not ok:
+            print("[WARN] Stream pause timeout — proceeding anyway", flush=True)
+        return ok
+
+    def resume(self):
+        """Возобновляет захват после изменения параметров. Flush включён."""
+        try:
+            self._cam._flush_usb()
+        except Exception:
+            pass
+        self._paused.clear()
+
+    def stop(self):
+        self._stop_event.set()
+        self._paused.clear()
+
+
+# ---------------------------------------------------------------------------
 # Image saving
 # ---------------------------------------------------------------------------
 def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
@@ -698,10 +793,17 @@ class InfraWorkerConsole(threading.Thread):
             "on_demand": on_demand,
         }), retain=False)
 
-    def _apply_params(self, params):
+    def _apply_params(self, params, stream: "_CameraStreamThread"):
+        """Применяет параметры камеры, ставя stream-поток на паузу.
+
+        Пауза ждёт завершения текущего grab_frame() (до 60 с при длинных
+        экспозициях). После применения параметров stream.resume() делает flush
+        и снимает паузу; вызывающий код отвечает за пропуск переходных кадров.
+        """
         applied = {}
         errors = []
-        changed = False
+        exp_timeout = self.cam.exposure_us / 1e6 + 10.0
+        stream.pause(timeout=exp_timeout)
         try:
             # ROI must be applied BEFORE exposure/gain — set_roi() resets the
             # exposure register on this camera.
@@ -711,7 +813,6 @@ class InfraWorkerConsole(threading.Thread):
                 self.cam.set_roi(width=w, height=h)
                 applied["roi_width"] = w
                 applied["roi_height"] = h
-                changed = True
                 time.sleep(0.05)
             exp_us = None
             if "exposure_us" in params:
@@ -721,20 +822,15 @@ class InfraWorkerConsole(threading.Thread):
             if exp_us is not None:
                 self.cam.set_exposure(exp_us)
                 applied["exposure_us"] = exp_us
-                changed = True
                 time.sleep(0.05)
             if "gain" in params:
                 self.cam.set_gain(int(params["gain"]))
                 applied["gain"] = int(params["gain"])
-                changed = True
                 time.sleep(0.05)
-        except Exception as e:
-            errors.append(str(e))
-        if changed:
-            try:
-                self._resync_camera()
-            except Exception as e:
-                errors.append(f"resync: {e}")
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            stream.resume()
         return applied, errors
 
     def _resync_camera(self, skip_frames: int = None):
@@ -769,7 +865,7 @@ class InfraWorkerConsole(threading.Thread):
               f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
               f"(exposure={self.cam.exposure_us/1000:.1f}ms)", flush=True)
 
-    def _handle_pending_capture(self):
+    def _handle_pending_capture(self, stream: "_CameraStreamThread"):
         with self._pending_capture_lock:
             params = self._pending_capture
             self._pending_capture = None
@@ -777,24 +873,41 @@ class InfraWorkerConsole(threading.Thread):
             return
         print("[INFO] On-demand Infra capture starting", flush=True)
         self._publish_status("capturing", f"Applying params: {params}")
+
+        applied, errors = self._apply_params(params, stream)
+        for err in errors:
+            print(f"[WARN] Param apply: {err}")
+
+        exp_s = self.cam.exposure_us / 1e6
+        timeout = max(exp_s * 2 + 10.0, 30.0)
+        skip_n = 3 if exp_s < 1.0 else 1
+
+        # Пропускаем переходные кадры после смены параметров
+        for i in range(skip_n):
+            f, _ = stream.wait_for_frame(timeout=timeout,
+                                         stop_event=self._stop_event)
+            if f is None:
+                self._publish_error("error", "Timeout during warm-up",
+                                    on_demand=True)
+                print("[ERROR] On-demand warm-up timeout")
+                return
+
+        print(f"[INFRA] === on-demand capture ===", flush=True)
+        frame, frame_ts = stream.wait_for_frame(timeout=timeout,
+                                                stop_event=self._stop_event)
+        if frame is None:
+            self._publish_error("error", "Timeout waiting for frame",
+                                on_demand=True)
+            print("[ERROR] On-demand capture timeout")
+            return
         try:
-            applied, errors = self._apply_params(params)
-            for err in errors:
-                print(f"[WARN] Param apply: {err}")
-            try:
-                self.cam._flush_usb()
-            except Exception:
-                pass
-            print(f"[INFRA] === on-demand capture ===", flush=True)
-            frame = self.cam.grab_frame(verbose_timing=True)
-            now = dt.now()
             jpeg_bytes = frame_to_jpeg_bytes(frame)
-            self._publish_ok(jpeg_bytes, now.isoformat(),
+            self._publish_ok(jpeg_bytes, frame_ts.isoformat(),
                              on_demand=True, params=applied)
             print("[INFO] On-demand frame sent via MQTT")
-        except Exception as e:
-            self._publish_error("error", f"Capture failed: {e}", on_demand=True)
-            print(f"[ERROR] On-demand capture error: {e}")
+        except Exception as exc:
+            self._publish_error("error", f"Encode error: {exc}", on_demand=True)
+            print(f"[ERROR] On-demand encode: {exc}")
 
     def _on_mqtt_command(self, topic, payload):
         print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
@@ -860,13 +973,21 @@ class InfraWorkerConsole(threading.Thread):
             print(f"[infra:{self.instance_name}] No MQTT — remote commands disabled",
                   flush=True)
 
+        exp_s = self.cam.exposure_us / 1e6
+        frame_timeout = max(exp_s * 2 + 10.0, 30.0)
+
+        # Stream thread держит FX3 FIFO в чистом состоянии — непрерывный
+        # захват без пауз, идентично preview-режиму.
+        stream = _CameraStreamThread(self.cam)
+        stream.start()
+        print("[INFO] Infra camera stream thread started")
+
         print("[INFO] Infra camera measurement started")
         self._save_status("running")
 
         while not self._stop_event.is_set():
-            # Handle on-demand capture requests (outside schedule)
             if self._pending_capture is not None:
-                self._handle_pending_capture()
+                self._handle_pending_capture(stream)
 
             now = dt.now()
 
@@ -886,7 +1007,7 @@ class InfraWorkerConsole(threading.Thread):
             fire_key = (now.minute, now.second)
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
-                ok = self._capture_one(now)
+                ok = self._capture_one_stream(now, stream, frame_timeout)
                 if ok:
                     consecutive_errors = 0
                     self._shots += 1
@@ -904,11 +1025,16 @@ class InfraWorkerConsole(threading.Thread):
 
             self._stop_event.wait(0.1)
 
+        stream.stop()
+        stream.join(timeout=frame_timeout)
         self._save_status("stopped")
         self._delete_status()
         print("[INFO] Infra camera measurement stopped")
 
     def _capture_one(self, now):
+        # Устаревший метод: захватывал кадр с flush перед каждым снимком,
+        # что приводило к артефактам FX3 FIFO после длинных простоев.
+        # Заменён на _capture_one_stream.
         timestamp = now.strftime("%Y%m%dT%H%M%S")
         ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
         ext = ext_map.get(self.save_format, "tiff")
@@ -935,6 +1061,51 @@ class InfraWorkerConsole(threading.Thread):
             return True
         except Exception as exc:
             print(f"[ERROR] Capture error: {exc}")
+            return False
+
+    def _capture_one_stream(self, now, stream: "_CameraStreamThread",
+                             timeout: float) -> bool:
+        """Сохраняет следующий кадр из непрерывного потока stream.
+
+        Не делает flush и не отбрасывает кадры — stream-поток уже держит FIFO
+        в чистом состоянии. Метод просто ждёт следующий готовый кадр и
+        сохраняет его. Для длинных экспозиций ожидание занимает до одного
+        периода кадра (exposure + readout).
+        """
+        timestamp = now.strftime("%Y%m%dT%H%M%S")
+        ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
+        ext = ext_map.get(self.save_format, "tiff")
+        filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
+
+        print(f"[INFRA] === scheduled capture {timestamp} — "
+              f"waiting for frame (timeout={timeout:.0f}s) ===", flush=True)
+        t0 = time.perf_counter()
+        frame, frame_ts = stream.wait_for_frame(timeout=timeout,
+                                                stop_event=self._stop_event)
+        wait_ms = (time.perf_counter() - t0) * 1000.0
+
+        if frame is None:
+            print(f"[ERROR] Capture timeout after {wait_ms/1000:.1f}s "
+                  f"(scheduled {timestamp})", flush=True)
+            return False
+
+        print(f"[INFRA] Frame received: waited {wait_ms:.0f}ms, "
+              f"frame_ts={frame_ts.isoformat()}", flush=True)
+        try:
+            if self.save_format == "fits":
+                save_fits(filepath, frame,
+                          exposure_us=self.cam.exposure_us,
+                          gain=self.cam.gain,
+                          roi=f"{self.cam.roi_width}x{self.cam.roi_height}")
+            elif self.save_format == "tiff":
+                save_tiff(filepath, frame)
+            else:
+                save_png(filepath, frame)
+            self._last_frame = frame
+            print(f"[INFO] Shot saved: {os.path.basename(filepath)}")
+            return True
+        except Exception as exc:
+            print(f"[ERROR] Save error: {exc}")
             return False
 
     def _save_status(self, status):

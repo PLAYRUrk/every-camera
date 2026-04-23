@@ -4,3 +4,5 @@ __pycache__/
 camcfg_*.ini
 config.json
 .claude/
+infra_capture_cycle.pdf
+generate_capture_doc.py
