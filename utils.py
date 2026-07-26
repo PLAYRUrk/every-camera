@@ -14,11 +14,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_STATUS_DIR = str(Path.home() / ".every_camera" / "status")
-HOME_CONFIG_FILE = str(Path.home() / ".every_camera" / "config.json")
 LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
-LOCAL_MQTT_FILE = os.path.join(APP_DIR, "mqtt.json")
 
 SCHEDULE_DT_FMT = "%Y-%m-%d %H:%M:%S"
+
+# Minimum interval between status publications. Outside the schedule the
+# workers loop twice a second; without this they would write the status file
+# and publish a retained MQTT message twice a second, around the clock.
+STATUS_MIN_INTERVAL = 5.0
 SCHEDULE_LINE_RE = re.compile(
     r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*-\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})$'
 )
@@ -71,6 +74,7 @@ DEFAULT_CONFIG = {
     "sptt": {
         "instance_name": "",
         "output_dir": "",
+        "capture_seconds": [0, 30],
         "exposure": 0.88,
         "gain": 100,
         "binning": 0,
@@ -88,6 +92,18 @@ DEFAULT_CONFIG = {
         "roi": "1280x1024",
         "save_format": "tiff",
     },
+    "sentry": {
+        "instance_name": "",
+        "imagerd_rt_dir": "/usr/local/imagerd_rt",
+        "output_dir": "",
+        "device_id": "ASI1",
+        "site_id": "SITE",
+        "zenith_angle_start": -10,
+        "schedule_len_ms": 1440000,
+        "imaging_mode": "schedule",
+        "capture_seconds": [0, 30],
+        "slots": [],
+    },
     "mqtt": {
         "enabled": False,
         "host": "broker.hivemq.com",
@@ -97,22 +113,49 @@ DEFAULT_CONFIG = {
         "prefix": "every_camera",
         "tls": False,
     },
+    "server": {
+        "enabled": True,
+        "bind": "0.0.0.0",
+        "port": 8765,
+        "discovery": True,
+        "discovery_port": 45455,
+        "max_list": 2000,
+        "focus_ttl": 60,
+    },
     "status_dir": "",
 }
 
 
 def load_config(path=None):
-    """Load config from JSON file. Returns merged config with defaults."""
+    """Load config from JSON file. Returns merged config with defaults.
+
+    A malformed config used to be swallowed silently, so a single typo made
+    every setting revert to defaults — and the GUI then wrote those defaults
+    back over the file. Now the error is reported and the original is kept as
+    a ``.bak`` copy before anything can overwrite it.
+    """
     path = path or LOCAL_CONFIG_FILE
     cfg = _deep_copy(DEFAULT_CONFIG)
     try:
         with open(path) as fh:
             data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("top-level JSON value is not an object")
         _deep_merge(cfg, data)
     except FileNotFoundError:
         save_config(cfg, path)
-    except Exception:
-        pass
+    except (json.JSONDecodeError, ValueError) as exc:
+        backup = path + ".bak"
+        try:
+            import shutil
+            shutil.copy2(path, backup)
+            hint = f"Original kept as {backup}."
+        except Exception:
+            hint = "Could not back it up."
+        print(f"[ERROR] Config {path} is not valid JSON: {exc}\n"
+              f"        Falling back to defaults. {hint}")
+    except Exception as exc:
+        print(f"[ERROR] Could not read config {path}: {exc}. Using defaults.")
     return cfg
 
 
@@ -193,10 +236,71 @@ def save_schedule_file(filepath, entries):
 # ---------------------------------------------------------------------------
 def write_status_file(path, data):
     """Atomically write JSON status file."""
-    tmp = str(path) + ".tmp"
+    path = str(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
+
+
+def pid_alive(pid):
+    """Return True if a process with this PID currently exists."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import subprocess
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                 capture_output=True, text=True, timeout=5)
+            return str(pid) in out.stdout
+        except Exception:
+            return True  # cannot tell — assume alive rather than hide a live node
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True      # exists, owned by another user
+    except OSError:
+        return True
+    return True
+
+
+def cleanup_stale_status_files(status_dir):
+    """Remove ``{pid}.json`` status files left behind by dead processes.
+
+    Without this, a crashed or SIGKILLed worker stays in the monitor's local
+    list forever, since only a clean shutdown removes its own file.
+    """
+    removed = 0
+    if not status_dir or not os.path.isdir(status_dir):
+        return removed
+    try:
+        names = os.listdir(status_dir)
+    except OSError:
+        return removed
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        # Console workers write "{pid}.json"; the GUI, which can run several
+        # cameras in one process, writes "{pid}_{camera}.json".
+        pid_part = stem.split("_", 1)[0]
+        if ext != ".json" or not pid_part.isdigit():
+            continue
+        if pid_alive(pid_part):
+            continue
+        try:
+            os.remove(os.path.join(status_dir, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +455,72 @@ def configure_console_infra(cfg, config_path=None):
     print("\nConfiguration saved.\n")
 
 
+def configure_console_sentry(cfg, config_path=None):
+    """Interactive configuration for Sentry (imagerd_rt) camera console mode."""
+    sentry = cfg.get("sentry", {})
+    print("\n--- Sentry (imagerd_rt) Camera Configuration ---\n")
+
+    sentry["imagerd_rt_dir"] = _ask(
+        "imagerd_rt installation directory",
+        sentry.get("imagerd_rt_dir", "/usr/local/imagerd_rt"),
+    )
+    sentry["output_dir"] = _ask(
+        "Output directory for archived FITS files (optional)",
+        sentry.get("output_dir", ""),
+    )
+    sentry["instance_name"] = _ask(
+        "Instance name (auto if empty)",
+        sentry.get("instance_name", ""),
+    )
+    sentry["device_id"] = _ask("Camera device ID", sentry.get("device_id", "ASI1"))
+    sentry["site_id"] = _ask("Site ID", sentry.get("site_id", "SITE"))
+    sentry["zenith_angle_start"] = _ask_float(
+        "Solar zenith angle to start imaging (degrees, negative = below horizon)",
+        sentry.get("zenith_angle_start", -10),
+    )
+    sentry["schedule_len_ms"] = _ask_int(
+        "Schedule cycle length (ms)", sentry.get("schedule_len_ms", 1440000)
+    )
+    cur_mode = sentry.get("imaging_mode", "schedule")
+    if isinstance(cur_mode, int):
+        cur_mode = "schedule" if cur_mode == 0 else "rapid"
+    mode_in = _ask("Imaging mode (schedule / rapid)", cur_mode)
+    sentry["imaging_mode"] = mode_in if mode_in in ("schedule", "rapid") else "schedule"
+
+    secs_str = _ask(
+        "Capture seconds for MQTT publish (comma-separated)",
+        ", ".join(str(s) for s in sentry.get("capture_seconds", [0, 30])),
+    )
+    try:
+        sentry["capture_seconds"] = [int(s.strip()) for s in secs_str.split(",") if s.strip()]
+    except ValueError:
+        sentry["capture_seconds"] = [0, 30]
+
+    # Slot editor
+    if _ask_bool("Configure imaging slots now?", bool(sentry.get("slots"))):
+        slots = []
+        while True:
+            print(f"\n  Slot {len(slots) + 1}:")
+            slot = {
+                "filter_num":  _ask_int("    Filter number", 1),
+                "start_ms":    _ask_int("    Start time in cycle (ms)", 0),
+                "exposure_ms": _ask_int("    Exposure length (ms)", 55000),
+                "binning":     _ask_int("    Binning (1/2/4)", 2),
+                "gain":        _ask_int("    CCD gain (1-3)", 3),
+                "readout_ms":  _ask_int("    Filter wheel + readout overhead (ms)", 5000),
+            }
+            slots.append(slot)
+            if not _ask_bool("  Add another slot?", False):
+                break
+        sentry["slots"] = slots
+
+    cfg["sentry"] = sentry
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
 def _configure_mqtt(cfg):
     """Interactive MQTT configuration (shared)."""
     mqtt = cfg.get("mqtt", {})
@@ -365,3 +535,24 @@ def _configure_mqtt(cfg):
     else:
         mqtt["enabled"] = False
     cfg["mqtt"] = mqtt
+    _configure_server(cfg)
+
+
+def _configure_server(cfg):
+    """Interactive LAN frame-server configuration (shared)."""
+    srv = cfg.get("server", _deep_copy(DEFAULT_CONFIG["server"]))
+    print("\n  The LAN frame server lets viewer_app.py and focus_app.py browse")
+    print("  captured frames and watch a live stream over the local network.")
+    if _ask_bool("Enable LAN frame server?", srv.get("enabled", True)):
+        srv["enabled"] = True
+        srv["port"] = _ask_int("HTTP port", srv.get("port", 8765))
+        srv["bind"] = _ask("Bind address (0.0.0.0 = whole LAN)",
+                           srv.get("bind", "0.0.0.0"))
+        srv["discovery"] = _ask_bool("Answer UDP discovery broadcasts?",
+                                     srv.get("discovery", True))
+        if srv["discovery"]:
+            srv["discovery_port"] = _ask_int("Discovery UDP port",
+                                             srv.get("discovery_port", 45455))
+    else:
+        srv["enabled"] = False
+    cfg["server"] = srv

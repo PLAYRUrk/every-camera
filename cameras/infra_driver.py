@@ -1,0 +1,1301 @@
+"""
+Infra camera driver: Tanho SW1300 SWIR camera (THCAMSW1300, Sony IMX990).
+USB: Cypress FX3, VID=0xaa55, PID=0x8866.
+12-bit ADC, 16-bit output, 1280x1024.
+
+Provides:
+  - TanhoCamera: low-level USB camera control
+  - InfraCaptureThread: continuous frame capture (QThread for live preview)
+  - InfraWorkerConsole: schedule-based capture (threading.Thread for headless)
+  - run_console_infra(): console entry point
+"""
+import os
+import io
+import sys
+import json
+import signal
+import ctypes
+import threading
+import time
+
+import numpy as np
+
+from datetime import datetime as dt, timezone
+from pathlib import Path
+
+import frame_archive
+
+from utils import (
+    load_schedule_file, get_instance_name, get_system_info, APP_DIR,
+)
+from worker_common import WorkerMqtt, parse_command_params
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+RAW_HALF_WIDTH = 640
+BYTES_PER_PIXEL = 2
+
+ROI_MODES = {
+    "1280x256": (1280, 256),
+    "1280x1024": (1280, 1024),
+}
+DEFAULT_ROI = "1280x1024"
+
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 1024
+ADC_MAX = 4094
+
+CMD_PACKET_SIZE = 32
+CMD_FOOTER_POS = 31
+CMD_FOOTER_VAL = 0x15
+
+CMD_EXPOSURE = 0xFF
+CMD_EXPOSURE_ALT = 0xF5
+CMD_GAIN = 0xFE
+CMD_ROI = 0xD0
+
+USB_EP_IN = 0x81
+USB_CHUNK_SIZE = 0x4000
+USB_TIMEOUT = 200
+SYNC_MARKER = b'\x55\xFF\xAA\xCC'
+SYNC_HEADER_SIZE = 0x200
+
+MAX_GRAB_RETRIES = 3
+
+INFRA_CAPTURE_SECONDS = [0, 30]
+
+# Vendor protocol (reverse-engineered from Wireshark capture, infra-camera/
+# reCode/data/exp_100_*): exposure is set via a TWO-COMMAND sequence.
+#   1) CMD_EXPOSURE (0xFF) carries a constant 0x00000001 — acts as a "use
+#      long-exposure register" enable / mode-set handshake.
+#   2) CMD_EXPOSURE_ALT (0xF5) carries the exposure duration expressed in
+#      ticks of the camera's low-rate clock. For the captured exposure of
+#      100 ms the payload was 13332, giving a tick of exactly 7.5 us
+#      (= 133.33 kHz clock). This matches our earlier "scale hunt" where
+#      150 ms with the old `* 20` formula produced ~22 s of actual
+#      integration: 3_000_000 ticks * 7.5 us = 22.5 s.
+# Using this protocol removes the 16-bit register overflow problem — the
+# camera accepts ~32-bit tick counts, covering exposures up to ~32 seconds
+# at the 7.5 us tick plus even longer once we verify the full register width.
+EXPOSURE_TICKS_PER_US = 1.0 / 7.5  # ~= 0.1333
+
+# Fixed payload for CMD_EXPOSURE (0xFF) — sent unchanged before every
+# CMD_EXPOSURE_ALT to select the long-exposure register path.
+CMD_EXPOSURE_ENABLE_VALUE = 1
+
+
+# ---------------------------------------------------------------------------
+# Library discovery
+# ---------------------------------------------------------------------------
+def _find_library() -> str:
+    """Find libTanhoAPI.so in infra_lib/ at the project root (APP_DIR)."""
+    base = Path(APP_DIR)
+    # Prefer the real file first (symlinks may not work on all systems)
+    candidates = [
+        base / "infra_lib" / "libTanhoAPI.so.1.0.0",
+        base / "infra_lib" / "libTanhoAPI.so",
+    ]
+    for path in candidates:
+        if path.is_file() and not path.is_symlink() or (
+            path.is_symlink() and path.resolve().is_file()
+        ):
+            return str(path)
+    raise FileNotFoundError(
+        "libTanhoAPI.so not found. Check infra_lib/ directory:\n"
+        + "\n".join(f"  - {p}" for p in candidates)
+    )
+
+
+def _raw_size_for_roi(width: int, height: int) -> tuple:
+    raw_w = width // 2
+    raw_h = height * 2
+    return raw_w, raw_h
+
+
+# ---------------------------------------------------------------------------
+# Camera class
+# ---------------------------------------------------------------------------
+class TanhoCamera:
+    """Low-level wrapper for TanhoAPI SDK (SW1300 SWIR camera)."""
+
+    def __init__(self):
+        self._lib = None
+        self._libusb = None
+        self._connected = False
+        self._roi_width = 1280
+        self._roi_height = 1024
+        self._exposure_us = 1000.0
+        self._gain = 0
+        self._usb_buffer = None
+        self._usb_chunk = None
+        self._transferred = None
+        self._num_chunks = 0
+        self._usb_buf_size = 0
+        self._frame_size = 0
+        self._raw_w = 0
+        self._raw_h = 0
+        self._devh_ref = None
+
+    def _load_library(self):
+        lib_path = _find_library()
+        self._lib = ctypes.CDLL(lib_path)
+
+        self._driver_init = self._lib._ZN8TanhoAPI19TanhoCam_DriverInitEj
+        self._driver_init.argtypes = [ctypes.c_uint]
+        self._driver_init.restype = ctypes.c_int
+
+        self._open_driver = self._lib._ZN8TanhoAPI19TanhoCam_OpenDriverEv
+        self._open_driver.argtypes = []
+        self._open_driver.restype = ctypes.c_int
+
+        self._close_driver = self._lib._ZN8TanhoAPI20TanhoCam_CloseDriverEv
+        self._close_driver.argtypes = []
+        self._close_driver.restype = ctypes.c_int
+
+        self._execute_cmd = self._lib._ZN8TanhoAPI19TanhoCam_ExecuteCmdEPh
+        self._execute_cmd.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
+        self._execute_cmd.restype = ctypes.c_int
+
+        self._driver_start = self._lib._Z20TanhoCam_DriverStartv
+        self._driver_start.argtypes = []
+        self._driver_start.restype = ctypes.c_int
+
+        self._driver_stop = self._lib._Z19TanhoCam_DriverStopv
+        self._driver_stop.argtypes = []
+        self._driver_stop.restype = ctypes.c_int
+
+        self._libusb = ctypes.CDLL("libusb-1.0.so.0")
+        self._bulk_transfer = self._libusb.libusb_bulk_transfer
+        self._bulk_transfer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ubyte,
+            ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+        ]
+        self._bulk_transfer.restype = ctypes.c_int
+
+    def connect(self) -> bool:
+        if self._connected:
+            return True
+        if self._lib is None:
+            self._load_library()
+
+        result = self._driver_init(1)
+        if result != 0:
+            raise RuntimeError(f"TanhoCam_DriverInit error: {result}")
+
+        result = self._open_driver()
+        if not result:
+            raise RuntimeError(
+                "Failed to open camera. Check:\n"
+                "  1. Camera connected via USB 3.0\n"
+                "  2. Access rights (udev rule or sudo)"
+            )
+
+        self._driver_start()
+        self._devh_ref = ctypes.c_void_p.in_dll(self._lib, 'devh')
+        self._connected = True
+        self.set_roi(1280, 1024)
+        self._flush_usb()
+        return True
+
+    def disconnect(self):
+        if self._connected and self._lib is not None:
+            self._driver_stop()
+            self._close_driver()
+            self._connected = False
+            self._usb_buffer = None
+            self._usb_chunk = None
+            self._devh_ref = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def roi_width(self) -> int:
+        return self._roi_width
+
+    @property
+    def roi_height(self) -> int:
+        return self._roi_height
+
+    @property
+    def exposure_us(self) -> float:
+        return self._exposure_us
+
+    @property
+    def gain(self) -> int:
+        return self._gain
+
+    def _allocate_buffer(self):
+        raw_w, raw_h = _raw_size_for_roi(self._roi_width, self._roi_height)
+        self._raw_w = raw_w
+        self._raw_h = raw_h
+        self._frame_size = self._roi_width * self._roi_height * BYTES_PER_PIXEL
+        self._chunks_per_frame = (self._frame_size + USB_CHUNK_SIZE - 1) // USB_CHUNK_SIZE
+        # Allocate enough slack (×3) to guarantee a full frame is captured
+        # even when sync marker falls near a buffer boundary.
+        self._num_chunks = self._chunks_per_frame * 3
+        self._usb_buf_size = self._num_chunks * USB_CHUNK_SIZE
+        self._usb_buffer = (ctypes.c_ubyte * self._usb_buf_size)()
+        self._usb_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
+        self._transferred = ctypes.c_int(0)
+
+    def _flush_usb(self, max_chunks: int = 4096, idle_streak: int = 10,
+                   chunk_timeout_ms: int = 20, verbose: bool = False):
+        """Drain USB FIFO until it stays idle for `idle_streak` consecutive
+        empty reads at `chunk_timeout_ms` each. Previous 5ms/3-streak was
+        too aggressive — it exited the moment the camera had a momentary
+        pause mid-stream, leaving the tail of an old frame in the pipe that
+        then became the "first sync marker" on the next read."""
+        if not self._devh_ref:
+            return 0
+        devh = self._devh_ref.value
+        if not devh:
+            return 0
+        flush_chunk = (ctypes.c_ubyte * USB_CHUNK_SIZE)()
+        transferred = ctypes.c_int(0)
+        drained_chunks = 0
+        drained_bytes = 0
+        idle = 0
+        for _ in range(max_chunks):
+            ret = self._bulk_transfer(
+                devh, USB_EP_IN, flush_chunk, USB_CHUNK_SIZE,
+                ctypes.byref(transferred), chunk_timeout_ms
+            )
+            got = (ret == 0 and transferred.value > 0)
+            if got:
+                drained_chunks += 1
+                drained_bytes += transferred.value
+                idle = 0
+            else:
+                idle += 1
+                if idle >= idle_streak:
+                    break
+        if verbose and drained_chunks:
+            print(f"[INFRA] flush: drained {drained_chunks} chunks "
+                  f"({drained_bytes/1024:.0f} KiB)", flush=True)
+        return drained_chunks
+
+    def _read_frame_usb(self, verbose_timing: bool = False) -> bytes:
+        """Read one frame worth of USB data and extract the freshest complete
+        frame.
+
+        Critical fix vs. the old implementation: chunks that time out are NOT
+        copied into the shared buffer. Previously, on timeout we still memmoved
+        `self._usb_chunk` (which still held bytes from the PREVIOUS successful
+        transfer) into the next slot — that duplicated good data into every
+        idle slot and produced phantom sync markers pointing at stale frames.
+        Now invalid slots stay zero and we only accept a sync marker if the
+        whole frame payload falls in contiguous valid chunks.
+
+        Also measures per-chunk timestamps so we can estimate the real
+        frame period (≈ exposure + readout) from the spacing between
+        consecutive sync markers in the stream.
+        """
+        devh = self._devh_ref.value
+        if not devh:
+            raise RuntimeError("USB device handle not initialized")
+
+        buf_addr = ctypes.addressof(self._usb_buffer)
+        # Zero the buffer so timed-out slots cannot impersonate fresh data.
+        ctypes.memset(buf_addr, 0, self._usb_buf_size)
+
+        valid = bytearray(self._num_chunks)
+        chunk_ts = [0.0] * self._num_chunks
+
+        timeouts = 0
+        errors = 0
+        data_chunks = 0
+        first_data_idx = -1
+        last_data_idx = -1
+        t_start = time.perf_counter()
+        t_first_data = None
+        t_last_data = None
+
+        # After receiving a full frame's worth of data, exit as soon as the
+        # USB stream goes idle instead of burning _num_chunks × USB_TIMEOUT on
+        # empty reads.  For a 20 s exposure the camera bursts one frame then
+        # sits silent for ~20 s; without early-exit that silence costs
+        # (num_chunks - chunks_per_frame) × 200 ms ≈ 64 s of dead time, which
+        # makes the stream thread deliver frames every ~84 s instead of ~21 s.
+        _EARLY_EXIT_IDLE = 5   # consecutive empty reads before bailing out
+        _idle_cur = 0
+
+        for i in range(self._num_chunks):
+            ret = self._bulk_transfer(
+                devh, USB_EP_IN, self._usb_chunk, USB_CHUNK_SIZE,
+                ctypes.byref(self._transferred), USB_TIMEOUT
+            )
+            got_data = (ret == 0 and self._transferred.value > 0)
+            if got_data:
+                n = self._transferred.value
+                ctypes.memmove(buf_addr + i * USB_CHUNK_SIZE,
+                               self._usb_chunk, n)
+                valid[i] = 1
+                now = time.perf_counter()
+                chunk_ts[i] = now
+                data_chunks += 1
+                _idle_cur = 0
+                if first_data_idx < 0:
+                    first_data_idx = i
+                    t_first_data = now
+                last_data_idx = i
+                t_last_data = now
+            elif ret == -7 or (ret == 0 and self._transferred.value == 0):
+                timeouts += 1
+                _idle_cur += 1
+                if (data_chunks >= self._chunks_per_frame
+                        and _idle_cur >= _EARLY_EXIT_IDLE):
+                    break
+            else:
+                errors += 1
+
+        t_end = time.perf_counter()
+
+        # Find all sync markers, keep only those sitting in valid chunks.
+        buf_bytes = ctypes.string_at(buf_addr, self._usb_buf_size)
+        markers = []  # (byte_pos, chunk_idx, timestamp)
+        search = 0
+        while True:
+            pos = buf_bytes.find(SYNC_MARKER, search)
+            if pos < 0:
+                break
+            ci = pos // USB_CHUNK_SIZE
+            if valid[ci]:
+                markers.append((pos, ci, chunk_ts[ci]))
+            search = pos + 1
+
+        # Pick the first marker whose full payload (a) lies in contiguous
+        # valid chunks and (b) decodes to plausible 12-bit pixel data. The
+        # 12-bit check filters out spurious sync-marker matches inside image
+        # payload: the real sync header is always followed by pixels whose
+        # top 4 bits are zero (ADC_MAX=4094), so a misaligned extraction
+        # fails the `(pixels & 0xF000) == 0` test almost immediately.
+        frame_bytes = None
+        chosen_idx = -1
+        rejected_misaligned = 0
+        for m_idx, (pos, ci, _ts) in enumerate(markers):
+            data_start = pos + SYNC_HEADER_SIZE
+            data_end = data_start + self._frame_size
+            if data_end > self._usb_buf_size:
+                continue
+            c0 = data_start // USB_CHUNK_SIZE
+            c1 = (data_end - 1) // USB_CHUNK_SIZE
+            if not all(valid[c] for c in range(c0, c1 + 1)):
+                continue
+            candidate = buf_bytes[data_start:data_end]
+            pixels = np.frombuffer(candidate, dtype=np.uint16)
+            bad = int(np.count_nonzero(pixels & 0xF000))
+            # Allow a handful of corrupted pixels; more than that means the
+            # window is shifted (spurious sync marker).
+            if bad > 16:
+                rejected_misaligned += 1
+                continue
+            frame_bytes = candidate
+            chosen_idx = m_idx
+            break
+
+        # Estimate real frame period from sync markers spaced at least one
+        # full frame apart (4-byte SYNC_MARKER sometimes appears spuriously
+        # inside image data, so adjacent markers in the same chunk are bogus).
+        frame_period_s = None
+        real_markers = []
+        for m in markers:
+            if not real_markers or (m[0] - real_markers[-1][0]) >= self._frame_size:
+                real_markers.append(m)
+        if len(real_markers) >= 2:
+            frame_period_s = real_markers[1][2] - real_markers[0][2]
+        self._last_frame_period_s = frame_period_s
+        self._last_sync_count = len(markers)
+        self._last_real_sync_count = len(real_markers)
+
+        if verbose_timing:
+            wait_ms = ((t_first_data or t_end) - t_start) * 1000.0
+            total_ms = (t_end - t_start) * 1000.0
+            data_span_ms = ((t_last_data - t_first_data) * 1000.0
+                            if t_first_data and t_last_data else 0.0)
+            period_str = (f"{frame_period_s*1000:.1f}ms"
+                          if frame_period_s is not None else "n/a")
+            chosen_str = f"#{chosen_idx}" if chosen_idx >= 0 else "NONE"
+            print(f"[INFRA] usb-read: valid={data_chunks}/{self._num_chunks} "
+                  f"timeouts={timeouts} errors={errors} "
+                  f"first@{first_data_idx} last@{last_data_idx} "
+                  f"sync_markers={len(real_markers)} (raw={len(markers)}, "
+                  f"misaligned_rejected={rejected_misaligned}) "
+                  f"chosen={chosen_str} wait={wait_ms:.0f}ms "
+                  f"span={data_span_ms:.0f}ms total={total_ms:.0f}ms "
+                  f"frame_period={period_str}", flush=True)
+
+        return frame_bytes
+
+    def grab_frame(self, verbose_timing: bool = False) -> np.ndarray:
+        """Grab one frame, deinterlace. Returns uint16 (roi_height, roi_width)."""
+        if not self._connected:
+            raise RuntimeError("Camera not connected")
+
+        t_grab_start = time.perf_counter()
+        for attempt in range(MAX_GRAB_RETRIES):
+            frame_bytes = self._read_frame_usb(verbose_timing=verbose_timing)
+            if frame_bytes is not None:
+                break
+            if verbose_timing:
+                print(f"[INFRA] grab: attempt {attempt+1}/{MAX_GRAB_RETRIES} "
+                      "no valid frame, retrying", flush=True)
+        else:
+            raise RuntimeError(
+                f"Failed to grab frame after {MAX_GRAB_RETRIES} attempts "
+                "(no valid sync marker found)"
+            )
+        if verbose_timing:
+            grab_ms = (time.perf_counter() - t_grab_start) * 1000.0
+            exp_ms = self._exposure_us / 1000.0
+            period_s = getattr(self, "_last_frame_period_s", None)
+            if period_s is not None:
+                measured_ms = period_s * 1000.0
+                delta_ms = measured_ms - exp_ms
+                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
+                      f"measured_frame_period={measured_ms:.1f}ms "
+                      f"(delta={delta_ms:+.1f}ms) grab_total={grab_ms:.0f}ms",
+                      flush=True)
+            else:
+                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
+                      f"measured_frame_period=n/a (only 1 real frame in stream) "
+                      f"grab_total={grab_ms:.0f}ms", flush=True)
+
+        raw_16 = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(
+            self._raw_h, self._raw_w
+        )
+
+        frame = np.empty((self._roi_height, self._roi_width), dtype=np.uint16)
+        frame[:, :self._raw_w] = raw_16[0::2]
+        frame[:, self._raw_w:] = raw_16[1::2]
+
+        if verbose_timing:
+            # Fingerprint: MD5 of raw bytes + stats. If two consecutive
+            # captures print the SAME md5 the pipeline is replaying the same
+            # buffer; if md5 differs but stats are near-identical the sensor
+            # is just seeing a stable scene dominated by fixed-pattern noise.
+            import hashlib
+            md5 = hashlib.md5(frame_bytes).hexdigest()[:12]
+            print(f"[INFRA] frame-stats: md5={md5} "
+                  f"mean={frame.mean():.1f} std={frame.std():.1f} "
+                  f"min={int(frame.min())} max={int(frame.max())} "
+                  f"first4={frame_bytes[:4].hex()} "
+                  f"mid4={frame_bytes[len(frame_bytes)//2:len(frame_bytes)//2+4].hex()}",
+                  flush=True)
+
+        return frame
+
+    def set_exposure(self, microseconds: float):
+        """Set exposure via the vendor's two-command protocol.
+
+        Command 1 (0xFF): fixed enable/handshake payload of 0x00000001.
+        Command 2 (0xF5): exposure duration as uint32 ticks, 1 tick = 7.5 us.
+
+        Byte order in both packets uses the firmware's word-swap convention:
+        cmd[4..7] = [b1, b0, b3, b2] where b is the little-endian uint32."""
+        if not self._connected:
+            return
+        self._exposure_us = microseconds
+
+        enable_val = CMD_EXPOSURE_ENABLE_VALUE
+        eb = enable_val.to_bytes(4, 'little')
+        cmd1 = self._make_cmd_packet(CMD_EXPOSURE)
+        cmd1[4] = eb[1]; cmd1[5] = eb[0]
+        cmd1[6] = eb[3]; cmd1[7] = eb[2]
+        self._execute_raw_cmd(cmd1)
+
+        ticks = max(1, int(round(microseconds * EXPOSURE_TICKS_PER_US)))
+        tb = ticks.to_bytes(4, 'little')
+        cmd2 = self._make_cmd_packet(CMD_EXPOSURE_ALT)
+        cmd2[4] = tb[1]; cmd2[5] = tb[0]
+        cmd2[6] = tb[3]; cmd2[7] = tb[2]
+        self._execute_raw_cmd(cmd2)
+
+        print(f"[INFRA] set_exposure: {microseconds/1000:.1f}ms "
+              f"({ticks} ticks @ 7.5us)", flush=True)
+
+    def set_gain(self, gain: int):
+        """Set gain (0-120)."""
+        if not self._connected:
+            return
+        self._gain = gain
+        cmd = self._make_cmd_packet(CMD_GAIN)
+        cmd[4] = 0x00
+        cmd[5] = max(1, gain) & 0xFF
+        self._execute_raw_cmd(cmd)
+
+    def set_roi(self, width: int = 1280, height: int = 1024):
+        if not self._connected:
+            return
+        cmd = self._make_cmd_packet(CMD_ROI)
+        cmd[4] = 0x00
+        cmd[5] = 0x00
+        cmd[6] = (width // 8) & 0xFF
+        cmd[7] = (height // 8) & 0xFF
+        self._execute_raw_cmd(cmd)
+        self._roi_width = width
+        self._roi_height = height
+        self._allocate_buffer()
+
+    def _execute_raw_cmd(self, data):
+        buf = (ctypes.c_ubyte * CMD_PACKET_SIZE)(*data[:CMD_PACKET_SIZE])
+        self._execute_cmd(buf)
+
+    @staticmethod
+    def _make_cmd_packet(cmd_code: int) -> bytearray:
+        packet = bytearray(CMD_PACKET_SIZE)
+        packet[0] = 0x00
+        packet[1] = 0x06
+        packet[2] = 0x00
+        packet[3] = cmd_code
+        packet[CMD_FOOTER_POS] = CMD_FOOTER_VAL
+        return packet
+
+    def __del__(self):
+        self.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Camera stream thread
+# ---------------------------------------------------------------------------
+class _CameraStreamThread(threading.Thread):
+    """Непрерывный захват кадров для поддержания FX3 FIFO в чистом состоянии.
+
+    Принцип работы идентичен preview-режиму: grab_frame() вызывается без
+    пауз, хост всегда читает быстрее, чем FX3 накапливает данные. Рабочий
+    поток (InfraWorkerConsole) ждёт кадр через wait_for_frame() по расписанию
+    — без flush и без skip-кадров на каждый снимок.
+    """
+
+    def __init__(self, cam: "TanhoCamera"):
+        super().__init__(daemon=True)
+        self._cam = cam
+        self._cond = threading.Condition()
+        self._latest_frame = None
+        self._latest_ts = None
+        self._frame_counter = 0
+        self._stop_event = threading.Event()
+        self._paused = threading.Event()
+        self._pause_ack = threading.Event()
+        self._error_count = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            if self._paused.is_set():
+                self._pause_ack.set()
+                self._stop_event.wait(0.05)
+                continue
+            self._pause_ack.clear()
+            try:
+                frame = self._cam.grab_frame(verbose_timing=False)
+                ts = dt.now()
+                with self._cond:
+                    self._latest_frame = frame
+                    self._latest_ts = ts
+                    self._frame_counter += 1
+                    self._cond.notify_all()
+                self._error_count = 0
+            except Exception as exc:
+                self._error_count += 1
+                print(f"[INFRA] stream: error #{self._error_count}: {exc}", flush=True)
+                if self._error_count >= 5:
+                    self._stop_event.wait(1.0)
+
+    def wait_for_frame(self, timeout: float = None,
+                       stop_event: threading.Event = None):
+        """Ждёт следующий полный кадр от потока.
+
+        Возвращает (frame, timestamp) или (None, None) при таймауте/остановке.
+        """
+        deadline = time.monotonic() + (timeout if timeout is not None else 1e9)
+        with self._cond:
+            base_count = self._frame_counter
+            while self._frame_counter == base_count:
+                if stop_event and stop_event.is_set():
+                    return None, None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, None
+                self._cond.wait(timeout=min(remaining, 0.5))
+            return self._latest_frame, self._latest_ts
+
+    def get_latest_frame(self):
+        """Возвращает последний захваченный кадр без ожидания."""
+        with self._cond:
+            return self._latest_frame, self._latest_ts
+
+    def pause(self, timeout: float = 65.0) -> bool:
+        """Ставит поток на паузу, ожидая завершения текущего grab_frame().
+
+        Нужен перед изменением параметров камеры (set_roi меняет размер буфера).
+        Для 60-секундных экспозиций ожидание может занять до 60 с.
+        """
+        self._pause_ack.clear()
+        self._paused.set()
+        ok = self._pause_ack.wait(timeout=timeout)
+        if not ok:
+            print("[WARN] Stream pause timeout — proceeding anyway", flush=True)
+        return ok
+
+    def resume(self):
+        """Возобновляет захват после изменения параметров. Flush включён."""
+        try:
+            self._cam._flush_usb()
+        except Exception:
+            pass
+        self._paused.clear()
+
+    def stop(self):
+        self._stop_event.set()
+        self._paused.clear()
+
+
+# ---------------------------------------------------------------------------
+# Image saving
+# ---------------------------------------------------------------------------
+def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
+              stack_n=1, sub_exposure_us=None):
+    """Save frame as FITS with metadata header. Supports uint16 and uint32
+    (stacked) frames."""
+    from astropy.io import fits
+    hdu = fits.PrimaryHDU(data=frame)
+    hdr = hdu.header
+    hdr['INSTRUME'] = ('THCAMSW1300', 'Camera model')
+    hdr['SENSOR'] = ('IMX990-AABA-C', 'Sensor model')
+    hdr['DATE-OBS'] = (dt.now(timezone.utc).isoformat(), 'Observation date (UTC)')
+    if exposure_us is not None:
+        hdr['EXPTIME'] = (exposure_us / 1e6, 'Total integration time (seconds)')
+        hdr['EXPTUS'] = (exposure_us, 'Total integration time (microseconds)')
+    if gain is not None:
+        hdr['GAIN'] = (gain, 'Camera gain')
+    if roi is not None:
+        hdr['ROI'] = (roi, 'Region of interest')
+    if stack_n > 1:
+        hdr['STACK_N'] = (stack_n, 'Number of stacked sub-frames')
+        if sub_exposure_us is not None:
+            hdr['SUB_EXP'] = (sub_exposure_us / 1e6, 'Sub-frame exposure (s)')
+    hdu.writeto(filepath, overwrite=True)
+
+
+def save_tiff(filepath, frame_16):
+    """Save 16-bit frame as TIFF using cv2 or PIL."""
+    try:
+        import cv2
+        cv2.imwrite(filepath, frame_16)
+        return
+    except ImportError:
+        pass
+    try:
+        from PIL import Image
+        img = Image.fromarray(frame_16)
+        img.save(filepath)
+    except ImportError:
+        raise RuntimeError("Install opencv-python or Pillow to save TIFF images")
+
+
+def save_png(filepath, frame_16):
+    """Save 16-bit frame as 8-bit PNG (normalized)."""
+    fmin, fmax = frame_16.min(), frame_16.max()
+    if fmax > fmin:
+        img_8 = ((frame_16 - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+    else:
+        img_8 = np.zeros_like(frame_16, dtype=np.uint8)
+    try:
+        import cv2
+        cv2.imwrite(filepath, img_8)
+        return
+    except ImportError:
+        pass
+    try:
+        from PIL import Image
+        img = Image.fromarray(img_8, mode="L")
+        img.save(filepath)
+    except ImportError:
+        raise RuntimeError("Install opencv-python or Pillow to save PNG images")
+
+
+def frame_to_jpeg_bytes(frame):
+    """Convert 16-bit or stacked uint32 frame to 8-bit JPEG for MQTT.
+
+    Kept as a thin wrapper for backwards compatibility — the implementation now
+    lives in ``frame_archive`` and is shared by every camera driver.
+    """
+    stretch = "minmax" if frame.dtype == np.uint32 else "raw"
+    return frame_archive.to_jpeg_bytes(frame, stretch=stretch,
+                                       full_scale=ADC_MAX)
+
+
+# ---------------------------------------------------------------------------
+# Console worker
+# ---------------------------------------------------------------------------
+class InfraWorkerConsole(threading.Thread):
+    """Schedule-based capture worker for console/headless mode."""
+    MAX_CONSECUTIVE_ERRORS = 5
+
+    def __init__(self, cam, schedule, output_dir, instance_name,
+                 status_dir, capture_seconds, save_format="tiff",
+                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
+        super().__init__(daemon=True)
+        self.cam = cam
+        self.schedule = schedule
+        self.output_dir = output_dir
+        self.instance_name = instance_name
+        self.status_dir = status_dir
+        self.capture_seconds = sorted(capture_seconds)
+        self.save_format = save_format
+        self._service = service
+        self._bus = WorkerMqtt("infra", instance_name, status_dir,
+                               mqtt_publisher, mqtt_prefix, service=service)
+        self._stop_event = threading.Event()
+        self._shots = 0
+        self._errors = 0
+        self._last_shot = None
+        self._last_frame = None
+        self._active_until = None
+        self._pending_capture = None
+        self._pending_capture_lock = threading.Lock()
+        self._pending_capture_event = threading.Event()
+
+    def request_stop(self):
+        self._stop_event.set()
+
+    def _publish_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
+        self._bus.publish_frame_jpeg(jpeg_bytes, ts_iso, on_demand=on_demand,
+                                     params=params)
+
+    def _publish_error(self, status, error, ts_iso=None, on_demand=False):
+        self._bus.publish_error(status, error, ts_iso=ts_iso,
+                                on_demand=on_demand)
+
+    def _apply_params(self, params, stream: "_CameraStreamThread"):
+        """Применяет параметры камеры, ставя stream-поток на паузу.
+
+        Пауза ждёт завершения текущего grab_frame() (до 60 с при длинных
+        экспозициях). После применения параметров stream.resume() делает flush
+        и снимает паузу; вызывающий код отвечает за пропуск переходных кадров.
+        """
+        applied = {}
+        errors = []
+        exp_timeout = self.cam.exposure_us / 1e6 + 10.0
+        stream.pause(timeout=exp_timeout)
+        try:
+            # ROI must be applied BEFORE exposure/gain — set_roi() resets the
+            # exposure register on this camera.
+            # "roi" is the "1280x1024" form used by config.json and the focus
+            # tool; roi_width/roi_height stay supported for the monitor dialog.
+            if "roi" in params and params["roi"] in ROI_MODES:
+                params = dict(params)
+                params["roi_width"], params["roi_height"] = ROI_MODES[params["roi"]]
+            if "roi_width" in params or "roi_height" in params:
+                w = int(params.get("roi_width", self.cam.roi_width))
+                h = int(params.get("roi_height", self.cam.roi_height))
+                self.cam.set_roi(width=w, height=h)
+                applied["roi_width"] = w
+                applied["roi_height"] = h
+                time.sleep(0.05)
+            exp_us = None
+            if "exposure_us" in params:
+                exp_us = float(params["exposure_us"])
+            elif "exposure" in params:
+                exp_us = float(params["exposure"]) * 1_000_000
+            if exp_us is not None:
+                self.cam.set_exposure(exp_us)
+                applied["exposure_us"] = exp_us
+                time.sleep(0.05)
+            if "gain" in params:
+                self.cam.set_gain(int(params["gain"]))
+                applied["gain"] = int(params["gain"])
+                time.sleep(0.05)
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            stream.resume()
+        return applied, errors
+
+    def _resync_camera(self, skip_frames: int = None):
+        """Flush USB buffer and discard a few frames after config change so
+        subsequent grab_frame() returns a frame with the NEW exposure/gain/ROI.
+
+        For long exposures the settle/skip times become dominant, so we scale
+        them adaptively: short settle capped at 1s, and skip_frames reduced
+        to 1 when a single frame already takes >1 second.
+        """
+        t0 = time.perf_counter()
+        exp_s = self.cam.exposure_us / 1e6
+        # Cap settle at 1s so 60s exposures don't block the worker for a minute
+        # just to apply a command. One flushed frame is enough to clear the pipe.
+        settle_s = max(0.15, min(exp_s + 0.1, 1.0))
+        if skip_frames is None:
+            skip_frames = 3 if exp_s < 1.0 else 1
+        time.sleep(settle_s)
+        try:
+            self.cam._flush_usb()
+        except Exception as e:
+            print(f"[INFRA] resync flush error: {e}", flush=True)
+        discarded = 0
+        for i in range(skip_frames):
+            try:
+                self.cam.grab_frame(verbose_timing=False)
+                discarded += 1
+            except Exception as e:
+                print(f"[INFRA] resync skip-frame {i} error: {e}", flush=True)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[INFRA] resync done: settle={settle_s*1000:.0f}ms, "
+              f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
+              f"(exposure={self.cam.exposure_us/1000:.1f}ms)", flush=True)
+
+    def _handle_pending_capture(self, stream: "_CameraStreamThread"):
+        with self._pending_capture_lock:
+            params = self._pending_capture
+            self._pending_capture = None
+        self._pending_capture_event.clear()
+        if params is None:
+            return
+        print("[INFO] On-demand Infra capture starting", flush=True)
+        self._bus.publish_note("capturing", f"Applying params: {params}")
+
+        applied, errors = self._apply_params(params, stream)
+        for err in errors:
+            print(f"[WARN] Param apply: {err}")
+
+        exp_s = self.cam.exposure_us / 1e6
+        timeout = max(exp_s * 2 + 10.0, 30.0)
+        skip_n = 3 if exp_s < 1.0 else 1
+
+        # Пропускаем переходные кадры после смены параметров
+        for i in range(skip_n):
+            f, _ = stream.wait_for_frame(timeout=timeout,
+                                         stop_event=self._stop_event)
+            if f is None:
+                self._publish_error("error", "Timeout during warm-up",
+                                    on_demand=True)
+                print("[ERROR] On-demand warm-up timeout")
+                return
+
+        print(f"[INFRA] === on-demand capture ===", flush=True)
+        frame, frame_ts = stream.wait_for_frame(timeout=timeout,
+                                                stop_event=self._stop_event)
+        if frame is None:
+            self._publish_error("error", "Timeout waiting for frame",
+                                on_demand=True)
+            print("[ERROR] On-demand capture timeout")
+            return
+        try:
+            jpeg_bytes = frame_to_jpeg_bytes(frame)
+            self._publish_ok(jpeg_bytes, frame_ts.isoformat(),
+                             on_demand=True, params=applied)
+            print("[INFO] On-demand frame sent via MQTT")
+        except Exception as exc:
+            self._publish_error("error", f"Encode error: {exc}", on_demand=True)
+            print(f"[ERROR] On-demand encode: {exc}")
+
+    def _on_mqtt_command(self, topic, payload):
+        print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
+              f"({len(payload) if payload else 0} bytes)", flush=True)
+        if not self._bus.enabled:
+            return
+        if topic.endswith("/cmd/get_frame"):
+            if self._last_frame is None:
+                self._publish_error("no_frame", "No frame captured yet")
+                print("[WARN] Frame requested but no frame available yet")
+                return
+            ts = self._last_shot.isoformat() if self._last_shot else None
+            try:
+                jpeg_data = frame_to_jpeg_bytes(self._last_frame)
+            except Exception as e:
+                self._publish_error("error", str(e), ts)
+                print(f"[ERROR] Frame encode error: {e}")
+                return
+            self._publish_ok(jpeg_data, ts)
+            print("[INFO] Frame sent via MQTT")
+            return
+        if topic.endswith("/cmd/capture_frame"):
+            params, err = parse_command_params(payload)
+            if err:
+                self._publish_error("bad_request", err, on_demand=True)
+                return
+            with self._pending_capture_lock:
+                self._pending_capture = params
+            self._pending_capture_event.set()
+            self._bus.publish_note("accepted",
+                                   f"Request queued with params: {params}")
+            print(f"[INFO] On-demand capture queued with params: {params}",
+                  flush=True)
+            return
+        print(f"[infra:{self.instance_name}] Unknown command: {topic}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Live view for the LAN focus tool
+    # ------------------------------------------------------------------
+    def _current_params(self):
+        return {
+            "exposure_us": self.cam.exposure_us,
+            "gain": self.cam.gain,
+            "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
+        }
+
+    def _handle_focus(self, now, stream: "_CameraStreamThread"):
+        """Feed the focus tool from the stream thread that is already running.
+
+        The infra camera streams continuously anyway to keep the FX3 FIFO
+        clean, so serving focus costs nothing more than publishing the frame
+        the stream thread just produced — the measurement loop is untouched.
+        """
+        if self._service is None or not self._service.focus_active():
+            return
+        if now.second in self.capture_seconds:
+            return
+        req_id, params = self._service.take_param_request()
+        if params:
+            applied, errors = self._apply_params(params, stream)
+            self._service.complete_param_request(req_id, applied, errors)
+            self._service.set_current_params(self._current_params())
+        frame, frame_ts = stream.get_latest_frame()
+        if frame is not None:
+            self._service.publish_frame(frame, frame_ts or now)
+
+    def run(self):
+        last_fired = (-1, -1)
+        consecutive_errors = 0
+        self._bus.prepare_status_dir()
+        self._bus.subscribe(self._on_mqtt_command)
+        if self._service is not None:
+            self._service.set_current_params(self._current_params())
+
+        exp_s = self.cam.exposure_us / 1e6
+        frame_timeout = max(exp_s * 2 + 10.0, 30.0)
+
+        # Stream thread держит FX3 FIFO в чистом состоянии — непрерывный
+        # захват без пауз, идентично preview-режиму.
+        stream = _CameraStreamThread(self.cam)
+        stream.start()
+        print("[INFO] Infra camera stream thread started")
+
+        print("[INFO] Infra camera measurement started")
+        self._save_status("running", force=True)
+
+        while not self._stop_event.is_set():
+            if self._pending_capture_event.is_set():
+                self._handle_pending_capture(stream)
+
+            now = dt.now()
+
+            active_end = None
+            for entry in self.schedule:
+                if entry.start <= now <= entry.end:
+                    active_end = entry.end
+                    break
+
+            if active_end is None:
+                self._save_status("waiting")
+                self._handle_focus(now, stream)
+                self._stop_event.wait(0.5)
+                continue
+
+            self._active_until = active_end
+
+            fire_key = (now.minute, now.second)
+            if now.second in self.capture_seconds and fire_key != last_fired:
+                last_fired = fire_key
+                ok = self._capture_one_stream(now, stream, frame_timeout)
+                if ok:
+                    consecutive_errors = 0
+                    self._shots += 1
+                    self._last_shot = now
+                    self._save_status("running", force=True)
+                else:
+                    consecutive_errors += 1
+                    self._errors += 1
+                    self._save_status("error", force=True)
+                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                        print(f"[ERROR] {consecutive_errors} consecutive errors, stopping")
+                        break
+            elif now.second not in self.capture_seconds:
+                last_fired = (-1, -1)
+                self._handle_focus(now, stream)
+
+            self._stop_event.wait(0.1)
+
+        stream.stop()
+        stream.join(timeout=frame_timeout)
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
+        print("[INFO] Infra camera measurement stopped")
+
+    def _capture_one_stream(self, now, stream: "_CameraStreamThread",
+                             timeout: float) -> bool:
+        """Сохраняет следующий кадр из непрерывного потока stream.
+
+        Не делает flush и не отбрасывает кадры — stream-поток уже держит FIFO
+        в чистом состоянии. Метод просто ждёт следующий готовый кадр и
+        сохраняет его. Для длинных экспозиций ожидание занимает до одного
+        периода кадра (exposure + readout).
+        """
+        timestamp = now.strftime("%Y%m%dT%H%M%S")
+        ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
+        ext = ext_map.get(self.save_format, "tiff")
+        filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
+
+        print(f"[INFRA] === scheduled capture {timestamp} — "
+              f"waiting for frame (timeout={timeout:.0f}s) ===", flush=True)
+        t0 = time.perf_counter()
+        frame, frame_ts = stream.wait_for_frame(timeout=timeout,
+                                                stop_event=self._stop_event)
+        wait_ms = (time.perf_counter() - t0) * 1000.0
+
+        if frame is None:
+            print(f"[ERROR] Capture timeout after {wait_ms/1000:.1f}s "
+                  f"(scheduled {timestamp})", flush=True)
+            return False
+
+        print(f"[INFRA] Frame received: waited {wait_ms:.0f}ms, "
+              f"frame_ts={frame_ts.isoformat()}", flush=True)
+        try:
+            if self.save_format == "fits":
+                save_fits(filepath, frame,
+                          exposure_us=self.cam.exposure_us,
+                          gain=self.cam.gain,
+                          roi=f"{self.cam.roi_width}x{self.cam.roi_height}")
+            elif self.save_format == "tiff":
+                save_tiff(filepath, frame)
+            else:
+                save_png(filepath, frame)
+            self._last_frame = frame
+            if self._service is not None:
+                self._service.publish_frame(frame, frame_ts or now)
+            print(f"[INFO] Shot saved: {os.path.basename(filepath)}")
+            return True
+        except Exception as exc:
+            print(f"[ERROR] Save error: {exc}")
+            return False
+
+    def _save_status(self, status, force=False):
+        payload = {
+            "instance_name": self.instance_name,
+            "camera_type": "infra",
+            "pid": os.getpid(),
+            "status": status,
+            "output_dir": self.output_dir,
+            "shots_taken": self._shots,
+            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
+            "active_until": self._active_until.isoformat() if self._active_until else None,
+            "errors": self._errors,
+            "capture_seconds": self.capture_seconds,
+            "exposure_us": self.cam.exposure_us,
+            "gain": self.cam.gain,
+            "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
+            "last_update": dt.now().isoformat(),
+        }
+        try:
+            payload["system"] = get_system_info(self.output_dir)
+        except Exception:
+            pass
+        self._bus.publish_status(payload, force=force)
+
+
+# ---------------------------------------------------------------------------
+# Console entry point
+# ---------------------------------------------------------------------------
+def run_preview_infra(cam, instance_name):
+    """Continuously grab frames and overwrite preview_{instance_name}.fits at max FPS."""
+    preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.fits")
+    # Write to a scratch file and rename into place: writing straight to
+    # preview_path let readers pick up a half-written FITS.
+    tmp_path = preview_path + ".tmp"
+    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+
+    stop = threading.Event()
+
+    def _sigint(sig, frame):
+        print("\n[INFO] Stopping preview...")
+        stop.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    frames = 0
+    t0 = dt.now()
+    while not stop.is_set():
+        try:
+            frame = cam.grab_frame()
+            save_fits(tmp_path, frame,
+                      exposure_us=cam.exposure_us, gain=cam.gain,
+                      roi=f"{cam.roi_width}x{cam.roi_height}")
+            os.replace(tmp_path, preview_path)
+            frames += 1
+            if frames % 10 == 0:
+                elapsed = (dt.now() - t0).total_seconds()
+                fps = frames / elapsed if elapsed > 0 else 0
+                print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+        except Exception as exc:
+            print(f"[ERROR] Preview frame error: {exc}")
+            time.sleep(0.1)
+
+
+def run_console_infra(config_path=None, preview=False):
+    """Run Infra camera measurement in console mode."""
+    from utils import load_config
+    from mqtt_client import create_console_publisher
+
+    cfg = load_config(config_path)
+    infra_cfg = cfg.get("infra", {})
+    mqtt_cfg = cfg.get("mqtt", {})
+
+    instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
+    output_dir = infra_cfg.get("output_dir", "")
+    status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
+    schedule_file = infra_cfg.get("schedule_file", "")
+    capture_seconds = infra_cfg.get("capture_seconds", INFRA_CAPTURE_SECONDS)
+    exposure_us = infra_cfg.get("exposure_us", 1000.0)
+    gain_val = infra_cfg.get("gain", 0)
+    roi = infra_cfg.get("roi", DEFAULT_ROI)
+    save_format = infra_cfg.get("save_format", "tiff")
+
+    print("=" * 60)
+    print("  Every Camera -- Infra (SW1300 SWIR) Console Mode" + ("  [PREVIEW]" if preview else ""))
+    print(f"  Instance      : {instance_name}")
+    if not preview:
+        print(f"  Capture at    : {capture_seconds} seconds of each minute")
+    print(f"  Exposure      : {exposure_us} us")
+    print(f"  Gain          : {gain_val}")
+    print(f"  ROI           : {roi}")
+    if not preview:
+        print(f"  Save format   : {save_format}")
+    print("=" * 60)
+
+    if preview:
+        print("[INFO] Connecting to Infra camera...")
+        cam = TanhoCamera()
+        try:
+            cam.connect()
+        except Exception as exc:
+            print(f"[ERROR] Failed to connect camera: {exc}")
+            sys.exit(1)
+        cam.set_exposure(exposure_us)
+        cam.set_gain(gain_val)
+        if roi in ROI_MODES:
+            w, h = ROI_MODES[roi]
+            cam.set_roi(w, h)
+        print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height}")
+        try:
+            run_preview_infra(cam, instance_name)
+        finally:
+            cam.disconnect()
+        print("[INFO] Done.")
+        return
+
+    if not output_dir or not schedule_file:
+        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        from utils import configure_console_infra
+        configure_console_infra(cfg, config_path)
+        infra_cfg = cfg.get("infra", {})
+        instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
+        output_dir = infra_cfg.get("output_dir", "")
+        schedule_file = infra_cfg.get("schedule_file", "")
+        capture_seconds = infra_cfg.get("capture_seconds", INFRA_CAPTURE_SECONDS)
+        exposure_us = infra_cfg.get("exposure_us", 1000.0)
+        gain_val = infra_cfg.get("gain", 0)
+        roi = infra_cfg.get("roi", DEFAULT_ROI)
+        save_format = infra_cfg.get("save_format", "tiff")
+
+    if not output_dir:
+        print("[ERROR] output_dir is required.")
+        sys.exit(1)
+    if not schedule_file:
+        print("[ERROR] schedule_file is required.")
+        sys.exit(1)
+    if not os.path.exists(schedule_file):
+        print(f"[ERROR] Schedule file not found: {schedule_file}")
+        sys.exit(1)
+
+    entries, errors = load_schedule_file(schedule_file)
+    for err in errors:
+        print(f"[WARN] Schedule: {err}")
+    if not entries:
+        print("[ERROR] No valid schedule entries found.")
+        sys.exit(1)
+
+    print(f"[INFO] Loaded {len(entries)} schedule intervals")
+    print(f"[INFO] Output directory: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(status_dir, exist_ok=True)
+
+    # Connect camera
+    print("[INFO] Connecting to Infra camera...")
+    cam = TanhoCamera()
+    try:
+        cam.connect()
+    except Exception as exc:
+        print(f"[ERROR] Failed to connect camera: {exc}")
+        sys.exit(1)
+
+    # Order matters: set_roi() resets exposure/gain registers, so ROI first,
+    # then exposure/gain. Small sleeps give the firmware time to latch.
+    if roi in ROI_MODES:
+        w, h = ROI_MODES[roi]
+        cam.set_roi(w, h)
+        time.sleep(0.05)
+    cam.set_gain(gain_val)
+    time.sleep(0.05)
+    cam.set_exposure(exposure_us)
+    time.sleep(0.05)
+    print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height} "
+          f"exposure_us={exposure_us} gain={gain_val}")
+
+    # Let the camera settle after exposure/gain/ROI so the first scheduled
+    # frame is actually captured with the configured exposure, not a stale
+    # frame already in the USB pipeline. Capped to 1s + 1 skip frame for long
+    # exposures to avoid minute-long startup delays.
+    exp_s = exposure_us / 1e6
+    settle_s = max(0.15, min(exp_s + 0.1, 1.0))
+    skip_n = 3 if exp_s < 1.0 else 1
+    time.sleep(settle_s)
+    try:
+        cam._flush_usb()
+    except Exception:
+        pass
+    for i in range(skip_n):
+        try:
+            cam.grab_frame(verbose_timing=False)
+        except Exception as exc:
+            print(f"[WARN] Warm-up frame {i} failed: {exc}")
+    print(f"[INFO] Warm-up done (settle={settle_s*1000:.0f}ms + {skip_n} skip frames)")
+
+    # MQTT
+    mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "infra")
+
+    # LAN frame server (archive browsing + live view). Never fatal.
+    from camera_service import CameraService
+    from frame_server import start_frame_server
+    service = CameraService("infra", instance_name, output_dir)
+    server = start_frame_server(cfg.get("server", {}), service)
+
+    worker = InfraWorkerConsole(
+        cam=cam,
+        schedule=entries,
+        output_dir=output_dir,
+        instance_name=instance_name,
+        status_dir=status_dir,
+        capture_seconds=capture_seconds,
+        save_format=save_format,
+        mqtt_publisher=mqtt_pub,
+        mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+        service=service,
+    )
+
+    def _sigint(sig, frame):
+        print("\n[INFO] Stopping (Ctrl+C)...")
+        worker.request_stop()
+    signal.signal(signal.SIGINT, _sigint)
+
+    print("[INFO] Starting. Press Ctrl+C to stop.")
+    worker.start()
+    worker.join()
+
+    cam.disconnect()
+    if server:
+        server.stop()
+    if mqtt_pub:
+        mqtt_pub.disconnect_broker()
+    print("[INFO] Done.")

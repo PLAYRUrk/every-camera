@@ -25,6 +25,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt, QObject
 from PyQt5.QtGui import QColor, QFont, QTextCursor, QImage, QPixmap
 
+import frame_archive
+
 from utils import (
     load_config, save_config, can_use_gui, get_instance_name,
     parse_schedule_text, load_schedule_file, save_schedule_file,
@@ -33,9 +35,48 @@ from utils import (
 )
 from mqtt_client import MQTT_AVAILABLE, MqttPublisher
 from monitor import MonitorWidget
+from worker_common import (
+    MQTT_MAX_PAYLOAD_BYTES, WorkerMqtt, run_focus_iteration,
+)
 
-# HiveMQ free tier limits messages to ~256 KB — leave headroom for JSON envelope.
-MQTT_MAX_PAYLOAD_BYTES = 240_000
+
+# ===========================================================================
+# Shared tab helpers
+# ===========================================================================
+
+def _make_tab_publisher(mqtt_cfg, camera_type, instance_name, log):
+    """Connected MqttPublisher with a retained last-will, or None."""
+    if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
+        return None
+    from mqtt_client import offline_payload
+    prefix = mqtt_cfg.get("prefix", "every_camera")
+    try:
+        pub = MqttPublisher(
+            host=mqtt_cfg.get("host", ""),
+            port=mqtt_cfg.get("port", 1883),
+            user=mqtt_cfg.get("user", ""),
+            password=mqtt_cfg.get("password", ""),
+            use_tls=mqtt_cfg.get("tls", False),
+            will_topic=f"{prefix}/{instance_name}/status",
+            will_payload=offline_payload(instance_name, camera_type),
+        )
+        pub.connect_broker()
+        return pub
+    except Exception as exc:
+        log(f"MQTT failed: {exc}", "warn")
+        return None
+
+
+def _start_tab_server(cfg, camera_type, instance_name, output_dir):
+    """Create the CameraService and start the LAN frame server for a tab.
+
+    Returns ``(service, server)``; ``server`` is None when the server is
+    disabled or could not bind — the measurement always goes ahead either way.
+    """
+    from camera_service import CameraService
+    from frame_server import start_frame_server
+    service = CameraService(camera_type, instance_name, output_dir)
+    return service, start_frame_server(cfg.get("server", {}), service)
 
 
 # ===========================================================================
@@ -71,7 +112,8 @@ class CannonWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, config, schedule, output_dir, instance_name,
-                 status_dir, capture_seconds, mqtt_publisher=None, mqtt_prefix="every_camera"):
+                 status_dir, capture_seconds, mqtt_publisher=None, mqtt_prefix="every_camera",
+                 service=None):
         super().__init__()
         self.cam = cam
         self.config = config
@@ -80,16 +122,18 @@ class CannonWorkerQt(QThread):
         self.instance_name = instance_name
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
+        self._service = service
         self._mqtt = mqtt_publisher
         self._mqtt_prefix = mqtt_prefix
-        self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame_data = None
         self._active_until = None
-        self._status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+        self._bus = WorkerMqtt("cannon", instance_name, status_dir,
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               status_suffix="_cannon")
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
 
@@ -244,12 +288,12 @@ class CannonWorkerQt(QThread):
 
         last_fired = (-1, -1)
         consecutive_errors = 0
-        os.makedirs(self.status_dir, exist_ok=True)
+        self._bus.prepare_status_dir()
 
         self._setup_command_listener()
         self.log_msg.emit("Measurement started", "info")
         self.status_msg.emit("Running")
-        self._save_status("running")
+        self._save_status("running", force=True)
 
         while not self._stop:
             # Handle on-demand capture requests (outside schedule)
@@ -268,6 +312,7 @@ class CannonWorkerQt(QThread):
                 self.status_msg.emit("Waiting for schedule")
                 self._save_status("waiting")
                 self.countdown.emit("--")
+                self._handle_focus(now)
                 self.msleep(500)
                 continue
 
@@ -292,34 +337,81 @@ class CannonWorkerQt(QThread):
                     with open(filepath, "wb") as f:
                         f.write(img_data)
                     self._last_frame_data = img_data
+                    self._push_live(img_data, now)
                     self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
                     consecutive_errors = 0
                     self._shots += 1
                     self._last_shot = now
                     self.shot_taken.emit(self._shots)
                     self.status_msg.emit("Running")
-                    self._save_status("running")
+                    self._save_status("running", force=True)
                 except Exception as e:
                     self.log_msg.emit(f"Capture error: {e}", "error")
                     consecutive_errors += 1
                     self._errors += 1
                     self.error_count.emit(self._errors)
-                    self._save_status("error")
+                    self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         self.log_msg.emit(
                             f"Stopped: {consecutive_errors} consecutive errors", "error")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
+                self._handle_focus(now)
 
             self.msleep(100)
 
-        self._save_status("stopped")
-        self._delete_status()
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
         self.log_msg.emit("Measurement stopped", "info")
         self.finished.emit()
 
-    def _save_status(self, status):
+
+    def _handle_focus(self, now):
+        """Serve the LAN focus tool between scheduled shots.
+
+        Scheduled captures always take priority: this is skipped on the
+        capture seconds themselves, and a focus session expires by itself if
+        the observer's program goes away, so it can never hold up a run.
+        """
+        if self._service is None or not self._service.focus_active():
+            return
+        if now.second in self.capture_seconds:
+            return
+        req_id, params = self._service.take_param_request()
+        if params:
+            failures = self._apply_cannon_params(params)
+            self._service.complete_param_request(
+                req_id, applied=params,
+                errors=[f"{k}: {e}" for k, e in failures])
+            try:
+                from cannon_driver import get_camera_settings_info
+                self._service.set_current_params(
+                    get_camera_settings_info(self.config))
+            except Exception:
+                pass
+        run_focus_iteration(
+            self._service, lambda: self._grab_focus_frame(),
+            on_error=lambda exc, stopped: self.log_msg.emit(
+                f"Focus frame failed: {exc}"
+                + (" — focus mode disabled" if stopped else ""), "warn"))
+
+    def _grab_focus_frame(self):
+        from cannon_driver import capture_image
+        try:
+            return self.cam.get_preview()
+        except Exception:
+            return capture_image(self.cam)
+
+    def _push_live(self, frame, ts=None):
+        """Hand the newest frame to the LAN service (viewer / focus tool)."""
+        if self._service is not None:
+            try:
+                self._service.publish_frame(frame, ts or dt.now())
+            except Exception:
+                pass
+
+    def _save_status(self, status, force=False):
         from cannon_driver import get_camera_settings_info
         cam_info = {}
         try:
@@ -343,21 +435,7 @@ class CannonWorkerQt(QThread):
             payload["system"] = get_system_info(self.output_dir)
         except Exception:
             pass
-        try:
-            write_status_file(self._status_path, payload)
-        except Exception:
-            pass
-        if self._mqtt:
-            try:
-                self._mqtt.publish(self._mqtt_topic, json.dumps(payload), retain=True)
-            except Exception:
-                pass
-
-    def _delete_status(self):
-        try:
-            os.remove(self._status_path)
-        except FileNotFoundError:
-            pass
+        self._bus.publish_status(payload, force=force)
 
 
 class CannonTab(QWidget):
@@ -374,6 +452,8 @@ class CannonTab(QWidget):
         self.worker = None
         self.connect_thread = None
         self._mqtt_pub = None
+        self._server = None
+        self._service = None
         self._build_ui()
         self._load_config()
 
@@ -616,21 +696,13 @@ class CannonTab(QWidget):
         capture_seconds = self._parse_capture_seconds()
         mqtt_cfg = self._cfg.get("mqtt", {})
 
-        # MQTT publisher
-        self._mqtt_pub = None
-        if mqtt_cfg.get("enabled") and MQTT_AVAILABLE:
-            try:
-                self._mqtt_pub = MqttPublisher(
-                    host=mqtt_cfg.get("host", ""),
-                    port=mqtt_cfg.get("port", 1883),
-                    user=mqtt_cfg.get("user", ""),
-                    password=mqtt_cfg.get("password", ""),
-                    use_tls=mqtt_cfg.get("tls", False),
-                )
-                self._mqtt_pub.connect_broker()
-            except Exception as e:
-                self._log(f"MQTT failed: {e}", "warn")
-                self._mqtt_pub = None
+        # MQTT publisher (with a retained last-will on the status topic)
+        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "cannon", instance_name,
+                                             self._log)
+
+        # LAN frame server: archive browsing + live view for viewer/focus apps
+        self._service, self._server = _start_tab_server(
+            self._cfg, "cannon", instance_name, output_dir)
 
         self.worker = CannonWorkerQt(
             cam=self.cam, config=self.config, schedule=entries,
@@ -638,6 +710,7 @@ class CannonTab(QWidget):
             status_dir=status_dir, capture_seconds=capture_seconds,
             mqtt_publisher=self._mqtt_pub,
             mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+            service=self._service,
         )
         self.worker.log_msg.connect(self._log)
         self.worker.shot_taken.connect(lambda n: self.lbl_shots.setText(f"Shots: {n}"))
@@ -655,6 +728,9 @@ class CannonTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.request_stop()
             self.worker.wait(5000)
+        if self._server:
+            self._server.stop()
+            self._server = None
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -772,21 +848,23 @@ class SpttScheduledWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 mqtt_publisher=None, mqtt_prefix="every_camera"):
+                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
         super().__init__()
         self.cam = cam
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
+        self._service = service
         self._mqtt = mqtt_publisher
         self._mqtt_prefix = mqtt_prefix
-        self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
-        self._status_path = os.path.join(status_dir, f"{os.getpid()}_sptt.json")
+        self._bus = WorkerMqtt("sptt", instance_name, status_dir,
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               status_suffix="_sptt")
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
 
@@ -803,32 +881,9 @@ class SpttScheduledWorkerQt(QThread):
 
     def _encode_sptt_jpeg(self, frame):
         """Convert a 2D frame to JPEG bytes with auto-downscale. Returns (bytes, w, h)."""
-        import base64
-        import io
-        from PIL import Image
-
         if frame.ndim != 2:
             raise ValueError(f"Unexpected frame shape: {frame.shape}")
-        if frame.dtype == np.uint16:
-            peak = int(frame.max()) or 1
-            display = (frame.astype(np.float32) / peak * 255).astype(np.uint8)
-        else:
-            display = frame.astype(np.uint8, copy=False)
-        img = Image.fromarray(display, mode="L")
-        buf = io.BytesIO()
-        quality = 85
-        img.save(buf, format="JPEG", quality=quality)
-        while True:
-            jpeg_bytes = buf.getvalue()
-            payload_size = len(base64.b64encode(jpeg_bytes)) + 512
-            if payload_size <= MQTT_MAX_PAYLOAD_BYTES:
-                return jpeg_bytes, img.size[0], img.size[1]
-            if min(img.size) <= 320:
-                raise ValueError(
-                    f"Frame payload still {payload_size} bytes after downscale")
-            img = img.resize((img.size[0] // 2, img.size[1] // 2))
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality)
+        return frame_archive.to_jpeg_capped(frame, MQTT_MAX_PAYLOAD_BYTES)
 
     def _publish_sptt_frame(self, jpeg_bytes, w, h, ts_iso,
                              on_demand=False, params=None):
@@ -984,18 +1039,19 @@ class SpttScheduledWorkerQt(QThread):
 
         last_fired = (-1, -1)
         consecutive_errors = 0
-        os.makedirs(self.status_dir, exist_ok=True)
+        self._bus.prepare_status_dir()
 
         self._setup_command_listener()
         self.log_msg.emit("SPTT measurement started", "info")
         self.status_msg.emit("Running")
-        self._save_status("running")
+        self._save_status("running", force=True)
 
         try:
             self.cam.start()
         except Exception as e:
             self.log_msg.emit(f"Failed to start camera: {e}", "error")
-            self._save_status("error")
+            self._save_status("error", force=True)
+            self._bus.shutdown()
             self.finished.emit()
             return
 
@@ -1033,34 +1089,70 @@ class SpttScheduledWorkerQt(QThread):
                         metadata["TRGTEMP"] = cam_status.get("temp_target", 0)
                     save_fits(filepath, frame, metadata)
                     self._last_frame = frame
+                    self._push_live(frame, now)
                     self.log_msg.emit(f"Frame saved: {os.path.basename(filepath)}", "info")
                     consecutive_errors = 0
                     self._shots += 1
                     self._last_shot = now
                     self.shot_taken.emit(self._shots)
                     self.status_msg.emit("Running")
-                    self._save_status("running")
+                    self._save_status("running", force=True)
                 except Exception as e:
                     self.log_msg.emit(f"Capture error: {e}", "error")
                     consecutive_errors += 1
                     self._errors += 1
                     self.error_count.emit(self._errors)
-                    self._save_status("error")
+                    self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         self.log_msg.emit(f"Stopped: {consecutive_errors} consecutive errors", "error")
                         break
             elif now.second not in SPTT_CAPTURE_SECONDS:
                 last_fired = (-1, -1)
+                self._handle_focus(now)
 
             self.msleep(100)
 
         self.cam.stop()
-        self._save_status("stopped")
-        self._delete_status()
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
         self.log_msg.emit("SPTT measurement stopped", "info")
         self.finished.emit()
 
-    def _save_status(self, status):
+
+    def _handle_focus(self, now):
+        """Serve the LAN focus tool between scheduled shots.
+
+        Scheduled captures always take priority: this is skipped on the
+        capture seconds themselves, and a focus session expires by itself if
+        the observer's program goes away, so it can never hold up a run.
+        """
+        from sptt_driver import SPTT_CAPTURE_SECONDS
+        if self._service is None or not self._service.focus_active():
+            return
+        if now.second in SPTT_CAPTURE_SECONDS:
+            return
+        req_id, params = self._service.take_param_request()
+        if params:
+            applied, errors = self._apply_sptt_params(params)
+            self._service.complete_param_request(req_id, applied, errors)
+            self._service.set_current_params({
+                "exposure": self.cam.exposure, "gain": self.cam.gain,
+                "binning": self.cam.binning})
+        run_focus_iteration(
+            self._service, lambda: self.cam.grab_frame(),
+            on_error=lambda exc, stopped: self.log_msg.emit(
+                f"Focus frame failed: {exc}"
+                + (" — focus mode disabled" if stopped else ""), "warn"))
+
+    def _push_live(self, frame, ts=None):
+        """Hand the newest frame to the LAN service (viewer / focus tool)."""
+        if self._service is not None:
+            try:
+                self._service.publish_frame(frame, ts or dt.now())
+            except Exception:
+                pass
+
+    def _save_status(self, status, force=False):
         from sptt_driver import ENCODING_12BPP
         cam_status = {}
         try:
@@ -1087,21 +1179,7 @@ class SpttScheduledWorkerQt(QThread):
             payload["system"] = get_system_info(self.output_dir)
         except Exception:
             pass
-        try:
-            write_status_file(self._status_path, payload)
-        except Exception:
-            pass
-        if self._mqtt:
-            try:
-                self._mqtt.publish(self._mqtt_topic, json.dumps(payload), retain=True)
-            except Exception:
-                pass
-
-    def _delete_status(self):
-        try:
-            os.remove(self._status_path)
-        except FileNotFoundError:
-            pass
+        self._bus.publish_status(payload, force=force)
 
 
 class SpttTab(QWidget):
@@ -1119,6 +1197,8 @@ class SpttTab(QWidget):
         self.fps_time = time.time()
         self.fps = 0.0
         self._mqtt_pub = None
+        self._server = None
+        self._service = None
         self._build_ui()
         self._load_config()
 
@@ -1424,20 +1504,10 @@ class SpttTab(QWidget):
         instance_name = self.le_instance.text().strip() or get_instance_name("SPTT")
         mqtt_cfg = self._cfg.get("mqtt", {})
 
-        self._mqtt_pub = None
-        if mqtt_cfg.get("enabled") and MQTT_AVAILABLE:
-            try:
-                self._mqtt_pub = MqttPublisher(
-                    host=mqtt_cfg.get("host", ""),
-                    port=mqtt_cfg.get("port", 1883),
-                    user=mqtt_cfg.get("user", ""),
-                    password=mqtt_cfg.get("password", ""),
-                    use_tls=mqtt_cfg.get("tls", False),
-                )
-                self._mqtt_pub.connect_broker()
-            except Exception as e:
-                self._log(f"MQTT failed: {e}", "warn")
-                self._mqtt_pub = None
+        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "sptt", instance_name,
+                                             self._log)
+        self._service, self._server = _start_tab_server(
+            self._cfg, "sptt", instance_name, output_dir)
 
         self.scheduled_worker = SpttScheduledWorkerQt(
             cam=self.cam,
@@ -1446,6 +1516,7 @@ class SpttTab(QWidget):
             status_dir=status_dir,
             mqtt_publisher=self._mqtt_pub,
             mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+            service=self._service,
         )
         self.scheduled_worker.log_msg.connect(self._log)
         self.scheduled_worker.shot_taken.connect(
@@ -1465,6 +1536,9 @@ class SpttTab(QWidget):
         if self.scheduled_worker and self.scheduled_worker.isRunning():
             self.scheduled_worker.request_stop()
             self.scheduled_worker.wait(5000)
+        if self._server:
+            self._server.stop()
+            self._server = None
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -1582,8 +1656,9 @@ class InfraWorkerQt(QThread):
 
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
-                 mqtt_publisher=None, mqtt_prefix="every_camera"):
+                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
         super().__init__()
+        self._service = service
         self.cam = cam
         self.schedule = schedule
         self.output_dir = output_dir
@@ -1593,14 +1668,15 @@ class InfraWorkerQt(QThread):
         self.save_format = save_format
         self._mqtt = mqtt_publisher
         self._mqtt_prefix = mqtt_prefix
-        self._mqtt_topic = f"{mqtt_prefix}/{instance_name}/status"
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
         self._active_until = None
-        self._status_path = os.path.join(status_dir, f"{os.getpid()}_infra.json")
+        self._bus = WorkerMqtt("infra", instance_name, status_dir,
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               status_suffix="_infra")
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
 
@@ -1765,12 +1841,12 @@ class InfraWorkerQt(QThread):
 
         last_fired = (-1, -1)
         consecutive_errors = 0
-        os.makedirs(self.status_dir, exist_ok=True)
+        self._bus.prepare_status_dir()
 
         self._setup_command_listener()
         self.log_msg.emit("Infra measurement started", "info")
         self.status_msg.emit("Running")
-        self._save_status("running")
+        self._save_status("running", force=True)
 
         while not self._stop:
             # Handle on-demand capture requests (outside schedule)
@@ -1789,6 +1865,7 @@ class InfraWorkerQt(QThread):
                 self.status_msg.emit("Waiting for schedule")
                 self._save_status("waiting")
                 self.countdown.emit("--")
+                self._handle_focus(now)
                 self.msleep(500)
                 continue
 
@@ -1822,34 +1899,69 @@ class InfraWorkerQt(QThread):
                     else:
                         save_png(filepath, frame)
                     self._last_frame = frame
+                    self._push_live(frame, now)
                     self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
                     consecutive_errors = 0
                     self._shots += 1
                     self._last_shot = now
                     self.shot_taken.emit(self._shots)
                     self.status_msg.emit("Running")
-                    self._save_status("running")
+                    self._save_status("running", force=True)
                 except Exception as e:
                     self.log_msg.emit(f"Capture error: {e}", "error")
                     consecutive_errors += 1
                     self._errors += 1
                     self.error_count.emit(self._errors)
-                    self._save_status("error")
+                    self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         self.log_msg.emit(
                             f"Stopped: {consecutive_errors} consecutive errors", "error")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
+                self._handle_focus(now)
 
             self.msleep(100)
 
-        self._save_status("stopped")
-        self._delete_status()
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
         self.log_msg.emit("Infra measurement stopped", "info")
         self.finished.emit()
 
-    def _save_status(self, status):
+
+    def _handle_focus(self, now):
+        """Serve the LAN focus tool between scheduled shots.
+
+        Scheduled captures always take priority: this is skipped on the
+        capture seconds themselves, and a focus session expires by itself if
+        the observer's program goes away, so it can never hold up a run.
+        """
+        if self._service is None or not self._service.focus_active():
+            return
+        if now.second in self.capture_seconds:
+            return
+        req_id, params = self._service.take_param_request()
+        if params:
+            applied, errors = self._apply_infra_params(params)
+            self._service.complete_param_request(req_id, applied, errors)
+            self._service.set_current_params({
+                "exposure_us": self.cam.exposure_us, "gain": self.cam.gain,
+                "roi": f"{self.cam.roi_width}x{self.cam.roi_height}"})
+        run_focus_iteration(
+            self._service, lambda: self.cam.grab_frame(),
+            on_error=lambda exc, stopped: self.log_msg.emit(
+                f"Focus frame failed: {exc}"
+                + (" — focus mode disabled" if stopped else ""), "warn"))
+
+    def _push_live(self, frame, ts=None):
+        """Hand the newest frame to the LAN service (viewer / focus tool)."""
+        if self._service is not None:
+            try:
+                self._service.publish_frame(frame, ts or dt.now())
+            except Exception:
+                pass
+
+    def _save_status(self, status, force=False):
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "infra",
@@ -1869,21 +1981,7 @@ class InfraWorkerQt(QThread):
             payload["system"] = get_system_info(self.output_dir)
         except Exception:
             pass
-        try:
-            write_status_file(self._status_path, payload)
-        except Exception:
-            pass
-        if self._mqtt:
-            try:
-                self._mqtt.publish(self._mqtt_topic, json.dumps(payload), retain=True)
-            except Exception:
-                pass
-
-    def _delete_status(self):
-        try:
-            os.remove(self._status_path)
-        except FileNotFoundError:
-            pass
+        self._bus.publish_status(payload, force=force)
 
 
 class InfraTab(QWidget):
@@ -1901,6 +1999,8 @@ class InfraTab(QWidget):
         self.fps_time = time.time()
         self.fps = 0.0
         self._mqtt_pub = None
+        self._server = None
+        self._service = None
         self._build_ui()
         self._load_config()
 
@@ -2304,20 +2404,10 @@ class InfraTab(QWidget):
         save_format = self.combo_format.currentText()
         mqtt_cfg = self._cfg.get("mqtt", {})
 
-        self._mqtt_pub = None
-        if mqtt_cfg.get("enabled") and MQTT_AVAILABLE:
-            try:
-                self._mqtt_pub = MqttPublisher(
-                    host=mqtt_cfg.get("host", ""),
-                    port=mqtt_cfg.get("port", 1883),
-                    user=mqtt_cfg.get("user", ""),
-                    password=mqtt_cfg.get("password", ""),
-                    use_tls=mqtt_cfg.get("tls", False),
-                )
-                self._mqtt_pub.connect_broker()
-            except Exception as e:
-                self._log(f"MQTT failed: {e}", "warn")
-                self._mqtt_pub = None
+        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "infra", instance_name,
+                                             self._log)
+        self._service, self._server = _start_tab_server(
+            self._cfg, "infra", instance_name, output_dir)
 
         self.worker = InfraWorkerQt(
             cam=self.cam,
@@ -2329,6 +2419,7 @@ class InfraTab(QWidget):
             save_format=save_format,
             mqtt_publisher=self._mqtt_pub,
             mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+            service=self._service,
         )
         self.worker.log_msg.connect(self._log)
         self.worker.shot_taken.connect(lambda n: self.lbl_meas_shots.setText(f"Shots: {n}"))
@@ -2347,6 +2438,9 @@ class InfraTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.request_stop()
             self.worker.wait(5000)
+        if self._server:
+            self._server.stop()
+            self._server = None
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -2389,16 +2483,353 @@ class InfraTab(QWidget):
 
 
 # ===========================================================================
+# Sentry GUI components
+# ===========================================================================
+
+class SentryWorkerQt(QThread):
+    log_msg = pyqtSignal(str, str)
+    status_msg = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, cam, output_dir, instance_name, status_dir,
+                 capture_seconds, mqtt_publisher=None,
+                 mqtt_prefix="every_camera", service=None):
+        super().__init__()
+        self.cam = cam
+        self.output_dir = output_dir
+        self.instance_name = instance_name
+        self.status_dir = status_dir
+        self.capture_seconds = sorted(capture_seconds)
+        self._service = service
+        self._mqtt = mqtt_publisher
+        self._mqtt_prefix = mqtt_prefix
+        self._bus = WorkerMqtt("sentry", instance_name, status_dir,
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               status_suffix="_sentry")
+        self._stop = False
+        self._shots = 0
+        self._errors = 0
+        self._last_shot = None
+        self._last_seqno = -1
+
+    def request_stop(self):
+        self._stop = True
+
+    def _save_status(self, status, force=False):
+        """Publish the status snapshot.
+
+        This used to be missing entirely: the worker computed a status path and
+        then never wrote it, so a sentry camera driven from the GUI was
+        invisible to the monitor and published nothing over MQTT.
+        """
+        meta = self.cam.get_metadata()
+        payload = {
+            "instance_name": self.instance_name,
+            "camera_type": "sentry",
+            "pid": os.getpid(),
+            "status": status,
+            "output_dir": self.output_dir,
+            "shots_taken": self._shots,
+            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
+            "errors": self._errors,
+            "seqno": self.cam.get_seqno(),
+            "capture_seconds": self.capture_seconds,
+            "daemon_running": self.cam.is_running(),
+            "last_update": dt.now().isoformat(),
+        }
+        for key in ("CCDTemp", "Exposure", "Binning", "CCDGain", "FilterPo",
+                    "SiteID", "DeviceID"):
+            if key in meta:
+                payload[key.lower()] = meta[key]
+        try:
+            payload["system"] = get_system_info(self.output_dir or None)
+        except Exception:
+            pass
+        self._bus.publish_status(payload, force=force)
+
+    def run(self):
+        self._bus.prepare_status_dir()
+
+        if not self.cam.is_running():
+            self.log_msg.emit("[SENTRY] Starting imagerd_rt daemon...", "info")
+            try:
+                self.cam.start()
+                time.sleep(2)
+            except Exception as exc:
+                self.log_msg.emit(f"[ERROR] Could not start daemon: {exc}", "error")
+                self._errors += 1
+                self._save_status("error", force=True)
+                self._bus.shutdown()
+                self.finished.emit()
+                return
+
+        self.log_msg.emit("[INFO] Sentry worker running", "info")
+        self.status_msg.emit("running")
+        self._save_status("running", force=True)
+
+        last_fired = (-1, -1)
+        while not self._stop:
+            now = dt.now()
+            fire_key = (now.minute, now.second)
+            if now.second in self.capture_seconds and fire_key != last_fired:
+                last_fired = fire_key
+                seqno = self.cam.get_seqno()
+                meta = self.cam.get_metadata()
+                running = self.cam.is_running()
+                self.status_msg.emit("running" if running else "waiting")
+                self.log_msg.emit(
+                    f"[SENTRY] seqno={seqno} "
+                    f"temp={meta.get('CCDTemp', '?')} "
+                    f"exp={meta.get('Exposure', '?')}",
+                    "info",
+                )
+                if seqno != self._last_seqno and seqno > 0:
+                    self._last_seqno = seqno
+                    self._shots += 1
+                    self._last_shot = now
+                    self._archive_and_publish(now)
+                self._save_status("running" if running else "waiting", force=True)
+            elif now.second not in self.capture_seconds:
+                last_fired = (-1, -1)
+            time.sleep(0.1)
+
+        if self.cam.is_running():
+            self.cam.stop()
+        self.status_msg.emit("stopped")
+        self.log_msg.emit("[INFO] Sentry worker stopped", "info")
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
+        self.finished.emit()
+
+    def _archive_and_publish(self, now):
+        """Archive the daemon's latest FITS and publish it to MQTT / LAN."""
+        if self.output_dir:
+            path = self.cam.archive_latest_image(self.output_dir, now)
+            if path:
+                self.log_msg.emit(f"[SENTRY] Archived {os.path.basename(path)}",
+                                  "info")
+        frame = self.cam.get_latest_image()
+        if frame is None:
+            return
+        if self._service is not None:
+            self._service.publish_frame(frame, now, self.cam.get_metadata())
+        if self._bus.enabled:
+            try:
+                self._bus.publish_frame_array(frame, now.isoformat())
+            except Exception as exc:
+                self._errors += 1
+                self.log_msg.emit(f"[WARN] Could not publish frame: {exc}", "warn")
+
+
+class SentryTab(QWidget):
+    """GUI tab for the Sentry (imagerd_rt) camera."""
+
+    def __init__(self, cfg: dict, log_fn, mqtt_fn=None):
+        super().__init__()
+        self._cfg = cfg
+        self._log = log_fn
+        self._mqtt_fn = mqtt_fn
+        self._worker = None
+        self._server = None
+        self._service = None
+        self.cam = None
+        self._build_ui()
+
+    def _build_ui(self):
+        sentry_cfg = self._cfg.get("sentry", {})
+        layout = QVBoxLayout(self)
+
+        # Configuration group
+        cfg_box = QGroupBox("Sentry Camera (imagerd_rt)")
+        cfg_grid = QGridLayout(cfg_box)
+        cfg_grid.setColumnStretch(1, 1)
+        row = 0
+
+        cfg_grid.addWidget(QLabel("imagerd_rt dir:"), row, 0)
+        self.le_dir = QLineEdit(sentry_cfg.get("imagerd_rt_dir", "/usr/local/imagerd_rt"))
+        cfg_grid.addWidget(self.le_dir, row, 1)
+        row += 1
+
+        cfg_grid.addWidget(QLabel("Output dir:"), row, 0)
+        self.le_output = QLineEdit(sentry_cfg.get("output_dir", ""))
+        cfg_grid.addWidget(self.le_output, row, 1)
+        btn_browse = QPushButton("Browse…")
+        btn_browse.clicked.connect(self._browse_output)
+        cfg_grid.addWidget(btn_browse, row, 2)
+        row += 1
+
+        cfg_grid.addWidget(QLabel("Instance name:"), row, 0)
+        self.le_instance = QLineEdit(sentry_cfg.get("instance_name", ""))
+        self.le_instance.setPlaceholderText("auto")
+        cfg_grid.addWidget(self.le_instance, row, 1)
+        row += 1
+
+        layout.addWidget(cfg_box)
+
+        # Control buttons
+        ctrl_lay = QHBoxLayout()
+        self.btn_start = QPushButton("Start Monitoring")
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop)
+        ctrl_lay.addWidget(self.btn_start)
+        ctrl_lay.addWidget(self.btn_stop)
+        ctrl_lay.addStretch()
+        layout.addLayout(ctrl_lay)
+
+        # Status
+        status_box = QGroupBox("Status")
+        status_lay = QGridLayout(status_box)
+        status_lay.addWidget(QLabel("Status:"), 0, 0)
+        self.lbl_status = QLabel("stopped")
+        status_lay.addWidget(self.lbl_status, 0, 1)
+        status_lay.addWidget(QLabel("Daemon:"), 0, 2)
+        self.lbl_daemon = QLabel("unknown")
+        status_lay.addWidget(self.lbl_daemon, 0, 3)
+        status_lay.addWidget(QLabel("Seq#:"), 1, 0)
+        self.lbl_seqno = QLabel("—")
+        status_lay.addWidget(self.lbl_seqno, 1, 1)
+        status_lay.addWidget(QLabel("CCD Temp:"), 1, 2)
+        self.lbl_temp = QLabel("—")
+        status_lay.addWidget(self.lbl_temp, 1, 3)
+        status_lay.addWidget(QLabel("Exposure:"), 2, 0)
+        self.lbl_exp = QLabel("—")
+        status_lay.addWidget(self.lbl_exp, 2, 1)
+        status_lay.addWidget(QLabel("Filter pos:"), 2, 2)
+        self.lbl_filter = QLabel("—")
+        status_lay.addWidget(self.lbl_filter, 2, 3)
+        layout.addWidget(status_box)
+
+        # Log
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Monospace", 9))
+        layout.addWidget(self.log_text, 1)
+
+        # Poll timer for status refresh
+        self._poll_timer = QTimer()
+        self._poll_timer.setInterval(2000)
+        self._poll_timer.timeout.connect(self._refresh_status)
+
+    def _browse_output(self):
+        d = QFileDialog.getExistingDirectory(self, "Select output directory",
+                                             self.le_output.text())
+        if d:
+            self.le_output.setText(d)
+
+    def _log_local(self, msg, level="info"):
+        colors = {"info": "#000", "warn": "#aa6600", "error": "#cc0000"}
+        ts = dt.now().strftime("%H:%M:%S")
+        self.log_text.append(
+            f'<span style="color:{colors.get(level, "#000")}">[{ts}] {msg}</span>'
+        )
+        self._log(msg, level)
+
+    def _on_start(self):
+        from cameras.sentry_driver import SentryCamera
+        from utils import get_instance_name, HOME_STATUS_DIR
+        from pathlib import Path
+
+        imagerd_rt_dir = self.le_dir.text().strip()
+        output_dir = self.le_output.text().strip()
+        instance = self.le_instance.text().strip() or get_instance_name("Sentry")
+
+        self.cam = SentryCamera(imagerd_rt_dir)
+        if not self.cam.is_available():
+            self._log_local(
+                f"[ERROR] imagerd_rt not found at: {imagerd_rt_dir}", "error"
+            )
+            return
+
+        status_dir = str(Path.home() / ".every_camera" / "status")
+        sentry_cfg = self._cfg.get("sentry", {})
+        capture_seconds = sentry_cfg.get("capture_seconds", [0, 30])
+
+        # MQTT and the LAN frame server, same as the console entry point —
+        # neither used to be wired up here at all.
+        mqtt_pub = self._mqtt_fn("sentry", instance) if self._mqtt_fn else None
+        mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
+
+        from camera_service import CameraService
+        from frame_server import start_frame_server
+        self._service = CameraService("sentry", instance, output_dir,
+                                      supports_params=False)
+        self._server = start_frame_server(self._cfg.get("server", {}),
+                                          self._service)
+
+        self._worker = SentryWorkerQt(
+            cam=self.cam,
+            output_dir=output_dir,
+            instance_name=instance,
+            status_dir=status_dir,
+            capture_seconds=capture_seconds,
+            mqtt_publisher=mqtt_pub,
+            mqtt_prefix=mqtt_prefix,
+            service=self._service,
+        )
+        self._worker.log_msg.connect(self._log_local)
+        self._worker.status_msg.connect(self.lbl_status.setText)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._poll_timer.start()
+        self._log_local(f"[INFO] Sentry monitoring started — instance: {instance}")
+
+    def _on_stop(self):
+        if self._worker:
+            self._worker.request_stop()
+        self.btn_stop.setEnabled(False)
+
+    def _on_finished(self):
+        self._poll_timer.stop()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        if self._server:
+            self._server.stop()
+            self._server = None
+
+    def _refresh_status(self):
+        if self.cam is None:
+            return
+        running = self.cam.is_running()
+        self.lbl_daemon.setText("running" if running else "stopped")
+        seqno = self.cam.get_seqno()
+        self.lbl_seqno.setText(str(seqno) if seqno >= 0 else "—")
+        meta = self.cam.get_metadata()
+        self.lbl_temp.setText(meta.get("CCDTemp", "—"))
+        self.lbl_exp.setText(meta.get("Exposure", "—"))
+        self.lbl_filter.setText(meta.get("FilterPo", "—"))
+
+    def cleanup(self):
+        self._poll_timer.stop()
+        if self._worker and self._worker.isRunning():
+            self._worker.request_stop()
+            self._worker.wait(3000)
+        if self._server:
+            self._server.stop()
+            self._server = None
+        if self.cam and self.cam.is_running():
+            self.cam.stop()
+
+
+# ===========================================================================
 # Main Window
 # ===========================================================================
 
 class MainWindow(QMainWindow):
-    def __init__(self, cfg, camera_type=None):
+    def __init__(self, cfg, camera_type=None, config_path=None):
         super().__init__()
         self.setWindowTitle("Every Camera")
         self.setMinimumSize(700, 450)
         self.resize(1100, 750)
         self._cfg = cfg
+        # Remember where the config came from: closeEvent used to save to the
+        # default config.json regardless of --config, writing settings into
+        # the wrong file.
+        self._config_path = config_path
         self._tabs = {}
         self._build_ui(camera_type)
 
@@ -2467,6 +2898,12 @@ class MainWindow(QMainWindow):
             self.tab_widget.addTab(self._infra_tab, "Infra Camera")
             self._tabs["infra"] = self._infra_tab
 
+        if camera_type is None or camera_type == "sentry":
+            self._sentry_tab = SentryTab(self._cfg, self._log,
+                                         self.create_mqtt_publisher)
+            self.tab_widget.addTab(self._sentry_tab, "Sentry Camera")
+            self._tabs["sentry"] = self._sentry_tab
+
         # Monitor tab
         mqtt_cfg = self._cfg.get("mqtt", {})
         self._monitor = MonitorWidget(mqtt_cfg)
@@ -2494,20 +2931,49 @@ class MainWindow(QMainWindow):
         self.log_text.moveCursor(QTextCursor.End)
 
     def _get_mqtt_config(self):
+        # Keep the port an int: saving it as a string is what put
+        # "port": "1883" into config.json.
+        try:
+            port = int(self.le_mqtt_port.text().strip() or 1883)
+        except ValueError:
+            port = 1883
         return {
             "enabled": self._mqtt_box.isChecked(),
             "host": self.le_mqtt_host.text().strip(),
-            "port": self.le_mqtt_port.text().strip(),
+            "port": port,
             "user": self.le_mqtt_user.text().strip(),
             "password": self.le_mqtt_pass.text(),
             "prefix": self.le_mqtt_prefix.text().strip(),
             "tls": self.cb_mqtt_tls.isChecked(),
         }
 
+    def create_mqtt_publisher(self, camera_type, instance_name):
+        """Build a connected MqttPublisher with a last-will, or None."""
+        mqtt_cfg = self._get_mqtt_config()
+        if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
+            return None
+        from mqtt_client import offline_payload
+        prefix = mqtt_cfg.get("prefix") or "every_camera"
+        try:
+            pub = MqttPublisher(
+                host=mqtt_cfg["host"],
+                port=mqtt_cfg["port"] or 1883,
+                user=mqtt_cfg["user"],
+                password=mqtt_cfg["password"],
+                use_tls=mqtt_cfg["tls"],
+                will_topic=f"{prefix}/{instance_name}/status",
+                will_payload=offline_payload(instance_name, camera_type),
+            )
+            pub.connect_broker()
+            return pub
+        except Exception as exc:
+            self._log(f"MQTT setup failed: {exc}", "error")
+            return None
+
     def closeEvent(self, event):
-        # Save MQTT config back
+        # Save MQTT config back to the file it was loaded from
         self._cfg["mqtt"] = self._get_mqtt_config()
-        save_config(self._cfg)
+        save_config(self._cfg, self._config_path)
         for tab in self._tabs.values():
             tab.cleanup()
         event.accept()
@@ -2527,13 +2993,14 @@ def run_gui(args):
     except Exception:
         os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
-    cfg = load_config(args.config if hasattr(args, 'config') else None)
+    config_path = getattr(args, 'config', None)
+    cfg = load_config(config_path)
     camera_type = getattr(args, 'type', None)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    win = MainWindow(cfg, camera_type)
+    win = MainWindow(cfg, camera_type, config_path)
     win.show()
 
     sys.exit(app.exec_())

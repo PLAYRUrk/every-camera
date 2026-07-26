@@ -23,6 +23,43 @@
       30
     ]
   },
+  "infra": {
+    "instance_name": "",
+    "output_dir": "/home/alex/data/New Folder/woglass",
+    "schedule_file": "/home/alex/data/schedule.txt",
+    "capture_seconds": [
+      0,
+      30
+    ],
+    "exposure_us": 20000000.0,
+    "gain": 120,
+    "roi": "1280x1024",
+    "save_format": "png"
+  },
+  "sentry": {
+    "instance_name": "",
+    "imagerd_rt_dir": "/usr/local/imagerd_rt",
+    "output_dir": "",
+    "device_id": "ASI1",
+    "site_id": "SITE",
+    "zenith_angle_start": -10,
+    "schedule_len_ms": 1440000,
+    "imaging_mode": "schedule",
+    "capture_seconds": [
+      0,
+      30
+    ],
+    "slots": [
+      {
+        "filter_num": 1,
+        "start_ms": 0,
+        "exposure_ms": 55000,
+        "binning": 2,
+        "gain": 3,
+        "readout_ms": 5000
+      }
+    ]
+  },
   "mqtt": {
     "enabled": false,
     "host": "broker.hivemq.com",

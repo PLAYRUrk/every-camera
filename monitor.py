@@ -23,7 +23,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPixmap
 
 from mqtt_client import MQTT_AVAILABLE
 
-from utils import HOME_STATUS_DIR
+from utils import HOME_STATUS_DIR, pid_alive
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,6 +44,7 @@ STATUS_COLORS = {
     "waiting": QColor(180, 120, 0),
     "error":   QColor(200, 0, 0),
     "stopped": QColor(120, 120, 120),
+    "offline": QColor(200, 80, 0),
     "idle":    QColor(80, 80, 200),
     "stale":   QColor(200, 80, 0),
     "unknown": QColor(100, 100, 100),
@@ -72,15 +73,19 @@ class FrameViewerDialog(QDialog):
         self.lbl_image.setStyleSheet("background-color: #1a1a1a; color: #888;")
         lay.addWidget(self.lbl_image, 1)
 
+        # Full-resolution frame. Rescaling always starts from this, never from
+        # the scaled-down pixmap already on screen — otherwise every resize
+        # degraded the image a little further and the loss was irreversible.
+        self._original = None
+
     def show_frame(self, instance_name, camera_type, jpeg_data, timestamp=None):
         """Display a JPEG frame."""
         qimg = QImage()
         if qimg.loadFromData(jpeg_data):
-            pixmap = QPixmap.fromImage(qimg)
-            scaled = pixmap.scaled(self.lbl_image.size(),
-                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.lbl_image.setPixmap(scaled)
+            self._original = QPixmap.fromImage(qimg)
+            self._rescale()
         else:
+            self._original = None
             self.lbl_image.setText("Failed to decode image")
 
         ts = timestamp or "?"
@@ -88,14 +93,24 @@ class FrameViewerDialog(QDialog):
             f"{instance_name}  |  {camera_type.upper()}  |  {ts}")
         self.setWindowTitle(f"Last Frame — {instance_name}")
 
+    def show_message(self, text, info=None):
+        """Show a status message instead of an image."""
+        self._original = None
+        self.lbl_image.setPixmap(QPixmap())
+        self.lbl_image.setText(text)
+        if info is not None:
+            self.lbl_info.setText(info)
+
+    def _rescale(self):
+        if self._original is None or self._original.isNull():
+            return
+        self.lbl_image.setPixmap(
+            self._original.scaled(self.lbl_image.size(),
+                                  Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Re-scale pixmap on resize
-        pm = self.lbl_image.pixmap()
-        if pm and not pm.isNull():
-            self.lbl_image.setPixmap(
-                pm.scaled(self.lbl_image.size(),
-                          Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._rescale()
 
 
 class CaptureParamsDialog(QDialog):
@@ -253,6 +268,24 @@ def _extra_info(rec):
             parts.append(rec["frame_size"])
         if rec.get("cam_temp_ccd") is not None:
             parts.append(f"T:{rec['cam_temp_ccd']}\u00b0")
+    elif cam_type == "infra":
+        if rec.get("exposure_us") is not None:
+            exp_ms = rec["exposure_us"] / 1000.0
+            parts.append(f"Exp:{exp_ms:.1f}ms" if exp_ms < 1000
+                         else f"Exp:{exp_ms / 1000:.2f}s")
+        if rec.get("gain") is not None:
+            parts.append(f"G:{rec['gain']}")
+        if rec.get("roi"):
+            parts.append(rec["roi"])
+    elif cam_type == "sentry":
+        if rec.get("seqno") is not None:
+            parts.append(f"Seq:{rec['seqno']}")
+        if rec.get("ccdtemp") is not None:
+            parts.append(f"T:{rec['ccdtemp']}\u00b0")
+        if rec.get("exposure") is not None:
+            parts.append(f"Exp:{rec['exposure']}")
+        if rec.get("daemon_running") is not None:
+            parts.append("daemon:up" if rec["daemon_running"] else "daemon:DOWN")
     # System info
     sys_info = rec.get("system", {})
     if sys_info.get("disk_free_mb") is not None:
@@ -472,6 +505,12 @@ class MqttTab(QWidget):
         if topic.endswith("/frame"):
             self._on_frame_received(topic, payload)
             return
+        # An empty retained payload means the instance cleared its status on
+        # shutdown — drop it from the table instead of showing it forever.
+        if not payload.strip():
+            if self._instances.pop(topic, None) is not None:
+                self._refresh_table()
+            return
         # Handle status messages
         try:
             data = json.loads(payload)
@@ -503,9 +542,9 @@ class MqttTab(QWidget):
             # Open viewer dialog
             if not self._frame_viewer or not self._frame_viewer.isVisible():
                 self._frame_viewer = FrameViewerDialog(self)
-            self._frame_viewer.lbl_image.setText(
-                f"Waiting for frame from {instance_name}...")
-            self._frame_viewer.lbl_info.setText(f"Requesting: {instance_name}")
+            self._frame_viewer.show_message(
+                f"Waiting for frame from {instance_name}...",
+                f"Requesting: {instance_name}")
             self._frame_viewer.show()
             self._frame_viewer.raise_()
 
@@ -549,9 +588,9 @@ class MqttTab(QWidget):
 
         if not self._frame_viewer or not self._frame_viewer.isVisible():
             self._frame_viewer = FrameViewerDialog(self)
-        self._frame_viewer.lbl_image.setText(
-            f"Capturing new frame from {instance_name}...\nParams: {params}")
-        self._frame_viewer.lbl_info.setText(f"On-demand: {instance_name}")
+        self._frame_viewer.show_message(
+            f"Capturing new frame from {instance_name}...\nParams: {params}",
+            f"On-demand: {instance_name}")
         self._frame_viewer.show()
         self._frame_viewer.raise_()
 
@@ -571,8 +610,7 @@ class MqttTab(QWidget):
         self.lbl_footer.setText(msg)
         print(f"[monitor] Timeout waiting for {instance_name}", flush=True)
         if self._frame_viewer and self._frame_viewer.isVisible():
-            self._frame_viewer.lbl_image.setText(msg)
-            self._frame_viewer.lbl_info.setText(f"Timeout: {instance_name}")
+            self._frame_viewer.show_message(msg, f"Timeout: {instance_name}")
 
     def _on_frame_received(self, topic, payload):
         """Handle incoming frame data."""
@@ -598,9 +636,8 @@ class MqttTab(QWidget):
             self.lbl_footer.setText(
                 f"{instance_name}: request accepted — {note}")
             if self._frame_viewer and self._frame_viewer.isVisible():
-                self._frame_viewer.lbl_image.setText(
-                    f"Request accepted by {instance_name}\n{note}")
-                self._frame_viewer.lbl_info.setText(
+                self._frame_viewer.show_message(
+                    f"Request accepted by {instance_name}\n{note}",
                     f"{instance_name} ({camera_type}) — accepted")
             # Extend the window: camera will start capturing soon.
             self._frame_timeout_timer.start(ON_DEMAND_TIMEOUT_MS)
@@ -609,9 +646,8 @@ class MqttTab(QWidget):
             self.lbl_footer.setText(
                 f"{instance_name}: capturing — {note}")
             if self._frame_viewer and self._frame_viewer.isVisible():
-                self._frame_viewer.lbl_image.setText(
-                    f"Capturing new frame on {instance_name}...\n{note}")
-                self._frame_viewer.lbl_info.setText(
+                self._frame_viewer.show_message(
+                    f"Capturing new frame on {instance_name}...\n{note}",
                     f"{instance_name} ({camera_type}) — capturing")
             self._frame_timeout_timer.start(ON_DEMAND_TIMEOUT_MS)
             return
@@ -627,9 +663,8 @@ class MqttTab(QWidget):
             self.lbl_footer.setText(msg)
             print(f"[monitor] {msg}", flush=True)
             if self._frame_viewer and self._frame_viewer.isVisible():
-                self._frame_viewer.lbl_image.setText(msg)
-                self._frame_viewer.lbl_info.setText(
-                    f"{instance_name} ({camera_type}) — {status}")
+                self._frame_viewer.show_message(
+                    msg, f"{instance_name} ({camera_type}) — {status}")
             return
 
         try:
@@ -744,6 +779,12 @@ class LocalTab(QWidget):
                 data.setdefault("instance_name", os.path.basename(path))
                 data.setdefault("pid", "?")
                 data.setdefault("status", "unknown")
+                # A worker killed with SIGKILL never removes its own file. Show
+                # it as stopped instead of pretending it is still running.
+                if data["status"] not in ("stopped", "offline") \
+                        and not pid_alive(data.get("pid")):
+                    data["status"] = "stopped"
+                    data["instance_name"] = f"{data['instance_name']} (dead)"
                 records.append(data)
             except Exception:
                 pass

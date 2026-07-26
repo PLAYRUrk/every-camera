@@ -4,12 +4,28 @@ All MQTT operations are non-blocking and failure-safe.
 """
 import os
 import json
+import socket
+import uuid
 
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
+
+
+def make_client_id(role):
+    """Build a client id that is unique across machines.
+
+    A plain ``{role}_{pid}`` is not: two nodes easily end up with the same PID,
+    and an MQTT broker kicks off whichever client already holds the id — so
+    both would reconnect in a loop and lose commands.
+    """
+    try:
+        host = socket.gethostname().split(".")[0][:20]
+    except Exception:
+        host = "host"
+    return f"{role}_{host}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
 
 
 def _make_mqtt_client(client_id):
@@ -23,20 +39,36 @@ def _make_mqtt_client(client_id):
         return mqtt.Client(client_id=client_id)
 
 
+def offline_payload(instance_name, camera_type):
+    """Last-will payload: what the broker publishes if this node vanishes."""
+    return json.dumps({
+        "instance_name": instance_name,
+        "camera_type": camera_type,
+        "status": "offline",
+        "note": "connection lost (MQTT last will)",
+    })
+
+
 # ---------------------------------------------------------------------------
 # Console MQTT publisher (no Qt — safe to use in threads)
 # ---------------------------------------------------------------------------
 class MqttPublisherConsole:
     """Minimal paho-mqtt wrapper for console mode (no Qt signals)."""
 
-    def __init__(self, host, port, user="", password="", use_tls=False, client_id=""):
+    def __init__(self, host, port, user="", password="", use_tls=False,
+                 client_id="", will_topic=None, will_payload=None):
         if not MQTT_AVAILABLE:
             raise RuntimeError("paho-mqtt not installed: pip install paho-mqtt")
-        self._client = _make_mqtt_client(client_id or f"ecam_pub_{os.getpid()}")
+        self._client = _make_mqtt_client(client_id or make_client_id("ecam_pub"))
         if user:
             self._client.username_pw_set(user, password)
         if use_tls:
             self._client.tls_set()
+        if will_topic:
+            # Retained, so a monitor connecting later still sees that this node
+            # went away instead of its last "running" status.
+            self._client.will_set(will_topic, will_payload or "",
+                                  qos=1, retain=True)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
@@ -44,6 +76,7 @@ class MqttPublisherConsole:
         self._port = int(port)
         self._sub_topic = None
         self._on_command_cb = None
+        self._check_timer = None
 
     def connect_broker(self):
         print(f"[INFO] MQTT connecting to {self._host}:{self._port}...",
@@ -64,9 +97,14 @@ class MqttPublisherConsole:
             print(f"[WARN] MQTT still NOT connected to {self._host}:{self._port} "
                   f"after 3s. Check network/firewall/credentials. "
                   f"Commands from monitor will not be received.", flush=True)
-        _th.Timer(3.0, _check_connected).start()
+        self._check_timer = _th.Timer(3.0, _check_connected)
+        self._check_timer.daemon = True
+        self._check_timer.start()
 
     def disconnect_broker(self):
+        if self._check_timer is not None:
+            self._check_timer.cancel()
+            self._check_timer = None
         try:
             self._client.loop_stop()
             self._client.disconnect()
@@ -76,6 +114,22 @@ class MqttPublisherConsole:
     def publish(self, topic, payload, retain=True, qos=1):
         try:
             self._client.publish(topic, payload, qos=qos, retain=retain)
+        except Exception:
+            pass
+
+    def clear_retained(self, topic):
+        """Erase a retained topic by publishing an empty retained payload.
+
+        Without this a stopped camera keeps its last retained status on the
+        broker forever and shows up as a live instance in every monitor.
+        """
+        try:
+            info = self._client.publish(topic, b"", qos=1, retain=True)
+            # Give the broker a moment before the caller disconnects.
+            try:
+                info.wait_for_publish(timeout=3.0)
+            except (AttributeError, TypeError, ValueError):
+                pass
         except Exception:
             pass
 
@@ -129,15 +183,19 @@ try:
         error = pyqtSignal(str)
         command_received = pyqtSignal(str, bytes)  # topic, payload
 
-        def __init__(self, host, port, user="", password="", use_tls=False, client_id=""):
+        def __init__(self, host, port, user="", password="", use_tls=False,
+                     client_id="", will_topic=None, will_payload=None):
             super().__init__()
             if not MQTT_AVAILABLE:
                 raise RuntimeError("paho-mqtt not installed: pip install paho-mqtt")
-            self._client = _make_mqtt_client(client_id or f"ecam_pub_{os.getpid()}")
+            self._client = _make_mqtt_client(client_id or make_client_id("ecam_pub"))
             if user:
                 self._client.username_pw_set(user, password)
             if use_tls:
                 self._client.tls_set()
+            if will_topic:
+                self._client.will_set(will_topic, will_payload or "",
+                                      qos=1, retain=True)
             self._client.on_connect = self._on_connect
             self._client.on_disconnect = self._on_disconnect
             self._client.on_message = self._on_message
@@ -166,6 +224,17 @@ try:
         def publish(self, topic, payload, retain=True, qos=1):
             try:
                 self._client.publish(topic, payload, qos=qos, retain=retain)
+            except Exception:
+                pass
+
+        def clear_retained(self, topic):
+            """Erase a retained topic (see MqttPublisherConsole.clear_retained)."""
+            try:
+                info = self._client.publish(topic, b"", qos=1, retain=True)
+                try:
+                    info.wait_for_publish(timeout=3.0)
+                except (AttributeError, TypeError, ValueError):
+                    pass
             except Exception:
                 pass
 
@@ -206,7 +275,7 @@ try:
             super().__init__()
             if not MQTT_AVAILABLE:
                 raise RuntimeError("paho-mqtt not installed: pip install paho-mqtt")
-            self._client = _make_mqtt_client(client_id or f"ecam_mon_{os.getpid()}")
+            self._client = _make_mqtt_client(client_id or make_client_id("ecam_mon"))
             if user:
                 self._client.username_pw_set(user, password)
             if use_tls:
@@ -265,13 +334,15 @@ try:
                 self.disconnected.emit()
 
         def _on_message(self, client, userdata, msg):
+            # Text where possible (all every-camera payloads are JSON), binary
+            # only as a fallback — emitting both copied every frame twice.
             try:
-                # Try text decode for status messages
-                payload_str = msg.payload.decode("utf-8")
-                self.message_received.emit(msg.topic, payload_str)
-            except Exception:
+                self.message_received.emit(msg.topic, msg.payload.decode("utf-8"))
+                return
+            except UnicodeDecodeError:
                 pass
-            # Always emit binary for frame data
+            except Exception:
+                return
             try:
                 self.binary_received.emit(msg.topic, bytes(msg.payload))
             except Exception:
@@ -285,12 +356,22 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
-def create_console_publisher(mqtt_cfg):
-    """Create MqttPublisherConsole from config dict. Returns None on failure."""
+def create_console_publisher(mqtt_cfg, instance_name=None, camera_type=None):
+    """Create MqttPublisherConsole from config dict. Returns None on failure.
+
+    When ``instance_name`` is given, a retained last-will is registered on the
+    instance's status topic so a crashed node is reported as ``offline``
+    immediately instead of lingering as "running" until it goes stale.
+    """
     if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
         if mqtt_cfg.get("enabled") and not MQTT_AVAILABLE:
             print("[WARN] MQTT disabled: install paho-mqtt")
         return None
+    will_topic = will_payload = None
+    if instance_name:
+        prefix = mqtt_cfg.get("prefix", "every_camera")
+        will_topic = f"{prefix}/{instance_name}/status"
+        will_payload = offline_payload(instance_name, camera_type or "unknown")
     try:
         pub = MqttPublisherConsole(
             host=mqtt_cfg.get("host", "broker.hivemq.com"),
@@ -298,6 +379,8 @@ def create_console_publisher(mqtt_cfg):
             user=mqtt_cfg.get("user", ""),
             password=mqtt_cfg.get("password", ""),
             use_tls=mqtt_cfg.get("tls", False),
+            will_topic=will_topic,
+            will_payload=will_payload,
         )
         pub.connect_broker()
         return pub

@@ -17,3 +17,14 @@ astropy>=5.0
 # Python deps: numpy (already above), ctypes (stdlib)
 # System deps (install via apt):
 #   sudo apt install libusb-1.0-0 libqt5gui5 libqt5core5a libgl1-mesa-glx
+
+# ---------------------------------------------------------------------------
+# Observer machine only (viewer_app.py / focus_app.py)
+# ---------------------------------------------------------------------------
+# Neither program imports a camera driver, so a laptop that only *watches* the
+# cameras needs nothing from the sections above except:
+#     PyQt5, numpy, Pillow   — required
+#     paho-mqtt              — only for the HiveMQ tab in viewer_app.py
+#     astropy                — optional; without it FITS files are read by the
+#                              built-in minimal parser in frame_archive.py
+# LAN browsing, live view and discovery use only the standard library.
