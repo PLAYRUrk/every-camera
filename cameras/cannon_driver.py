@@ -19,9 +19,13 @@ from pathlib import Path
 import console_ui
 
 from utils import (
-    load_schedule_file, get_instance_name, get_system_info, APP_DIR,
+    load_schedule_safe, claim_instance_name, get_instance_name,
+    get_local_ip, get_system_info, APP_DIR,
 )
-from worker_common import WorkerMqtt, parse_command_params, run_focus_iteration
+from worker_common import (
+    WorkerMqtt, parse_command_params, run_focus_iteration,
+    announce_setup_mode, SETUP_STATUS,
+)
 
 # ---------------------------------------------------------------------------
 # gphoto2-cffi import with monkey-patching
@@ -282,7 +286,8 @@ class CannonWorkerConsole(threading.Thread):
 
     def __init__(self, cam, config, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None, node_name=""):
+                 mqtt_prefix="every_camera", service=None, node_name="",
+                 setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.config = config
@@ -291,6 +296,7 @@ class CannonWorkerConsole(threading.Thread):
         self.instance_name = instance_name
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
+        self.setup_mode = bool(setup_mode)
         self._service = service
         self._bus = WorkerMqtt("cannon", instance_name, status_dir,
                                mqtt_publisher, mqtt_prefix, service=service,
@@ -405,7 +411,7 @@ class CannonWorkerConsole(threading.Thread):
         """
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds:
+        if now.second in self.capture_seconds and not self.setup_mode:
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -430,8 +436,12 @@ class CannonWorkerConsole(threading.Thread):
         self._bus.prepare_status_dir()
         self._bus.subscribe(self._on_mqtt_command)
 
-        console_ui.log("Cannon measurement started")
-        self._save_status("running", force=True)
+        if self.setup_mode:
+            console_ui.log("Cannon ready for focusing (setup mode)")
+            self._save_status(SETUP_STATUS, force=True)
+        else:
+            console_ui.log("Cannon measurement started")
+            self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
             # Handle on-demand capture requests (outside schedule)
@@ -448,7 +458,7 @@ class CannonWorkerConsole(threading.Thread):
                     break
 
             if active_end is None:
-                self._save_status("waiting")
+                self._save_status(SETUP_STATUS if self.setup_mode else "waiting")
                 self._handle_focus(now)
                 self._stop_event.wait(0.5)
                 continue
@@ -515,6 +525,7 @@ class CannonWorkerConsole(threading.Thread):
             "active_until": self._active_until.isoformat() if self._active_until else None,
             "errors": self._errors,
             "capture_seconds": self.capture_seconds,
+            "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
         }
         payload.update(cam_info)
@@ -571,7 +582,8 @@ def run_preview_cannon(cam, instance_name):
             sleep(0.2)
 
 
-def run_console_cannon(config_path=None, preview=False, verbose=False):
+def run_console_cannon(config_path=None, preview=False, verbose=False,
+                       setup_mode=False):
     """Run Canon camera measurement in console mode."""
     from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
@@ -580,8 +592,13 @@ def run_console_cannon(config_path=None, preview=False, verbose=False):
     cannon_cfg = cfg.get("cannon", {})
     mqtt_cfg = cfg.get("mqtt", {})
 
-    instance_name = cannon_cfg.get("instance_name") or get_instance_name("Cannon")
     node_name = get_node_name(cfg)
+    # Reserved for the lifetime of the process, so a second copy started from
+    # this same config.json gets "Cannon_node-2" instead of silently sharing
+    # MQTT topics, the log file and preview_{instance}.png with the first.
+    claim = claim_instance_name(cannon_cfg.get("instance_name")
+                                or get_instance_name("Cannon", cfg))
+    instance_name = claim.name
     output_dir = cannon_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     schedule_file = cannon_cfg.get("schedule_file", "")
@@ -594,14 +611,15 @@ def run_console_cannon(config_path=None, preview=False, verbose=False):
     try:
         _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
                             instance_name, node_name, output_dir, status_dir,
-                            schedule_file, capture_seconds)
+                            schedule_file, capture_seconds, setup_mode)
     finally:
         dash.stop()
+        claim.release()
 
 
 def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
                         instance_name, node_name, output_dir, status_dir,
-                        schedule_file, capture_seconds):
+                        schedule_file, capture_seconds, setup_mode=False):
     """Body of :func:`run_console_cannon`, with the dashboard already running."""
     from mqtt_client import create_console_publisher
 
@@ -622,13 +640,18 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
         console_ui.log("Done.")
         return
 
-    if not output_dir or not schedule_file:
+    # Only a missing output_dir is worth an interactive prompt: a node without a
+    # schedule is a legitimate state (setup mode below), and a headless box must
+    # not stall on input() because of it.
+    if not output_dir:
         console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_cannon
         with dash.suspended():          # the wizard needs a plain terminal
             configure_console_cannon(cfg, config_path)
         cannon_cfg = cfg.get("cannon", {})
-        instance_name = cannon_cfg.get("instance_name") or get_instance_name("Cannon")
+        # instance_name is deliberately not re-read: it is already reserved, and
+        # the dashboard and log file are open under it. A name typed into the
+        # wizard takes effect on the next run.
         output_dir = cannon_cfg.get("output_dir", "")
         schedule_file = cannon_cfg.get("schedule_file", "")
         capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
@@ -638,21 +661,17 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     if not output_dir:
         console_ui.error("output_dir is required.")
         sys.exit(1)
-    if not schedule_file:
-        console_ui.error("schedule_file is required.")
-        sys.exit(1)
-    if not os.path.exists(schedule_file):
-        console_ui.error(f"Schedule file not found: {schedule_file}")
-        sys.exit(1)
 
-    entries, errors = load_schedule_file(schedule_file)
+    entries, errors, reason = load_schedule_safe(schedule_file)
     for err in errors:
         console_ui.warn(f"Schedule: {err}")
-    if not entries:
-        console_ui.error("No valid schedule entries found.")
-        sys.exit(1)
-
-    console_ui.log(f"Loaded {len(entries)} schedule intervals")
+    if setup_mode or reason:
+        entries = []
+        setup_mode = True
+        announce_setup_mode(reason)
+        dash.update(schedule="setup mode — no scheduled captures")
+    else:
+        console_ui.log(f"Loaded {len(entries)} schedule intervals")
     console_ui.log(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
@@ -684,7 +703,7 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     from camera_service import CameraService
     from frame_server import start_frame_server
     service = CameraService("cannon", instance_name, output_dir,
-                            node_name=node_name)
+                            node_name=node_name, setup_mode=setup_mode)
     try:
         service.set_current_params(get_camera_settings_info(config))
     except Exception:
@@ -692,6 +711,9 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     server = start_frame_server(cfg.get("server", {}), service)
     if server:
         dash.update(server_url=server.url)
+        if setup_mode:
+            console_ui.log(f"Focus this camera with: python focus_app.py "
+                           f"--host {get_local_ip()} --port {server.port}")
 
     worker = CannonWorkerConsole(
         cam=cam,
@@ -705,6 +727,7 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
         node_name=node_name,
+        setup_mode=setup_mode,
     )
 
     def _sigint(sig, frame):

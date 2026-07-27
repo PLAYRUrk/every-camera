@@ -29,6 +29,7 @@ import frame_archive
 
 from utils import (
     load_config, save_config, can_use_gui, get_instance_name,
+    claim_instance_name,
     parse_schedule_text, load_schedule_file, save_schedule_file,
     write_status_file, get_system_info,
     SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR,
@@ -67,17 +68,29 @@ def _make_tab_publisher(mqtt_cfg, camera_type, instance_name, log):
         return None
 
 
-def _start_tab_server(cfg, camera_type, instance_name, output_dir):
+def _release_claim(tab):
+    """Give a tab's reserved instance name back when its worker stops."""
+    claim = getattr(tab, "_claim", None)
+    if claim is not None:
+        claim.release()
+        tab._claim = None
+
+
+def _start_tab_server(cfg, camera_type, instance_name, output_dir,
+                      setup_mode=False):
     """Create the CameraService and start the LAN frame server for a tab.
 
     Returns ``(service, server)``; ``server`` is None when the server is
     disabled or could not bind — the measurement always goes ahead either way.
+    Tabs share one ``cfg["server"]``, so the port search in
+    :func:`frame_server.start_frame_server` is what lets more than one of them
+    have a server at all.
     """
     from camera_service import CameraService
     from frame_server import start_frame_server
     from utils import get_node_name
     service = CameraService(camera_type, instance_name, output_dir,
-                            node_name=get_node_name(cfg))
+                            node_name=get_node_name(cfg), setup_mode=setup_mode)
     return service, start_frame_server(cfg.get("server", {}), service)
 
 
@@ -571,7 +584,8 @@ class CannonTab(QWidget):
 
     def _load_config(self):
         c = self._cfg.get("cannon", {})
-        self.le_instance.setText(c.get("instance_name") or get_instance_name("Cannon"))
+        self.le_instance.setText(c.get("instance_name")
+                                 or get_instance_name("Cannon", self._cfg))
         self.le_output.setText(c.get("output_dir", ""))
         secs = c.get("capture_seconds", [0, 30])
         self.le_cap_seconds.setText(", ".join(str(s) for s in secs))
@@ -694,7 +708,13 @@ class CannonTab(QWidget):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(status_dir, exist_ok=True)
 
-        instance_name = self.le_instance.text().strip() or get_instance_name("Cannon")
+        self._claim = claim_instance_name(
+            self.le_instance.text().strip() or get_instance_name("Cannon", self._cfg))
+        instance_name = self._claim.name
+        setup_mode = not entries
+        if setup_mode:
+            self._log("Schedule is empty — starting in setup mode: live frames "
+                      "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
         mqtt_cfg = self._cfg.get("mqtt", {})
 
@@ -704,7 +724,7 @@ class CannonTab(QWidget):
 
         # LAN frame server: archive browsing + live view for viewer/focus apps
         self._service, self._server = _start_tab_server(
-            self._cfg, "cannon", instance_name, output_dir)
+            self._cfg, "cannon", instance_name, output_dir, setup_mode)
 
         self.worker = CannonWorkerQt(
             cam=self.cam, config=self.config, schedule=entries,
@@ -733,6 +753,7 @@ class CannonTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -1342,7 +1363,8 @@ class SpttTab(QWidget):
 
     def _load_config(self):
         c = self._cfg.get("sptt", {})
-        self.le_instance.setText(c.get("instance_name") or get_instance_name("SPTT"))
+        self.le_instance.setText(c.get("instance_name")
+                                 or get_instance_name("SPTT", self._cfg))
         self.le_output.setText(c.get("output_dir", ""))
         self.spin_exp.setValue(c.get("exposure", 0.88))
         self.spin_gain.setValue(c.get("gain", 100))
@@ -1503,7 +1525,9 @@ class SpttTab(QWidget):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(status_dir, exist_ok=True)
 
-        instance_name = self.le_instance.text().strip() or get_instance_name("SPTT")
+        self._claim = claim_instance_name(
+            self.le_instance.text().strip() or get_instance_name("SPTT", self._cfg))
+        instance_name = self._claim.name
         mqtt_cfg = self._cfg.get("mqtt", {})
 
         self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "sptt", instance_name,
@@ -1541,6 +1565,7 @@ class SpttTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -2204,7 +2229,8 @@ class InfraTab(QWidget):
 
     def _load_config(self):
         c = self._cfg.get("infra", {})
-        self.le_instance.setText(c.get("instance_name") or get_instance_name("Infra"))
+        self.le_instance.setText(c.get("instance_name")
+                                 or get_instance_name("Infra", self._cfg))
         self.le_output.setText(c.get("output_dir", ""))
         secs = c.get("capture_seconds", [0, 30])
         self.le_cap_seconds.setText(", ".join(str(s) for s in secs))
@@ -2401,7 +2427,13 @@ class InfraTab(QWidget):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(status_dir, exist_ok=True)
 
-        instance_name = self.le_instance.text().strip() or get_instance_name("Infra")
+        self._claim = claim_instance_name(
+            self.le_instance.text().strip() or get_instance_name("Infra", self._cfg))
+        instance_name = self._claim.name
+        setup_mode = not entries
+        if setup_mode:
+            self._log("Schedule is empty — starting in setup mode: live frames "
+                      "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
         save_format = self.combo_format.currentText()
         mqtt_cfg = self._cfg.get("mqtt", {})
@@ -2409,7 +2441,7 @@ class InfraTab(QWidget):
         self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "infra", instance_name,
                                              self._log)
         self._service, self._server = _start_tab_server(
-            self._cfg, "infra", instance_name, output_dir)
+            self._cfg, "infra", instance_name, output_dir, setup_mode)
 
         self.worker = InfraWorkerQt(
             cam=self.cam,
@@ -2443,6 +2475,7 @@ class InfraTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
         if self._mqtt_pub:
             self._mqtt_pub.disconnect_broker()
             self._mqtt_pub = None
@@ -2730,12 +2763,14 @@ class SentryTab(QWidget):
 
     def _on_start(self):
         from cameras.sentry_driver import SentryCamera
-        from utils import get_instance_name, HOME_STATUS_DIR
+        from utils import get_instance_name, claim_instance_name, HOME_STATUS_DIR
         from pathlib import Path
 
         imagerd_rt_dir = self.le_dir.text().strip()
         output_dir = self.le_output.text().strip()
-        instance = self.le_instance.text().strip() or get_instance_name("Sentry")
+        self._claim = claim_instance_name(
+            self.le_instance.text().strip() or get_instance_name("Sentry", self._cfg))
+        instance = self._claim.name
 
         self.cam = SentryCamera(imagerd_rt_dir)
         if not self.cam.is_available():
@@ -2794,6 +2829,7 @@ class SentryTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
 
     def _refresh_status(self):
         if self.cam is None:
@@ -2815,6 +2851,7 @@ class SentryTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
         if self.cam and self.cam.is_running():
             self.cam.stop()
 
@@ -2984,7 +3021,7 @@ class AsiTab(QWidget):
         from cameras.asi_driver import AsiCamera, AsiWorkerConsole
         from camera_service import CameraService
         from frame_server import start_frame_server
-        from utils import get_instance_name, get_node_name
+        from utils import get_instance_name, claim_instance_name, get_node_name
         from pathlib import Path
 
         asi_cfg = dict(self._cfg.get("asi", {}))
@@ -3000,12 +3037,15 @@ class AsiTab(QWidget):
         if not conf.output_dir:
             self._log_local("Output directory is required.", "error")
             return
-        if not conf.schedule.entries:
-            self._log_local("The schedule is empty — add slots in setup_app.py.",
-                            "error")
-            return
+        setup_mode = not conf.schedule.entries
+        if setup_mode:
+            self._log_local("The schedule is empty — starting in setup mode: "
+                            "live frames for focus_app.py, nothing archived. "
+                            "Add slots in setup_app.py to measure.", "warn")
 
-        instance = self.le_instance.text().strip() or get_instance_name("ASI")
+        self._claim = claim_instance_name(
+            self.le_instance.text().strip() or get_instance_name("ASI", self._cfg))
+        instance = self._claim.name
         node_name = get_node_name(self._cfg)
         status_dir = self._cfg.get("status_dir") or str(
             Path.home() / ".every_camera" / "status")
@@ -3024,7 +3064,8 @@ class AsiTab(QWidget):
         mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
 
         self._service = CameraService("asi", instance, conf.output_dir,
-                                      node_name=node_name)
+                                      node_name=node_name,
+                                      setup_mode=setup_mode)
         self._server = start_frame_server(self._cfg.get("server", {}),
                                           self._service)
 
@@ -3038,6 +3079,7 @@ class AsiTab(QWidget):
             mqtt_prefix=mqtt_prefix,
             service=self._service,
             node_name=node_name,
+            setup_mode=setup_mode,
         )
         self._worker.start()
 
@@ -3086,6 +3128,7 @@ class AsiTab(QWidget):
         if self._server:
             self._server.stop()
             self._server = None
+        _release_claim(self)
         if self._mqtt_pub:
             try:
                 self._mqtt_pub.disconnect_broker()

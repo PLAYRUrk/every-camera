@@ -108,7 +108,8 @@ class CameraService:
     """Shared state between one camera worker and the local frame server."""
 
     def __init__(self, camera_type, instance_name, output_dir="",
-                 supports_focus=True, supports_params=True, node_name=""):
+                 supports_focus=True, supports_params=True, node_name="",
+                 setup_mode=False):
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.output_dir = output_dir or ""
@@ -117,6 +118,10 @@ class CameraService:
         self.node_name = node_name or ""
         self.supports_focus = bool(supports_focus)
         self.supports_params = bool(supports_params)
+        # True when the camera is up for focusing only — no schedule, so no
+        # frames are being archived. Reported to focus_app and to discovery so
+        # nobody mistakes an idle setup node for a broken measurement.
+        self.setup_mode = bool(setup_mode)
 
         self._lock = threading.Lock()
         self._frame_cond = threading.Condition(self._lock)
@@ -297,6 +302,7 @@ class CameraService:
                 "camera_type": self.camera_type,
                 "node_name": self.node_name,
                 "output_dir": self.output_dir,
+                "setup_mode": self.setup_mode,
                 "supports_focus": self.supports_focus,
                 "supports_params": self.supports_params and bool(self._param_schema),
                 "param_schema": list(self._param_schema),

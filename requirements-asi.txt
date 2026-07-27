@@ -1,0 +1,11 @@
+# Узел с камерой ASI (Princeton PIXIS через PICAM + колесо фильтров).
+# Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
+-r requirements.txt
+
+pyserial>=3.5,<4       # колесо фильтров SmartMotor на /dev/ttyUSB*
+astropy>=5.3,<6.2      # обязателен: запись FITS; 7.x требует numpy 2.x
+
+# Системные зависимости:
+#   PICAM SDK — libpicam.so (export PICAM_LIB=... или установка в /usr/local/lib)
+#   sudo usermod -aG dialout $USER   # и перелогиниться
+# Без SDK драйвер работает с asi.camera.backend = "sim" и filter_wheel.port = "sim".

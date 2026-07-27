@@ -1025,17 +1025,32 @@ class ServerConfigTab:
             self.sb_port.setValue(8765)
         _add_label_row(grid, row, "HTTP port:", self.sb_port); row += 1
 
+        self.sb_port_search = QSpinBox()
+        self.sb_port_search.setRange(0, 200)
+        try:
+            self.sb_port_search.setValue(int(s.get("port_search", 20)))
+        except (ValueError, TypeError):
+            self.sb_port_search.setValue(20)
+        self.sb_port_search.setToolTip(
+            "How many ports above the one above to try when it is already "
+            "taken.\nThis is what lets several cameras run from one identical "
+            "config.json:\nthe second gets 8766, the third 8767, and nothing is "
+            "written back to the file.\n0 = use the configured port or nothing.")
+        _add_label_row(grid, row, "If busy, try up to:", self.sb_port_search); row += 1
+
         self.le_bind = QLineEdit(s.get("bind", "0.0.0.0"))
         self.le_bind.setToolTip(
             "0.0.0.0 = reachable from the whole LAN.\n"
             "127.0.0.1 = this machine only.")
         _add_label_row(grid, row, "Bind address:", self.le_bind); row += 1
 
-        self.cb_discovery = QCheckBox("Answer UDP discovery broadcasts")
+        self.cb_discovery = QCheckBox("Answer UDP discovery probes")
         self.cb_discovery.setChecked(s.get("discovery", True))
         self.cb_discovery.setToolTip(
             "Lets the viewer find this camera automatically instead of "
-            "requiring its IP address.")
+            "requiring its IP address.\nProbes arrive both as multicast and as "
+            "broadcast; the multicast path is what\nmakes several instances on "
+            "one machine visible at the same time.")
         grid.addWidget(self.cb_discovery, row, 0, 1, 2); row += 1
 
         self.sb_disc_port = QSpinBox()
@@ -1067,6 +1082,7 @@ class ServerConfigTab:
             "enabled":        self.cb_enabled.isChecked(),
             "bind":           self.le_bind.text().strip() or "0.0.0.0",
             "port":           self.sb_port.value(),
+            "port_search":    self.sb_port_search.value(),
             "discovery":      self.cb_discovery.isChecked(),
             "discovery_port": self.sb_disc_port.value(),
             "focus_ttl":      self.sb_focus_ttl.value(),

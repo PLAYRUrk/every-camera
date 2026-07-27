@@ -1,0 +1,12 @@
+# Узел с камерой Infra (SW1300). Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
+-r requirements.txt
+
+# Необязателен: без него TIFF/PNG пишет Pillow (cameras/infra_driver.py, save_tiff/save_png).
+# headless-сборка не тянет за собой GUI-библиотеки Qt, которых на узле нет.
+opencv-python-headless>=4.6,<4.11
+
+astropy>=5.3,<6.2      # запись FITS; 7.x требует numpy 2.x
+
+# Системные зависимости:
+#   sudo yum install libusbx
+#   драйвер libTanhoAPI.so из комплекта камеры (каталог infra_lib/)

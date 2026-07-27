@@ -1,0 +1,8 @@
+# Машина наблюдателя: viewer_app.py и focus_app.py. Драйверы камер не нужны —
+# ни одна из этих программ их не импортирует. Работает на Windows и Linux.
+-r requirements.txt
+-r requirements-gui.txt
+
+# astropy необязателен: без него FITS читает встроенный минимальный парсер
+# (frame_archive.read_fits_minimal). Раскомментируйте, если нужен полный:
+# astropy>=5.3,<6.2

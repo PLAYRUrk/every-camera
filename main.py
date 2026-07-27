@@ -52,6 +52,10 @@ Camera types:
 In console mode (--type), the program runs headless.
 With a display available and no --type flag, GUI mode starts automatically.
 Monitor is a separate program: python monitor_app.py
+
+A camera whose schedule file is missing or empty starts in setup mode: it comes
+up, serves live frames to focus_app.py, and archives nothing. --setup asks for
+that mode explicitly, even when a schedule is configured.
         """,
     )
     parser.add_argument("--type",
@@ -64,6 +68,10 @@ Monitor is a separate program: python monitor_app.py
     parser.add_argument("--preview", action="store_true",
                         help="Preview mode: continuously update preview_{cam}.png/fits "
                              "at max FPS (console mode only)")
+    parser.add_argument("--setup", action="store_true",
+                        help="Setup mode: bring the camera up for focusing only "
+                             "— no scheduled captures, nothing archived. Entered "
+                             "automatically when no schedule is configured")
     parser.add_argument("--verbose", action="store_true",
                         help="Console mode: plain timestamped log lines instead of "
                              "the live dashboard (also the default when the output "
@@ -77,23 +85,28 @@ Monitor is a separate program: python monitor_app.py
         if args.type == "cannon":
             from cameras.cannon_driver import run_console_cannon
             run_console_cannon(args.config, preview=args.preview,
-                               verbose=args.verbose)
+                               verbose=args.verbose,
+                               setup_mode=args.setup)
         elif args.type == "sptt":
             from cameras.sptt_driver import run_console_sptt
             run_console_sptt(args.config, preview=args.preview,
-                             verbose=args.verbose)
+                             verbose=args.verbose,
+                             setup_mode=args.setup)
         elif args.type == "infra":
             from cameras.infra_driver import run_console_infra
             run_console_infra(args.config, preview=args.preview,
-                              verbose=args.verbose)
+                              verbose=args.verbose,
+                              setup_mode=args.setup)
         elif args.type == "sentry":
             from cameras.sentry_driver import run_console_sentry
             run_console_sentry(args.config, preview=args.preview,
-                               verbose=args.verbose)
+                               verbose=args.verbose,
+                               setup_mode=args.setup)
         elif args.type == "asi":
             from cameras.asi_driver import run_console_asi
             run_console_asi(args.config, preview=args.preview,
-                            verbose=args.verbose)
+                            verbose=args.verbose,
+                            setup_mode=args.setup)
     elif args.gui or (can_use_gui() and not args.type):
         # GUI mode
         from gui_app import run_gui

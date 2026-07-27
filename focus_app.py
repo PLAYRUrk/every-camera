@@ -34,8 +34,9 @@ from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
-    QPushButton, QLabel, QLineEdit, QComboBox, QDoubleSpinBox,
+    QPushButton, QLabel, QLineEdit, QComboBox, QDoubleSpinBox, QCheckBox,
     QSpinBox, QGroupBox, QMessageBox, QSizePolicy, QStatusBar, QFileDialog,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont
@@ -49,6 +50,9 @@ DEFAULT_HTTP_PORT = 8765
 HEARTBEAT_MS = 20_000        # keep the focus session alive
 FOCUS_TTL_SECONDS = 60       # camera stops free-running this long after the last ping
 SHARPNESS_HISTORY = 120
+ROI_MIN = 32                 # below this the sharpness metric has nothing to chew on
+ROI_STEP = 8                 # keep typed and wheeled sizes on a tidy grid
+ROI_WHEEL_STEP = 1.25        # one wheel notch, as a factor on the side length
 STRETCH_MODES = [
     ("minmax", "Auto (min–max)"),
     ("percentile", "Auto (0.5–99.5 %)"),
@@ -59,10 +63,32 @@ STRETCH_MODES = [
 # ---------------------------------------------------------------------------
 # Live view with an optional measurement region
 # ---------------------------------------------------------------------------
+def crop_box(shape, size, center=None):
+    """``(x0, y0, side)`` of a square kept wholly inside a frame of ``shape``.
+
+    ``center`` is ``(fx, fy)`` as a *fraction* of the frame, so aiming survives a
+    change of stream resolution unchanged; None means the middle. A square asked
+    for near an edge is pushed back inside rather than clipped, so it keeps the
+    requested size.
+    """
+    h, w = shape
+    side = max(1, min(int(size), h, w))
+    fx, fy = (0.5, 0.5) if center is None else center
+    x0 = int(round(fx * w - side / 2))
+    y0 = int(round(fy * h - side / 2))
+    return max(0, min(x0, w - side)), max(0, min(y0, h - side)), side
+
+
 class LiveView(QLabel):
-    """Shows the stream and lets the user drag a region to measure sharpness in."""
+    """Shows the stream with a movable, resizable square to measure sharpness in.
+
+    The square is stored as a centre *fraction* plus a side in frame pixels: the
+    fraction keeps the aim on the same patch of sky when the stream resolution
+    changes, while the side stays a number the operator typed and can recognise.
+    """
 
     region_changed = pyqtSignal(object)   # (x0, y0, x1, y1) in image coords, or None
+    roi_changed = pyqtSignal(object)      # ((fx, fy), side_px) after a drag or wheel
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,10 +97,15 @@ class LiveView(QLabel):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(320, 240)
         self.setText("Not connected")
+        self.setCursor(Qt.CrossCursor)
         self._pixmap = None
-        self._drag_from = None
-        self._drag_to = None
-        self.region = None        # normalised (x0, y0, x1, y1), 0..1
+        self.roi_center = (0.5, 0.5)
+        self.roi_side = 0          # frame pixels; 0 means "measure the whole frame"
+        self.zoom_to_roi = False
+        # What the widget currently shows: (ox, oy, target_w, target_h,
+        # x0, y0, w, h), the last four in frame pixels. This is what turns a
+        # click into a position in the frame, zoomed or not.
+        self._view = None
 
     def set_frame(self, pixmap):
         self._pixmap = pixmap
@@ -82,25 +113,74 @@ class LiveView(QLabel):
 
     def clear_frame(self, message):
         self._pixmap = None
+        self._view = None
         self.setText(message)
         self.update()
 
-    def clear_region(self):
-        self.region = None
-        self._drag_from = self._drag_to = None
-        self.region_changed.emit(None)
+    # -- square ---------------------------------------------------------
+    def frame_pixmap(self):
+        """The newest frame, for anything else that wants to draw it."""
+        return self._pixmap
+
+    def frame_shape(self):
+        """(h, w) of the frame currently displayed, or None."""
+        if self._pixmap is None or not self._pixmap.width():
+            return None
+        return (self._pixmap.height(), self._pixmap.width())
+
+    def roi_box(self):
+        """The square in frame pixels as ``(x0, y0, side)``, or None if unset."""
+        shape = self.frame_shape()
+        if shape is None or self.roi_side <= 0:
+            return None
+        return crop_box(shape, self.roi_side, self.roi_center)
+
+    @property
+    def region(self):
+        """The square as a normalised box, the form :meth:`_update_metrics` wants."""
+        box = self.roi_box()
+        if box is None:
+            return None
+        h, w = self.frame_shape()
+        x0, y0, side = box
+        return (x0 / w, y0 / h, (x0 + side) / w, (y0 + side) / h)
+
+    def set_roi_side(self, side, notify=True):
+        side = max(0, int(side))
+        if side and side < ROI_MIN:
+            side = ROI_MIN
+        if side == self.roi_side:
+            return
+        self.roi_side = side
+        self.update()
+        if notify:
+            self.region_changed.emit(self.region)
+
+    def set_roi_center(self, fx, fy, notify=True):
+        center = (min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0))
+        if center == self.roi_center:
+            return
+        self.roi_center = center
+        self.update()
+        if notify:
+            self.region_changed.emit(self.region)
+
+    def set_zoom(self, enabled):
+        self.zoom_to_roi = bool(enabled)
         self.update()
 
+    def clear_region(self):
+        """Go back to measuring the whole frame."""
+        self.set_roi_side(0)
+        self.roi_changed.emit((self.roi_center, 0))
+
     # -- painting ------------------------------------------------------
-    def _target_rect(self):
-        """Where the frame is drawn inside this widget (letterboxed)."""
-        if self._pixmap is None:
-            return None
-        pw, ph = self._pixmap.width(), self._pixmap.height()
+    def _target_rect(self, pw, ph):
+        """Where an image of ``pw`` x ``ph`` lands inside this widget (letterboxed)."""
         if not pw or not ph:
             return None
         scale = min(self.width() / pw, self.height() / ph)
-        w, h = int(pw * scale), int(ph * scale)
+        w, h = max(1, int(pw * scale)), max(1, int(ph * scale))
         return ((self.width() - w) // 2, (self.height() - h) // 2, w, h)
 
     def paintEvent(self, event):
@@ -109,54 +189,122 @@ class LiveView(QLabel):
             return
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#0b0b0b"))
-        rect = self._target_rect()
+
+        full_h, full_w = self.frame_shape()
+        box = self.roi_box()
+        zoomed = self.zoom_to_roi and box is not None
+
+        source = self._pixmap
+        if zoomed:
+            x0, y0, side = box
+            source = self._pixmap.copy(x0, y0, side, side)
+
+        rect = self._target_rect(source.width(), source.height())
+        if rect is None:
+            painter.end()
+            return
         x, y, w, h = rect
-        painter.drawPixmap(x, y, self._pixmap.scaled(
+        painter.drawPixmap(x, y, source.scaled(
             w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        region = self._current_region()
-        if region:
-            rx0, ry0, rx1, ry1 = region
-            painter.setPen(QPen(QColor("#3fd07a"), 2, Qt.DashLine))
-            painter.drawRect(int(x + rx0 * w), int(y + ry0 * h),
-                             int((rx1 - rx0) * w), int((ry1 - ry0) * h))
+        if zoomed:
+            x0, y0, side = box
+            self._view = (x, y, w, h, x0, y0, side, side)
+        else:
+            self._view = (x, y, w, h, 0, 0, full_w, full_h)
+            if box is not None:
+                x0, y0, side = box
+                painter.setPen(QPen(QColor("#ffd24a"), 2))
+                painter.drawRect(int(x + x0 / full_w * w),
+                                 int(y + y0 / full_h * h),
+                                 int(side / full_w * w),
+                                 int(side / full_h * h))
         painter.end()
 
-    def _current_region(self):
-        if self._drag_from and self._drag_to:
-            return self._normalised(self._drag_from, self._drag_to)
-        return self.region
+    # -- aiming ---------------------------------------------------------
+    def _aim_at(self, pos):
+        """Point the square at a widget position (works while dragging, too)."""
+        if self._view is None or self._pixmap is None:
+            return
+        ox, oy, target_w, target_h, x0, y0, w, h = self._view
+        full_h, full_w = self.frame_shape()
+        x = x0 + (pos.x() - ox) / max(target_w, 1) * w
+        y = y0 + (pos.y() - oy) / max(target_h, 1) * h
+        self.set_roi_center(x / full_w, y / full_h)
+        self.roi_changed.emit((self.roi_center, self.roi_side))
 
-    def _normalised(self, p0, p1):
-        rect = self._target_rect()
-        if not rect:
-            return None
-        x, y, w, h = rect
-        xs = sorted((max(0.0, min(1.0, (p.x() - x) / w)) for p in (p0, p1)))
-        ys = sorted((max(0.0, min(1.0, (p.y() - y) / h)) for p in (p0, p1)))
-        if xs[1] - xs[0] < 0.02 or ys[1] - ys[0] < 0.02:
-            return None
-        return (xs[0], ys[0], xs[1], ys[1])
-
-    # -- region selection ----------------------------------------------
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self._pixmap is not None:
-            self._drag_from = event.pos()
-            self._drag_to = event.pos()
+        if event.button() == Qt.LeftButton:
+            self._aim_at(event.pos())
 
     def mouseMoveEvent(self, event):
-        if self._drag_from is not None:
-            self._drag_to = event.pos()
-            self.update()
+        if event.buttons() & Qt.LeftButton:
+            self._aim_at(event.pos())
 
-    def mouseReleaseEvent(self, event):
-        if self._drag_from is None:
+    def wheelEvent(self, event):
+        """Ctrl+wheel resizes the square; a plain wheel must not disturb the aim."""
+        if not (event.modifiers() & Qt.ControlModifier) or self._pixmap is None:
+            super().wheelEvent(event)
             return
-        region = self._normalised(self._drag_from, event.pos())
-        self._drag_from = self._drag_to = None
-        self.region = region
-        self.region_changed.emit(region)
+        notches = event.angleDelta().y() / 120.0
+        if not notches:
+            return
+        side = self.roi_side
+        if side <= 0:                       # from the full frame, start at its short side
+            side = min(self.frame_shape())
+        side = int(round(side * (ROI_WHEEL_STEP ** notches) / ROI_STEP)) * ROI_STEP
+        self.set_roi_side(max(ROI_MIN, side))
+        self.roi_changed.emit((self.roi_center, self.roi_side))
+        event.accept()
+
+
+class RoiPreview(QLabel):
+    """Shows just what the measurement square covers, beside the whole frame.
+
+    Judging focus needs the pixels big; keeping an eye on framing needs the
+    whole frame. Showing both at once means neither has to be given up, and the
+    square can be dragged around the full view while its contents stay readable.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background:#0b0b0b; color:#777;")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(180, 180)
+        self.setText("square preview")
+        self._pixmap = None
+        self._box = None
+        self.smooth = False
+
+    def set_source(self, pixmap, box):
+        """``box`` is ``(x0, y0, side)`` in frame pixels, or None for no square."""
+        self._pixmap = pixmap
+        self._box = box
         self.update()
+
+    def set_smooth(self, enabled):
+        self.smooth = bool(enabled)
+        self.update()
+
+    def paintEvent(self, event):
+        if self._pixmap is None or self._box is None:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0b0b0b"))
+        x0, y0, side = self._box
+        crop = self._pixmap.copy(x0, y0, side, side)
+        # Nearest-neighbour by default: smoothing a magnified crop invents edges
+        # that are exactly what the operator is trying to judge.
+        mode = Qt.SmoothTransformation if self.smooth else Qt.FastTransformation
+        scaled = crop.scaled(self.width(), self.height(),
+                             Qt.KeepAspectRatio, mode)
+        painter.drawPixmap((self.width() - scaled.width()) // 2,
+                           (self.height() - scaled.height()) // 2, scaled)
+        painter.setPen(QPen(QColor("#ffd24a"), 1))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +522,7 @@ class FocusWindow(QMainWindow):
         self._info = {}
         self._last_jpeg = None
         self._frames = 0
+        self._frame_shape = None
 
         self._build_ui()
 
@@ -423,9 +572,28 @@ class FocusWindow(QMainWindow):
         left = QWidget()
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
+        # Whole frame on the left, the square's contents on the right, so the
+        # operator can aim and judge sharpness without switching between them.
+        views = QSplitter(Qt.Horizontal)
         self.view = LiveView()
         self.view.region_changed.connect(self._on_region_changed)
-        left_lay.addWidget(self.view, 1)
+        self.view.roi_changed.connect(self._on_roi_changed)
+        views.addWidget(self.view)
+
+        preview_panel = QWidget()
+        preview_lay = QVBoxLayout(preview_panel)
+        preview_lay.setContentsMargins(0, 0, 0, 0)
+        preview_lay.setSpacing(2)
+        self.lbl_preview = QLabel("Square — whole frame")
+        self.lbl_preview.setStyleSheet("color:#888; font-size:11px;")
+        preview_lay.addWidget(self.lbl_preview)
+        self.roi_preview = RoiPreview()
+        preview_lay.addWidget(self.roi_preview, 1)
+        views.addWidget(preview_panel)
+        views.setStretchFactor(0, 3)
+        views.setStretchFactor(1, 2)
+        views.setSizes([520, 300])
+        left_lay.addWidget(views, 1)
 
         metrics = QGroupBox("Sharpness (turn the focuser until this peaks)")
         m_lay = QVBoxLayout(metrics)
@@ -446,8 +614,7 @@ class FocusWindow(QMainWindow):
         btn_reset.clicked.connect(self._reset_metrics)
         row.addWidget(btn_reset)
         btn_region = QPushButton("Whole frame")
-        btn_region.setToolTip("Measure the whole frame again "
-                              "(drag on the image to pick a region)")
+        btn_region.setToolTip("Measure the whole frame again")
         btn_region.clicked.connect(self.view.clear_region)
         row.addWidget(btn_region)
         m_lay.addLayout(row)
@@ -455,9 +622,16 @@ class FocusWindow(QMainWindow):
         splitter.addWidget(left)
 
         # ---- right: controls
+        # In a scroll area because the number of camera parameters is decided by
+        # the camera, not by us: an ASI with five fields on a short screen used
+        # to squash the form until the labels overlapped.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         right = QWidget()
         right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setContentsMargins(0, 0, 6, 0)
 
         info_box = QGroupBox("Connection")
         info_lay = QVBoxLayout(info_box)
@@ -496,6 +670,52 @@ class FocusWindow(QMainWindow):
         view_grid.addWidget(self.cmb_size, 2, 1)
         right_lay.addWidget(view_box)
 
+        # ---- the measured square
+        roi_box = QGroupBox("Measurement square")
+        roi_grid = QGridLayout(roi_box)
+        roi_grid.addWidget(QLabel("Side:"), 0, 0)
+        self.sb_roi = QSpinBox()
+        self.sb_roi.setRange(0, 8192)
+        self.sb_roi.setSingleStep(ROI_STEP)
+        self.sb_roi.setSuffix(" px")
+        self.sb_roi.setSpecialValueText("whole frame")
+        self.sb_roi.setToolTip("Any size, in pixels of the streamed frame. "
+                               "0 measures everything.")
+        self.sb_roi.valueChanged.connect(self._on_roi_side_typed)
+        roi_grid.addWidget(self.sb_roi, 0, 1, 1, 2)
+
+        roi_grid.addWidget(QLabel("Centre:"), 1, 0)
+        self.sb_roi_x = QSpinBox()
+        self.sb_roi_y = QSpinBox()
+        for box in (self.sb_roi_x, self.sb_roi_y):
+            box.setRange(0, 8192)
+            box.setSuffix(" px")
+            box.valueChanged.connect(self._on_roi_center_typed)
+        roi_grid.addWidget(self.sb_roi_x, 1, 1)
+        roi_grid.addWidget(self.sb_roi_y, 1, 2)
+
+        btn_centre = QPushButton("Centre")
+        btn_centre.setToolTip("Put the square back in the middle of the frame")
+        btn_centre.clicked.connect(self._centre_roi)
+        roi_grid.addWidget(btn_centre, 2, 1)
+        self.chk_zoom = QCheckBox("Zoom main view too")
+        self.chk_zoom.setToolTip("Also replace the whole-frame view with the "
+                                 "square, when the framing no longer matters")
+        self.chk_zoom.toggled.connect(self.view.set_zoom)
+        roi_grid.addWidget(self.chk_zoom, 2, 2)
+
+        self.chk_smooth = QCheckBox("Smooth the square preview")
+        self.chk_smooth.setToolTip("Off by default: smoothing a magnified crop "
+                                   "invents the very edges you are judging")
+        self.chk_smooth.toggled.connect(self.roi_preview.set_smooth)
+        roi_grid.addWidget(self.chk_smooth, 3, 0, 1, 3)
+
+        hint = QLabel("Click or drag the image to aim · Ctrl+wheel resizes")
+        hint.setStyleSheet("color:#888; font-size:11px;")
+        hint.setWordWrap(True)
+        roi_grid.addWidget(hint, 4, 0, 1, 3)
+        right_lay.addWidget(roi_box)
+
         self.params = ParamForm()
         self.params.apply_requested.connect(self._on_apply_params)
         right_lay.addWidget(self.params)
@@ -505,10 +725,12 @@ class FocusWindow(QMainWindow):
         self.btn_save.clicked.connect(self._on_save)
         right_lay.addWidget(self.btn_save)
         right_lay.addStretch()
-        splitter.addWidget(right)
+        right_scroll.setWidget(right)
+        right_scroll.setMinimumWidth(360)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([820, 340])
+        splitter.setSizes([820, 380])
 
         self.setStatusBar(QStatusBar())
         self._status("Ready — search the LAN or type a camera address")
@@ -575,9 +797,16 @@ class FocusWindow(QMainWindow):
 
     def _on_info(self, info):
         self._info = info
+        # A camera with no schedule is up purely to be focused. Saying so here
+        # saves the operator wondering why nothing is being archived.
+        setup = ('&nbsp;<span style="color:#c87000"><b>SETUP</b></span>'
+                 if info.get("setup_mode") else "")
         self.lbl_camera.setText(
             f"<b>{info.get('instance_name', '?')}</b> "
-            f"({info.get('camera_type', '?')})<br>{node_name_of(info)}")
+            f"({info.get('camera_type', '?')}){setup}<br>{node_name_of(info)}")
+        if info.get("setup_mode"):
+            self._status(f"{info.get('instance_name')} is in setup mode: no "
+                         f"schedule, nothing is being archived — focus freely.")
         if not info.get("supports_focus", True):
             self._status(
                 f"{info.get('instance_name')} streams whatever its daemon "
@@ -630,6 +859,7 @@ class FocusWindow(QMainWindow):
         # so a stop that arrives before it notices our disconnect gets undone.
         self._request_focus_off()
         QTimer.singleShot(2500, self._request_focus_off)
+        self.roi_preview.set_source(None, None)
         self.view.clear_frame("Stopped")
         self.lbl_stream.setText("stream: idle")
         self.btn_start.setEnabled(True)
@@ -656,13 +886,85 @@ class FocusWindow(QMainWindow):
         self._last_jpeg = jpeg
         self._frames += 1
         self.view.set_frame(QPixmap.fromImage(image))
+        # The stream resolution changes with the "Max size" setting; the square's
+        # centre is a fraction and rides it out, but the pixel boxes must follow.
+        shape = self.view.frame_shape()
+        if shape != self._frame_shape:
+            self._frame_shape = shape
+            self._sync_roi_widgets()
+        self._refresh_roi_preview()
         self.btn_save.setEnabled(True)
 
-    # -- metrics -------------------------------------------------------
+    # -- the measured square -------------------------------------------
     def _on_region_changed(self, region):
-        self.plot.reset()
-        self._status("Measuring the selected region" if region
-                     else "Measuring the whole frame")
+        # A different patch of sky, or a different amount of it, means a
+        # different sharpness scale — the old trace would be misleading, and so
+        # would the big "% of best" readout that was measured against it.
+        self._reset_metrics()
+        box = self.view.roi_box()
+        if box is None:
+            self._status("Measuring the whole frame")
+        else:
+            x0, y0, side = box
+            self._status(f"Measuring {side}×{side} px at "
+                         f"({x0 + side // 2}, {y0 + side // 2})")
+
+    def _on_roi_changed(self, roi):
+        """The view moved or resized the square itself — mirror it in the boxes."""
+        self._sync_roi_widgets()
+        self._refresh_roi_preview()
+
+    def _refresh_roi_preview(self):
+        """Repaint the side panel now, so it tracks the square while dragging."""
+        box = self.view.roi_box()
+        self.roi_preview.set_source(self.view.frame_pixmap(), box)
+        if box is None:
+            self.lbl_preview.setText("Square — whole frame (set a side to zoom)")
+        else:
+            x0, y0, side = box
+            self.lbl_preview.setText(
+                f"Square — {side}×{side} px at ({x0 + side // 2}, {y0 + side // 2})")
+
+    def _sync_roi_widgets(self):
+        """Show the square's size and centre in pixels of the current frame.
+
+        Signals are blocked so that reflecting the view's state does not look
+        like the operator typing, which would loop straight back into the view.
+        """
+        shape = self.view.frame_shape()
+        fx, fy = self.view.roi_center
+        limits = (None, None, None) if shape is None else (
+            min(shape), shape[1], shape[0])
+        for widget, limit, value in (
+                (self.sb_roi, limits[0], self.view.roi_side),
+                (self.sb_roi_x, limits[1], fx * (limits[1] or 0)),
+                (self.sb_roi_y, limits[2], fy * (limits[2] or 0))):
+            widget.blockSignals(True)
+            if limit:
+                widget.setMaximum(limit)
+            widget.setValue(int(round(value)))
+            widget.blockSignals(False)
+
+    def _on_roi_side_typed(self, value):
+        self.view.set_roi_side(value)
+        self._sync_roi_widgets()
+        self._refresh_roi_preview()
+
+    def _on_roi_center_typed(self, _value):
+        shape = self.view.frame_shape()
+        if shape is None:
+            return
+        full_h, full_w = shape
+        self.view.set_roi_center(self.sb_roi_x.value() / full_w,
+                                 self.sb_roi_y.value() / full_h)
+        self._refresh_roi_preview()
+
+    def _centre_roi(self):
+        self.view.set_roi_center(0.5, 0.5)
+        self._sync_roi_widgets()
+        self._refresh_roi_preview()
+
+    # -- metrics -------------------------------------------------------
 
     def _reset_metrics(self):
         self.plot.reset()

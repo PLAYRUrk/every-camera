@@ -31,6 +31,23 @@ from utils import (
 # envelope and base64 expansion.
 MQTT_MAX_PAYLOAD_BYTES = 240_000
 
+# Status name published while a camera is up for focusing only.
+SETUP_STATUS = "setup"
+
+
+def announce_setup_mode(reason=None):
+    """Explain why the camera is running without a schedule.
+
+    A missing or empty schedule used to abort the program, which made a newly
+    installed camera impossible to focus: focus_app.py needs the driver running
+    to get live frames from it. Now it is an ordinary state, and this is the one
+    place that words it.
+    """
+    console_ui.warn(f"Setup mode: {reason or 'requested with --setup'}.")
+    console_ui.log("No scheduled captures will be taken. Connect focus_app.py "
+                   "to adjust focus and camera parameters; add a schedule and "
+                   "restart to begin measuring.")
+
 
 class WorkerMqtt:
     """Status and frame publishing for one camera worker.

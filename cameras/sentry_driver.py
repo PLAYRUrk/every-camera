@@ -41,8 +41,11 @@ from pathlib import Path
 
 import frame_archive
 
-from utils import get_instance_name, get_system_info, APP_DIR
-from worker_common import WorkerMqtt
+from utils import (
+    claim_instance_name, get_instance_name, get_local_ip,
+    get_system_info, APP_DIR,
+)
+from worker_common import WorkerMqtt, announce_setup_mode, SETUP_STATUS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -312,13 +315,14 @@ class SentryWorkerConsole(threading.Thread):
     def __init__(self, cam: SentryCamera, output_dir: str, instance_name: str,
                  status_dir: str, capture_seconds: list,
                  mqtt_publisher=None, mqtt_prefix: str = "every_camera",
-                 service=None, node_name: str = ""):
+                 service=None, node_name: str = "", setup_mode: bool = False):
         super().__init__(daemon=True)
         self.cam = cam
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
+        self.setup_mode = bool(setup_mode)
         self._service = service
         self._bus = WorkerMqtt("sentry", instance_name, status_dir,
                                mqtt_publisher, mqtt_prefix, service=service,
@@ -384,8 +388,13 @@ class SentryWorkerConsole(threading.Thread):
             except Exception as exc:
                 console_ui.error(f"Could not start imagerd_rt: {exc}")
 
-        console_ui.log("Sentry measurement worker started")
-        self._save_status("running", force=True)
+        if self.setup_mode:
+            console_ui.log("Sentry ready for focusing (setup mode) — imagerd_rt "
+                           "has no schedule to follow")
+            self._save_status(SETUP_STATUS, force=True)
+        else:
+            console_ui.log("Sentry measurement worker started")
+            self._save_status("running", force=True)
 
         last_fired = (-1, -1)
 
@@ -409,8 +418,10 @@ class SentryWorkerConsole(threading.Thread):
                     self._send_latest_frame(on_demand=False)
                     self._shots += 1
                     self._last_shot = now
-                self._save_status("running" if self.cam.is_running() else "waiting",
-                                  force=True)
+                self._save_status(
+                    SETUP_STATUS if self.setup_mode else
+                    ("running" if self.cam.is_running() else "waiting"),
+                    force=True)
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
                 self._handle_focus(now)
@@ -493,6 +504,7 @@ class SentryWorkerConsole(threading.Thread):
             "seqno": seqno,
             "capture_seconds": self.capture_seconds,
             "daemon_running": self.cam.is_running(),
+            "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
         }
         # Embed key metadata fields as top-level for monitor display
@@ -563,7 +575,8 @@ def run_preview_sentry(cam: SentryCamera, instance_name: str):
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_sentry(config_path=None, preview=False, verbose=False):
+def run_console_sentry(config_path=None, preview=False, verbose=False,
+                       setup_mode=False):
     """Run Sentry (imagerd_rt) camera in console mode."""
     from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
@@ -572,8 +585,10 @@ def run_console_sentry(config_path=None, preview=False, verbose=False):
     sentry_cfg = cfg.get("sentry", {})
     mqtt_cfg = cfg.get("mqtt", {})
 
-    instance_name = sentry_cfg.get("instance_name") or get_instance_name("Sentry")
     node_name = get_node_name(cfg)
+    claim = claim_instance_name(sentry_cfg.get("instance_name")
+                                or get_instance_name("Sentry", cfg))
+    instance_name = claim.name
     imagerd_rt_dir = sentry_cfg.get("imagerd_rt_dir", "/usr/local/imagerd_rt")
     output_dir = sentry_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
@@ -600,12 +615,19 @@ def run_console_sentry(config_path=None, preview=False, verbose=False):
             run_preview_sentry(cam, instance_name)
             return
 
-        # Write schedule.conf from config if slots are defined
+        # Write schedule.conf from config if slots are defined. Without slots
+        # and without a schedule.conf left by an earlier run, imagerd_rt has no
+        # programme to follow — that is setup mode, not a failure.
         if sentry_cfg.get("slots"):
             try:
                 cam.write_schedule_conf(sentry_cfg)
             except Exception as exc:
                 console_ui.warn(f"Could not write schedule.conf: {exc}")
+        elif not os.path.exists(os.path.join(imagerd_rt_dir, "schedule.conf")):
+            setup_mode = True
+        if setup_mode:
+            announce_setup_mode("sentry.slots is empty and no schedule.conf "
+                                "exists in " + imagerd_rt_dir)
 
         if not output_dir:
             console_ui.log("sentry.output_dir not set. Status/MQTT still work; "
@@ -624,10 +646,14 @@ def run_console_sentry(config_path=None, preview=False, verbose=False):
         from camera_service import CameraService
         from frame_server import start_frame_server
         service = CameraService("sentry", instance_name, output_dir,
-                                supports_params=False, node_name=node_name)
+                                supports_params=False, node_name=node_name,
+                                setup_mode=setup_mode)
         server = start_frame_server(cfg.get("server", {}), service)
         if server:
             dash.update(server_url=server.url)
+            if setup_mode:
+                console_ui.log(f"Focus this camera with: python focus_app.py "
+                               f"--host {get_local_ip()} --port {server.port}")
 
         worker = SentryWorkerConsole(
             cam=cam,
@@ -639,6 +665,7 @@ def run_console_sentry(config_path=None, preview=False, verbose=False):
             mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=service,
             node_name=node_name,
+            setup_mode=setup_mode,
         )
 
         def _sigint(sig, frame):
@@ -659,3 +686,4 @@ def run_console_sentry(config_path=None, preview=False, verbose=False):
             except Exception:
                 pass
         dash.stop()
+        claim.release()

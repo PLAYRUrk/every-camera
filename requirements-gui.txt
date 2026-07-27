@@ -1,0 +1,17 @@
+# GUI на узле: gui_app.py, setup_app.py, monitor_app.py, schedule_generator.py.
+# Ставится дополнительно к файлу своей камеры. Для консольного режима не нужен.
+-r requirements.txt
+
+PyQt5>=5.15.6,<5.16
+# Нижняя граница не случайна: у PyQt5-Qt5 5.15.11–5.15.13 колёс под Linux нет
+# вообще (только macOS), и pip на CentOS 7 упрётся в сборку из исходников.
+# 5.15.14 и новее снова публикуют manylinux2014_x86_64 — это и есть glibc 2.17.
+PyQt5-Qt5>=5.15.14,<5.16
+PyQt5-sip>=12.11,<13
+
+# Если Qt всё же не загрузится с ошибкой вида "GLIBC_2.28 not found", значит
+# конкретная сборка Qt переросла свой тег. Тогда откатиться на заведомо рабочую:
+#     pip install "PyQt5-Qt5==5.15.2"
+#
+# Системные зависимости для Qt на CentOS 7:
+#   sudo yum install libxkbcommon-x11 libXcomposite libXcursor libXi libXtst mesa-libGL

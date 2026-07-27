@@ -42,8 +42,14 @@ from pathlib import Path
 
 import console_ui
 
-from utils import get_instance_name, get_node_name, get_system_info, APP_DIR
-from worker_common import WorkerMqtt, parse_command_params, run_focus_iteration
+from utils import (
+    claim_instance_name, get_instance_name, get_local_ip, get_node_name,
+    get_system_info, APP_DIR,
+)
+from worker_common import (
+    WorkerMqtt, parse_command_params, run_focus_iteration,
+    announce_setup_mode, SETUP_STATUS,
+)
 
 from cameras.asi import config as asi_config
 from cameras.asi import devices, schedule as asi_schedule
@@ -200,13 +206,14 @@ class AsiWorkerConsole(threading.Thread):
     def __init__(self, cam: AsiCamera, cfg: asi_config.AsiConfig, output_dir,
                  instance_name, status_dir, mqtt_publisher=None,
                  mqtt_prefix="every_camera", service=None, dashboard=None,
-                 node_name=""):
+                 node_name="", setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.cfg = cfg
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
+        self.setup_mode = bool(setup_mode)
         self._service = service
         self._dash = dashboard
         self._bus = WorkerMqtt("asi", instance_name, status_dir, mqtt_publisher,
@@ -294,6 +301,7 @@ class AsiWorkerConsole(threading.Thread):
             "gain": self.cam.current_gain,
             "filter": self.cam.current_filter,
             "next_slot": self._next_slot.isoformat() if self._next_slot else None,
+            "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
         }
         if cooling.get("ccd_temp") is not None:
@@ -382,7 +390,9 @@ class AsiWorkerConsole(threading.Thread):
             return
         exposure = self.cam.current_exposure or 0.0
         needed = exposure * FOCUS_SLACK_FACTOR + FOCUS_SLACK_SECONDS
-        if slack is not None and slack < needed:
+        # In setup mode there is no scheduled capture to be late for, so a long
+        # exposure must not be refused just because the idle tick is shorter.
+        if not self.setup_mode and slack is not None and slack < needed:
             return          # a live frame must never push a scheduled one late
         self._dash_update(focus=f"live frame ({exposure:g} s)")
         run_focus_iteration(
@@ -416,7 +426,8 @@ class AsiWorkerConsole(threading.Thread):
             if time.monotonic() - last_status >= 2.0:
                 last_status = time.monotonic()
                 cooling = self._refresh_camera_section()
-                self._save_status("running", cooling=cooling)
+                self._save_status(SETUP_STATUS if self.setup_mode else "running",
+                                  cooling=cooling)
             self._serve_params()
             if self._pending_capture_event.is_set():
                 self._handle_pending_capture()
@@ -594,6 +605,19 @@ class AsiWorkerConsole(threading.Thread):
     def _sun_angle_fn(self):
         from cameras.asi.sun import angle_fn
         return angle_fn(self.cfg.location)
+
+    def _run_setup_mode(self):
+        """Idle indefinitely, serving focus_app — no schedule, nothing archived.
+
+        There is no observing programme to follow, so the worker simply keeps
+        :meth:`_wait_until` running: that is already where focus frames,
+        parameter changes and status publication happen, and it is the whole
+        reason a camera without a schedule can now be focused at all.
+        """
+        self._dash_update(schedule="setup mode — no scheduled captures")
+        while not self._stop_event.is_set():
+            if not self._wait_seconds(5.0, phase="setup"):
+                return
 
     def _run_sun_mode(self):
         sched = self.cfg.schedule
@@ -832,12 +856,18 @@ class AsiWorkerConsole(threading.Thread):
             self._service.set_current_params(self._current_params())
         cooling = self._refresh_camera_section()
         self._save_status("starting", force=True, cooling=cooling)
-        console_ui.log(f"ASI worker started — mode '{self.cfg.schedule.mode}', "
-                       f"{len(self.cfg.schedule.entries)} schedule entr"
-                       f"{'y' if len(self.cfg.schedule.entries) == 1 else 'ies'}")
+        if self.setup_mode:
+            console_ui.log("ASI worker started in setup mode — no schedule, "
+                           "no darks, live frames on request")
+        else:
+            console_ui.log(f"ASI worker started — mode '{self.cfg.schedule.mode}', "
+                           f"{len(self.cfg.schedule.entries)} schedule entr"
+                           f"{'y' if len(self.cfg.schedule.entries) == 1 else 'ies'}")
 
         try:
-            if self._wait_for_start():
+            if self.setup_mode:
+                self._run_setup_mode()
+            elif self._wait_for_start():
                 if self.cfg.schedule.mode == "time":
                     self._run_time_mode()
                 else:
@@ -851,7 +881,9 @@ class AsiWorkerConsole(threading.Thread):
                 self.cam.set_shutter(False)
             except Exception:
                 pass
-            if not self._force_quit:
+            # Darks bracket a measurement run; in setup mode there was none, and
+            # the exposure combinations they are built from are empty anyway.
+            if not self._force_quit and not self.setup_mode:
                 self._set_phase("closing darks")
                 try:
                     self._capture_darks("final")
@@ -920,7 +952,8 @@ def _write_preview_fits(path, image):
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_asi(config_path=None, preview=False, verbose=False):
+def run_console_asi(config_path=None, preview=False, verbose=False,
+                    setup_mode=False):
     """Run the ASI camera in console mode."""
     from utils import load_config, configure_console_asi
     from mqtt_client import create_console_publisher
@@ -931,7 +964,6 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
     asi_cfg = cfg.get("asi", {})
     mqtt_cfg = cfg.get("mqtt", {})
 
-    instance_name = asi_cfg.get("instance_name") or get_instance_name("ASI")
     node_name = get_node_name(cfg)
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
 
@@ -941,8 +973,11 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
         cfg = load_config(config_path)
         asi_cfg = cfg.get("asi", {})
         mqtt_cfg = cfg.get("mqtt", {})
-        instance_name = asi_cfg.get("instance_name") or instance_name
         node_name = get_node_name(cfg)
+
+    claim = claim_instance_name(asi_cfg.get("instance_name")
+                                or get_instance_name("ASI", cfg))
+    instance_name = claim.name
 
     conf = asi_config.from_dict(asi_cfg)
     dash = console_ui.start_dashboard(
@@ -967,10 +1002,12 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
         os.makedirs(conf.output_dir, exist_ok=True)
         os.makedirs(status_dir, exist_ok=True)
 
-        if not preview and not conf.schedule.entries:
-            console_ui.error("The ASI schedule is empty — add slots to asi.schedule "
-                             "in config.json or point asi.schedule_file at a file.")
-            return
+        if not preview and (setup_mode or not conf.schedule.entries):
+            setup_mode = True
+            announce_setup_mode(
+                "requested with --setup" if conf.schedule.entries else
+                "the ASI schedule is empty — add slots to asi.schedule in "
+                "config.json or point asi.schedule_file at a file")
 
         console_ui.log("Opening the camera (cooling may take a while)…")
         cam = AsiCamera(conf).open()
@@ -985,10 +1022,13 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
             dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
         service = CameraService("asi", instance_name, conf.output_dir,
-                                node_name=node_name)
+                                node_name=node_name, setup_mode=setup_mode)
         server = start_frame_server(cfg.get("server", {}), service)
         if server:
             dash.update(server_url=server.url, focus="idle")
+            if setup_mode:
+                console_ui.log(f"Focus this camera with: python focus_app.py "
+                               f"--host {get_local_ip()} --port {server.port}")
 
         worker = AsiWorkerConsole(
             cam=cam,
@@ -1001,6 +1041,7 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
             service=service,
             dashboard=dash,
             node_name=node_name,
+            setup_mode=setup_mode,
         )
 
         def _sigint(sig, frame):
@@ -1032,3 +1073,4 @@ def run_console_asi(config_path=None, preview=False, verbose=False):
         if cam:
             cam.close()
         dash.stop()
+        claim.release()

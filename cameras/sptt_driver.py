@@ -21,11 +21,12 @@ from pathlib import Path
 import frame_archive
 
 from utils import (
-    get_instance_name, get_system_info, APP_DIR,
+    claim_instance_name, get_instance_name, get_local_ip, get_system_info,
+    APP_DIR,
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, run_focus_iteration,
-    MQTT_MAX_PAYLOAD_BYTES,
+    MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode, SETUP_STATUS,
 )
 
 from .sptt_load_firmware import (
@@ -513,13 +514,15 @@ class SpttWorkerConsole(threading.Thread):
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
                  capture_seconds=None, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None, node_name=""):
+                 mqtt_prefix="every_camera", service=None, node_name="",
+                 setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
+        self.setup_mode = bool(setup_mode)
         self._service = service
         self._bus = WorkerMqtt("sptt", instance_name, status_dir,
                                mqtt_publisher, mqtt_prefix, service=service,
@@ -670,7 +673,7 @@ class SpttWorkerConsole(threading.Thread):
         """Grab one extra frame for the focus tool, away from capture seconds."""
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds:
+        if now.second in self.capture_seconds and not self.setup_mode:
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -691,8 +694,12 @@ class SpttWorkerConsole(threading.Thread):
         if self._service is not None:
             self._service.set_current_params(self._current_params())
 
-        console_ui.log("SPTT measurement started (captures at :00 and :30)")
-        self._save_status("running", force=True)
+        if self.setup_mode:
+            console_ui.log("SPTT ready for focusing (setup mode) — nothing is archived")
+            self._save_status(SETUP_STATUS, force=True)
+        else:
+            console_ui.log("SPTT measurement started (captures at :00 and :30)")
+            self._save_status("running", force=True)
 
         # Start continuous capture
         try:
@@ -711,6 +718,12 @@ class SpttWorkerConsole(threading.Thread):
             now = dt.now()
 
             fire_key = (now.minute, now.second)
+            if self.setup_mode:
+                # No schedule to honour: focus gets every tick, nothing is saved.
+                self._handle_focus(now)
+                self._save_status(SETUP_STATUS)
+                self._stop_event.wait(0.1)
+                continue
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 ok = self._capture_one(now)
@@ -786,6 +799,7 @@ class SpttWorkerConsole(threading.Thread):
             "shots_taken": self._shots,
             "last_shot": self._last_shot.isoformat() if self._last_shot else None,
             "errors": self._errors,
+            "setup_mode": self.setup_mode,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
             "exposure_s": self.cam.exposure,
             "gain": self.cam.gain,
@@ -860,7 +874,8 @@ def run_preview_sptt(cam, instance_name):
         cam.stop()
 
 
-def run_console_sptt(config_path=None, preview=False, verbose=False):
+def run_console_sptt(config_path=None, preview=False, verbose=False,
+                     setup_mode=False):
     """Run SPTT camera measurement in console mode."""
     from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
@@ -869,8 +884,10 @@ def run_console_sptt(config_path=None, preview=False, verbose=False):
     sptt_cfg = cfg.get("sptt", {})
     mqtt_cfg = cfg.get("mqtt", {})
 
-    instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
     node_name = get_node_name(cfg)
+    claim = claim_instance_name(sptt_cfg.get("instance_name")
+                                or get_instance_name("SPTT", cfg))
+    instance_name = claim.name
     output_dir = sptt_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     exposure = sptt_cfg.get("exposure", 0.88)
@@ -894,15 +911,16 @@ def run_console_sptt(config_path=None, preview=False, verbose=False):
         _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
                           instance_name, node_name, output_dir, status_dir,
                           exposure, gain, binning, encoding, target_temp,
-                          capture_seconds)
+                          capture_seconds, setup_mode)
     finally:
         dash.stop()
+        claim.release()
 
 
 def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
                       instance_name, node_name, output_dir, status_dir,
                       exposure, gain, binning, encoding, target_temp,
-                      capture_seconds):
+                      capture_seconds, setup_mode=False):
     """Body of :func:`run_console_sptt`, with the dashboard already running."""
     from mqtt_client import create_console_publisher
 
@@ -935,7 +953,6 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         with dash.suspended():          # the wizard needs a plain terminal
             configure_console_sptt(cfg, config_path)
         sptt_cfg = cfg.get("sptt", {})
-        instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
         output_dir = sptt_cfg.get("output_dir", "")
         exposure = sptt_cfg.get("exposure", 0.88)
         gain = sptt_cfg.get("gain", 100)
@@ -949,6 +966,10 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
     if not output_dir:
         console_ui.error("output_dir is required.")
         sys.exit(1)
+
+    if setup_mode:
+        announce_setup_mode(None)
+        dash.update(schedule="setup mode — no scheduled captures")
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
@@ -982,10 +1003,13 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
     from camera_service import CameraService
     from frame_server import start_frame_server
     service = CameraService("sptt", instance_name, output_dir,
-                            node_name=node_name)
+                            node_name=node_name, setup_mode=setup_mode)
     server = start_frame_server(cfg.get("server", {}), service)
     if server:
         dash.update(server_url=server.url)
+        if setup_mode:
+            console_ui.log(f"Focus this camera with: python focus_app.py "
+                           f"--host {get_local_ip()} --port {server.port}")
 
     worker = SpttWorkerConsole(
         cam=cam,

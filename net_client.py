@@ -5,6 +5,7 @@ Uses only the standard library for networking, so the observer's machine needs
 nothing beyond PyQt5 — no camera SDKs, no ``requests``.
 """
 import json
+import os
 import socket
 import threading
 
@@ -322,13 +323,20 @@ def load_settings():
 
 
 def save_settings(data):
+    """Merge ``data`` into the settings file and replace it atomically.
+
+    viewer_app and focus_app share one file, so a blind overwrite let whichever
+    quit last erase the other's recent hosts. Re-reading first keeps keys this
+    program does not know about.
+    """
     path = settings_path()
+    merged = load_settings()
+    merged.update(data or {})
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = str(path) + ".tmp"
+        tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=2)
-        import os
+            json.dump(merged, fh, indent=2)
         os.replace(tmp, str(path))
     except OSError:
         pass

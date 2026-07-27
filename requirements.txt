@@ -1,43 +1,33 @@
-# Common
-numpy>=1.20
-paho-mqtt>=1.6
+# every-camera — общее ядро. Нужно на любом узле.
+#
+# Целевая платформа: CentOS 7.8 (glibc 2.17) + Python 3.11.7, прямой доступ к PyPI.
+#
+# Верхние границы здесь не косметика. За ними начинаются колёса, собранные под
+# glibc >= 2.28 (на CentOS 7 их не поставить), либо несовместимый ABI. Поднимать
+# границу можно, но только после проверки на самой машине:
+#
+#     python3.11 -m pip download -r requirements-<камера>.txt \
+#                -d /tmp/wheels --only-binary=:all:
+#
+# Всё, что не скачалось колесом, на CentOS 7 придётся собирать из исходников —
+# системный gcc 4.8 этого не потянет для numpy и подобных.
+#
+# Ставится не этот файл, а файл своей роли — он подключает ядро сам:
+#
+#     pip install -r requirements-cannon.txt     # узел с камерой Canon
+#     pip install -r requirements-sptt.txt       # узел с камерой SPTT
+#     pip install -r requirements-infra.txt      # узел с камерой Infra
+#     pip install -r requirements-asi.txt        # узел с камерой ASI
+#     pip install -r requirements-sentry.txt     # узел с камерой Sentry
+#     pip install -r requirements-gui.txt        # плюс GUI (gui_app/setup_app)
+#     pip install -r requirements-observer.txt   # машина наблюдателя
+#
+# Узлу с одной камерой зависимости остальных не нужны.
 
-# GUI (optional — only needed for --gui mode)
-PyQt5>=5.15
+numpy>=1.23.5,<2.0     # <2.0: astropy 5.x/6.x и opencv собраны под ABI numpy 1.x
+Pillow>=9.5,<11.0      # JPEG/PNG/TIFF; в 11.x меняется базовый образ manylinux
+paho-mqtt>=1.6.1       # верхней границы нет: mqtt_client._make_mqtt_client
+                       # поддерживает и v1, и v2 (CallbackAPIVersion.VERSION2)
 
-# Canon camera (gphoto2)
-gphoto2-cffi>=0.4
-Pillow>=9.0
-
-# SPTT camera (CSDU-429)
-pyusb>=1.2
-astropy>=5.0
-
-# ASI all-sky imager (Princeton Instruments PIXIS)
-pyserial>=3.5
-# astropy (already above) is required, not optional, for this camera
-# System deps:
-#   PICAM SDK — libpicam.so (set PICAM_LIB, or install to /usr/local/lib)
-#   sudo usermod -aG dialout $USER   # serial port of the filter wheel
-# Without the SDK the driver still runs with asi.camera.backend = "sim"
-
-# Infra camera (SW1300)
-# Python deps: numpy (already above), ctypes (stdlib)
-# System deps (install via apt):
-#   sudo apt install libusb-1.0-0 libqt5gui5 libqt5core5a libgl1-mesa-glx
-
-# ---------------------------------------------------------------------------
-# Observer machine only (viewer_app.py / focus_app.py)
-# ---------------------------------------------------------------------------
-# Neither program imports a camera driver, so a laptop that only *watches* the
-# cameras needs nothing from the sections above except:
-#     PyQt5, numpy, Pillow   — required
-#     paho-mqtt              — only for the HiveMQ tab in viewer_app.py
-#     astropy                — optional; without it FITS files are read by the
-#                              built-in minimal parser in frame_archive.py
-# LAN browsing, live view and discovery use only the standard library.
-
-# ---------------------------------------------------------------------------
-# Development only
-# ---------------------------------------------------------------------------
-# pytest>=7.0    — python -m pytest tests -q  (no hardware required)
+# LAN-сервер кадров, discovery и live view работают на одной стандартной
+# библиотеке — ничего ставить не нужно.

@@ -28,9 +28,12 @@ from pathlib import Path
 import frame_archive
 
 from utils import (
-    load_schedule_file, get_instance_name, get_system_info, APP_DIR,
+    load_schedule_safe, claim_instance_name, get_instance_name,
+    get_local_ip, get_system_info, APP_DIR,
 )
-from worker_common import WorkerMqtt, parse_command_params
+from worker_common import (
+    WorkerMqtt, parse_command_params, announce_setup_mode, SETUP_STATUS,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -733,7 +736,7 @@ class InfraWorkerConsole(threading.Thread):
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
                  mqtt_publisher=None, mqtt_prefix="every_camera", service=None,
-                 node_name=""):
+                 node_name="", setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.schedule = schedule
@@ -742,6 +745,7 @@ class InfraWorkerConsole(threading.Thread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self.save_format = save_format
+        self.setup_mode = bool(setup_mode)
         self._service = service
         self._bus = WorkerMqtt("infra", instance_name, status_dir,
                                mqtt_publisher, mqtt_prefix, service=service,
@@ -943,7 +947,7 @@ class InfraWorkerConsole(threading.Thread):
         """
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds:
+        if now.second in self.capture_seconds and not self.setup_mode:
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -971,8 +975,12 @@ class InfraWorkerConsole(threading.Thread):
         stream.start()
         console_ui.log("Infra camera stream thread started")
 
-        console_ui.log("Infra camera measurement started")
-        self._save_status("running", force=True)
+        if self.setup_mode:
+            console_ui.log("Infra camera ready for focusing (setup mode)")
+            self._save_status(SETUP_STATUS, force=True)
+        else:
+            console_ui.log("Infra camera measurement started")
+            self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
             if self._pending_capture_event.is_set():
@@ -987,7 +995,7 @@ class InfraWorkerConsole(threading.Thread):
                     break
 
             if active_end is None:
-                self._save_status("waiting")
+                self._save_status(SETUP_STATUS if self.setup_mode else "waiting")
                 self._handle_focus(now, stream)
                 self._stop_event.wait(0.5)
                 continue
@@ -1085,6 +1093,7 @@ class InfraWorkerConsole(threading.Thread):
             "exposure_us": self.cam.exposure_us,
             "gain": self.cam.gain,
             "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
+            "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
         }
         try:
@@ -1143,7 +1152,8 @@ def run_preview_infra(cam, instance_name):
             time.sleep(0.1)
 
 
-def run_console_infra(config_path=None, preview=False, verbose=False):
+def run_console_infra(config_path=None, preview=False, verbose=False,
+                      setup_mode=False):
     """Run Infra camera measurement in console mode."""
     from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
@@ -1152,8 +1162,10 @@ def run_console_infra(config_path=None, preview=False, verbose=False):
     infra_cfg = cfg.get("infra", {})
     mqtt_cfg = cfg.get("mqtt", {})
 
-    instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
     node_name = get_node_name(cfg)
+    claim = claim_instance_name(infra_cfg.get("instance_name")
+                                or get_instance_name("Infra", cfg))
+    instance_name = claim.name
     output_dir = infra_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     schedule_file = infra_cfg.get("schedule_file", "")
@@ -1177,15 +1189,16 @@ def run_console_infra(config_path=None, preview=False, verbose=False):
         _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
                            instance_name, node_name, output_dir, status_dir,
                            schedule_file, capture_seconds, exposure_us, gain_val,
-                           roi, save_format)
+                           roi, save_format, setup_mode)
     finally:
         dash.stop()
+        claim.release()
 
 
 def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
                        instance_name, node_name, output_dir, status_dir,
                        schedule_file, capture_seconds, exposure_us, gain_val,
-                       roi, save_format):
+                       roi, save_format, setup_mode=False):
     """Body of :func:`run_console_infra`, with the dashboard already running."""
     from mqtt_client import create_console_publisher
 
@@ -1210,13 +1223,18 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
         console_ui.log("Done.")
         return
 
-    if not output_dir or not schedule_file:
+    # Only a missing output_dir is worth an interactive prompt: a node without a
+    # schedule is a legitimate state (setup mode below), and a headless box must
+    # not stall on input() because of it.
+    if not output_dir:
         console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_infra
         with dash.suspended():          # the wizard needs a plain terminal
             configure_console_infra(cfg, config_path)
         infra_cfg = cfg.get("infra", {})
-        instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
+        # instance_name is deliberately not re-read: it is already reserved, and
+        # the dashboard and log file are open under it. A name typed into the
+        # wizard takes effect on the next run.
         output_dir = infra_cfg.get("output_dir", "")
         schedule_file = infra_cfg.get("schedule_file", "")
         capture_seconds = infra_cfg.get("capture_seconds", INFRA_CAPTURE_SECONDS)
@@ -1228,21 +1246,17 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
     if not output_dir:
         console_ui.error("output_dir is required.")
         sys.exit(1)
-    if not schedule_file:
-        console_ui.error("schedule_file is required.")
-        sys.exit(1)
-    if not os.path.exists(schedule_file):
-        console_ui.error(f"Schedule file not found: {schedule_file}")
-        sys.exit(1)
 
-    entries, errors = load_schedule_file(schedule_file)
+    entries, errors, reason = load_schedule_safe(schedule_file)
     for err in errors:
         console_ui.warn(f"Schedule: {err}")
-    if not entries:
-        console_ui.error("No valid schedule entries found.")
-        sys.exit(1)
-
-    console_ui.log(f"Loaded {len(entries)} schedule intervals")
+    if setup_mode or reason:
+        entries = []
+        setup_mode = True
+        announce_setup_mode(reason)
+        dash.update(schedule="setup mode — no scheduled captures")
+    else:
+        console_ui.log(f"Loaded {len(entries)} schedule intervals")
     console_ui.log(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
@@ -1297,10 +1311,13 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
     from camera_service import CameraService
     from frame_server import start_frame_server
     service = CameraService("infra", instance_name, output_dir,
-                            node_name=node_name)
+                            node_name=node_name, setup_mode=setup_mode)
     server = start_frame_server(cfg.get("server", {}), service)
     if server:
         dash.update(server_url=server.url)
+        if setup_mode:
+            console_ui.log(f"Focus this camera with: python focus_app.py "
+                           f"--host {get_local_ip()} --port {server.port}")
 
     worker = InfraWorkerConsole(
         cam=cam,
@@ -1314,6 +1331,7 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
         node_name=node_name,
+        setup_mode=setup_mode,
     )
 
     def _sigint(sig, frame):

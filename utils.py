@@ -55,11 +55,119 @@ def get_local_ip():
         return "127.0.0.1"
 
 
-def get_instance_name(camera_name):
-    """Build unique instance name: {camera_name}_{last_IP_octet}."""
-    ip = get_local_ip()
-    last_octet = ip.split(".")[-1]
-    return f"{camera_name}_{last_octet}"
+def sanitize_name(text, fallback="node"):
+    """Reduce free text to something safe for topics, file names and locks."""
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_"
+                   for ch in str(text or "")).strip("_")
+    return safe or fallback
+
+
+def get_instance_name(camera_name, cfg=None):
+    """Build the default instance name: ``{camera_name}_{node_name}``.
+
+    It used to be ``{camera_name}_{last_IP_octet}``, which collided in two
+    common cases: two machines whose addresses end in the same octet (.5 in
+    192.168.1.x and in 10.0.0.x), and two copies of the program on one machine.
+    Since the name drives the MQTT topics, the log file and the preview file,
+    a collision meant two cameras silently overwriting each other. The node
+    name (config ``node_name``, hostname otherwise) does not have that problem.
+
+    Same-machine duplicates are handled separately by :func:`claim_instance_name`.
+    """
+    return f"{camera_name}_{sanitize_name(get_node_name(cfg))}"
+
+
+# ---------------------------------------------------------------------------
+# Instance name reservation
+# ---------------------------------------------------------------------------
+INSTANCE_LOCK_DIR = str(Path.home() / ".every_camera" / "instances")
+MAX_INSTANCE_ORDINAL = 64
+
+
+class InstanceClaim:
+    """A held reservation of one instance name. Release it when the run ends."""
+
+    def __init__(self, name, fd=None, path=""):
+        self.name = name
+        self._fd = fd
+        self._path = path
+
+    def release(self):
+        """Give the name back. Closing the descriptor is what drops the flock.
+
+        The file itself stays: unlinking it would let a third process create a
+        fresh file at the same path and lock *that* inode while a second process
+        still holds the old one — two owners of one name. An empty leftover file
+        costs nothing and is reused by the next run.
+        """
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def claim_instance_name(base_name, lock_dir=None):
+    """Reserve ``base_name`` for this process. Returns an :class:`InstanceClaim`.
+
+    While another *live* process on this machine holds the name, ``-2``, ``-3``
+    … are appended, so several copies of every-camera can run from one
+    identical config.json without sharing MQTT topics, log files or preview
+    files. The reservation is a ``flock`` on a file in ``~/.every_camera/instances``:
+    the kernel drops it when the process dies, so a crashed run frees its name
+    without leaving anything to clean up.
+
+    Platforms without ``fcntl`` (Windows, where only the observer tools run)
+    get the name unchanged and no reservation.
+    """
+    base_name = sanitize_name(base_name, fallback="camera")
+    try:
+        import fcntl
+    except ImportError:
+        return InstanceClaim(base_name)
+
+    directory = lock_dir or INSTANCE_LOCK_DIR
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        console_ui.warn(f"Cannot create {directory}: {exc}. "
+                        f"Instance name {base_name} is not reserved.")
+        return InstanceClaim(base_name)
+
+    for ordinal in range(1, MAX_INSTANCE_ORDINAL + 1):
+        name = base_name if ordinal == 1 else f"{base_name}-{ordinal}"
+        path = os.path.join(directory, f"{name}.lock")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)          # held by a live process — try the next name
+            continue
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass
+        if ordinal > 1:
+            console_ui.warn(f"Instance name '{base_name}' is already used by "
+                            f"another process on this machine — running as '{name}'.")
+        return InstanceClaim(name, fd, path)
+
+    console_ui.warn(f"All {MAX_INSTANCE_ORDINAL} variants of '{base_name}' are "
+                    f"taken; running unreserved.")
+    return InstanceClaim(base_name)
 
 
 def get_node_name(cfg=None):
@@ -188,7 +296,11 @@ DEFAULT_CONFIG = {
     "server": {
         "enabled": True,
         "bind": "0.0.0.0",
+        # Preferred port. When it is taken — the normal case when several
+        # cameras run from this same config.json — the server moves up to
+        # port + port_search. Nothing is written back: the choice is per run.
         "port": 8765,
+        "port_search": 20,      # 0 = use "port" or nothing, as before
         "discovery": True,
         "discovery_port": 45455,
         "max_list": 2000,
@@ -296,6 +408,35 @@ def parse_schedule_text(text):
 def load_schedule_file(filepath):
     with open(filepath, "r") as f:
         return parse_schedule_text(f.read())
+
+
+def load_schedule_safe(filepath):
+    """Load a schedule without ever raising. Returns ``(entries, errors, reason)``.
+
+    ``reason`` is None when a usable schedule was loaded; otherwise it is a
+    short explanation of why the camera cannot measure, and the caller is
+    expected to start in setup mode rather than abort. Aborting used to be the
+    only option, which meant a freshly installed camera could not even be
+    focused until someone invented a schedule for it.
+
+    ``errors`` holds per-line complaints from :func:`parse_schedule_text`; they
+    are worth reporting even when enough valid lines remain.
+    """
+    if not str(filepath or "").strip():
+        return [], [], "schedule_file is not configured"
+    try:
+        entries, errors = load_schedule_file(filepath)
+    except FileNotFoundError:
+        return [], [], f"schedule file not found: {filepath}"
+    except IsADirectoryError:
+        return [], [], f"schedule file is a directory: {filepath}"
+    except UnicodeDecodeError:
+        return [], [], f"schedule file is not readable text: {filepath}"
+    except OSError as exc:
+        return [], [], f"cannot read schedule file {filepath}: {exc}"
+    if not entries:
+        return [], errors, f"no valid intervals in {filepath}"
+    return entries, errors, None
 
 
 def save_schedule_file(filepath, entries):
@@ -718,9 +859,14 @@ def _configure_server(cfg):
     if _ask_bool("Enable LAN frame server?", srv.get("enabled", True)):
         srv["enabled"] = True
         srv["port"] = _ask_int("HTTP port", srv.get("port", 8765))
+        # A busy port is normal when several cameras share one config.json, so
+        # the server moves up instead of giving up. Nothing is written back.
+        srv["port_search"] = _ask_int(
+            "If that port is busy, how many above it to try (0 = none)",
+            srv.get("port_search", 20))
         srv["bind"] = _ask("Bind address (0.0.0.0 = whole LAN)",
                            srv.get("bind", "0.0.0.0"))
-        srv["discovery"] = _ask_bool("Answer UDP discovery broadcasts?",
+        srv["discovery"] = _ask_bool("Answer UDP discovery probes?",
                                      srv.get("discovery", True))
         if srv["discovery"]:
             srv["discovery_port"] = _ask_int("Discovery UDP port",

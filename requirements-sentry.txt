@@ -1,0 +1,8 @@
+# Узел с камерой Sentry (демон imagerd_rt).
+# Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
+-r requirements.txt
+
+astropy>=5.3,<6.2      # чтение/копирование FITS демона; 7.x требует numpy 2.x
+
+# Системные зависимости: установленный и работающий imagerd_rt
+# (sentry.imagerd_rt_dir в config.json).

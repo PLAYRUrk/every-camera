@@ -34,6 +34,7 @@ Endpoints
     GET  /api/params/<id>        result of a parameter request
     POST /api/focus              start/extend/stop focus mode
 """
+import errno
 import json
 import os
 import socket
@@ -51,12 +52,28 @@ import frame_archive
 SERVER_VERSION = "every-camera/1.0"
 
 DEFAULT_PORT = 8765
+# How many ports above the configured one to try when it is already taken.
+# Several cameras are meant to run from one identical config.json, so a busy
+# port is a normal situation, not a misconfiguration.
+DEFAULT_PORT_SEARCH = 20
 DEFAULT_LIST_LIMIT = 200
 MAX_LIST_LIMIT = 2000
 MAX_MJPEG_CLIENTS = 4
 MJPEG_BOUNDARY = "everycamframe"
 THUMB_MAX_SIDE = 256
 THUMB_CACHE_SIZE = 64
+
+
+class _FrameHTTPServer(ThreadingHTTPServer):
+    """The server class, with SO_REUSEPORT explicitly off.
+
+    SO_REUSEADDR (inherited) only shortens TIME_WAIT. SO_REUSEPORT would let a
+    second instance bind the *same* port and have the kernel split requests
+    between two unrelated cameras at random — the opposite of what the port
+    search below is for, so it must stay off however the stdlib default moves.
+    """
+    allow_reuse_port = False
+    daemon_threads = True
 
 
 class _ThumbCache:
@@ -503,8 +520,10 @@ def start_frame_server(server_cfg, service, verbose=False):
         console_ui.log("LAN frame server disabled in config.")
         return None
 
-    port = int(cfg.get("port", DEFAULT_PORT))
+    wanted_port = int(cfg.get("port", DEFAULT_PORT))
     bind = cfg.get("bind", "0.0.0.0")
+    # 0 restores the old strict behaviour: use the configured port or nothing.
+    port_search = max(0, int(cfg.get("port_search", DEFAULT_PORT_SEARCH)))
 
     handler = type("_BoundHandler", (_Handler,), {
         "service": service,
@@ -515,14 +534,28 @@ def start_frame_server(server_cfg, service, verbose=False):
         "verbose": bool(verbose or cfg.get("verbose")),
     })
 
-    try:
-        httpd = ThreadingHTTPServer((bind, port), handler)
-        httpd.daemon_threads = True
-    except OSError as exc:
-        console_ui.warn(f"LAN frame server not started on {bind}:{port}: {exc}\n"
+    httpd = None
+    port = wanted_port
+    last_exc = None
+    for candidate in range(wanted_port, wanted_port + port_search + 1):
+        try:
+            httpd = _FrameHTTPServer((bind, candidate), handler)
+            port = candidate
+            break
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
+                break           # a wrong bind address will not fix itself
+    if httpd is None:
+        console_ui.warn(f"LAN frame server not started on {bind}:{wanted_port}"
+                        f"{f'..{wanted_port + port_search}' if port_search else ''}: "
+                        f"{last_exc}\n"
                         f"       Measurements continue; viewer_app/focus_app cannot "
                         f"connect to this node.")
         return None
+    if port != wanted_port:
+        console_ui.log(f"Port {wanted_port} is busy — this instance took {port}. "
+                       f"config.json is unchanged; the port is chosen per run.")
 
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.5},
                               daemon=True, name="everycam-frame-server")
@@ -536,6 +569,9 @@ def start_frame_server(server_cfg, service, verbose=False):
             info = service.info()
             info["http_port"] = port
             info["hostname"] = socket.gethostname()
+            # Several instances can share a hostname; the pid tells them apart
+            # in the observer's list even before the ports are noticed.
+            info["pid"] = os.getpid()
             # node_name comes from the service (config); the hostname is the
             # fallback the observer's programs show when no name was configured.
             if not info.get("node_name"):

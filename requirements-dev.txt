@@ -1,0 +1,5 @@
+# Только для разработки: python -m pytest tests -q (железо не требуется).
+-r requirements.txt
+
+pytest>=7.0,<9
+fpdf2>=2.7,<3          # generate_pdf.py — сборка README.pdf
