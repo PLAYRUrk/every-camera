@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor, QFont, QImage, QPixmap
 
+import console_ui
+
 from mqtt_client import MQTT_AVAILABLE
 
 from utils import HOME_STATUS_DIR, pid_alive
@@ -253,6 +255,10 @@ def fmt_dt(iso_str):
 def _extra_info(rec):
     """Build short extra info string from monitoring data."""
     parts = []
+    # Which machine this camera sits on — the same friendly name the observer
+    # programs show instead of an IP.
+    if rec.get("node_name"):
+        parts.append(f"@{rec['node_name']}")
     cam_type = rec.get("camera_type", "")
     if cam_type == "cannon":
         if rec.get("iso"):
@@ -286,6 +292,20 @@ def _extra_info(rec):
             parts.append(f"Exp:{rec['exposure']}")
         if rec.get("daemon_running") is not None:
             parts.append("daemon:up" if rec["daemon_running"] else "daemon:DOWN")
+    elif cam_type == "asi":
+        if rec.get("phase"):
+            parts.append(str(rec["phase"]))
+        if rec.get("filter") is not None:
+            parts.append(f"F:{rec['filter']}")
+        if rec.get("exposure") is not None:
+            parts.append(f"Exp:{rec['exposure']}s")
+        if rec.get("binning") is not None:
+            parts.append(f"B:{rec['binning']}x{rec['binning']}")
+        if rec.get("ccd_temp") is not None:
+            parts.append(f"T:{rec['ccd_temp']}°"
+                         + ("" if rec.get("temp_locked", True) else "!"))
+        if rec.get("darks_taken"):
+            parts.append(f"darks:{rec['darks_taken']}")
     # System info
     sys_info = rec.get("system", {})
     if sys_info.get("disk_free_mb") is not None:
@@ -536,7 +556,7 @@ class MqttTab(QWidget):
 
         if self._subscriber:
             self._subscriber.publish(cmd_topic, b"", retain=False)
-            print(f"[monitor] Published cmd: {cmd_topic}", flush=True)
+            console_ui.log(f"Published cmd: {cmd_topic}")
             self.lbl_footer.setText(f"Frame requested from {instance_name}...")
 
             # Open viewer dialog
@@ -581,8 +601,7 @@ class MqttTab(QWidget):
         cmd_topic = f"{prefix}/{instance_name}/cmd/capture_frame"
         payload_bytes = json.dumps(params).encode("utf-8")
         self._subscriber.publish(cmd_topic, payload_bytes, retain=False)
-        print(f"[monitor] Published cmd: {cmd_topic} payload={params}",
-              flush=True)
+        console_ui.log(f"Published cmd: {cmd_topic} payload={params}")
         self.lbl_footer.setText(
             f"On-demand capture requested from {instance_name}: {params or '(defaults)'}")
 
@@ -608,7 +627,7 @@ class MqttTab(QWidget):
         msg = (f"No response from {instance_name}. "
                f"{hint}")
         self.lbl_footer.setText(msg)
-        print(f"[monitor] Timeout waiting for {instance_name}", flush=True)
+        console_ui.log(f"Timeout waiting for {instance_name}")
         if self._frame_viewer and self._frame_viewer.isVisible():
             self._frame_viewer.show_message(msg, f"Timeout: {instance_name}")
 
@@ -619,7 +638,7 @@ class MqttTab(QWidget):
         except json.JSONDecodeError as e:
             msg = f"Frame decode error: {e}"
             self.lbl_footer.setText(msg)
-            print(f"[monitor] {msg}", flush=True)
+            console_ui.log(f"{msg}")
             return
 
         instance_name = data.get("instance_name", "?")
@@ -628,8 +647,8 @@ class MqttTab(QWidget):
         status = data.get("status", "ok")
         note = data.get("note", "")
 
-        print(f"[monitor] /frame from {instance_name} ({camera_type}): "
-              f"status={status} note={note!r}", flush=True)
+        console_ui.log(f"/frame from {instance_name} ({camera_type}): "
+                       f"status={status} note={note!r}")
 
         # Intermediate statuses — keep the timeout running but refresh the UI.
         if status == "accepted":
@@ -661,7 +680,7 @@ class MqttTab(QWidget):
             err = data.get("error") or f"status={status}"
             msg = f"No frame from {instance_name}: {err}"
             self.lbl_footer.setText(msg)
-            print(f"[monitor] {msg}", flush=True)
+            console_ui.log(f"{msg}")
             if self._frame_viewer and self._frame_viewer.isVisible():
                 self._frame_viewer.show_message(
                     msg, f"{instance_name} ({camera_type}) — {status}")

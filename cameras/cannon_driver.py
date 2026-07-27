@@ -16,6 +16,8 @@ from datetime import datetime as dt
 from time import sleep
 from pathlib import Path
 
+import console_ui
+
 from utils import (
     load_schedule_file, get_instance_name, get_system_info, APP_DIR,
 )
@@ -185,14 +187,14 @@ def generate_camcfg(config, model_name):
     filepath = camcfg_path(model_name)
     with open(filepath, "w") as f:
         f.write("\n".join(lines))
-    print(f"[INFO] Generated {filepath}")
+    console_ui.log(f"Generated {filepath}")
 
 
 def apply_camcfg(config, model_name):
     """Apply camera config from .ini file. Generate if missing."""
     cfg_path = camcfg_path(model_name)
     if not os.path.exists(cfg_path):
-        print(f"[INFO] Generating {os.path.basename(cfg_path)}...")
+        console_ui.log(f"Generating {os.path.basename(cfg_path)}...")
         generate_camcfg(config, model_name)
     camcfg = cp.ConfigParser()
     camcfg.read(cfg_path)
@@ -280,7 +282,7 @@ class CannonWorkerConsole(threading.Thread):
 
     def __init__(self, cam, config, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None):
+                 mqtt_prefix="every_camera", service=None, node_name=""):
         super().__init__(daemon=True)
         self.cam = cam
         self.config = config
@@ -291,7 +293,8 @@ class CannonWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds)
         self._service = service
         self._bus = WorkerMqtt("cannon", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service)
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
@@ -307,18 +310,18 @@ class CannonWorkerConsole(threading.Thread):
 
     def _on_mqtt_command(self, topic, payload):
         """Handle incoming MQTT commands (e.g. get_frame, capture_frame)."""
-        print(f"[cannon:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
+        console_ui.log(f"MQTT cmd received: {topic} "
+                       f"({len(payload) if payload else 0} bytes)")
         if not self._bus.enabled:
             return
         if topic.endswith("/cmd/get_frame"):
             if self._last_frame_data is None:
                 self._bus.publish_error("no_frame", "No frame captured yet")
-                print("[WARN] Frame requested but no frame available yet")
+                console_ui.warn("Frame requested but no frame available yet")
                 return
             ts = self._last_shot.isoformat() if self._last_shot else None
             self._bus.publish_frame_jpeg(self._last_frame_data, ts)
-            print("[INFO] Frame sent via MQTT")
+            console_ui.log("Frame sent via MQTT")
             return
         if topic.endswith("/cmd/capture_frame"):
             params, err = parse_command_params(payload)
@@ -330,10 +333,9 @@ class CannonWorkerConsole(threading.Thread):
             self._pending_capture_event.set()
             self._bus.publish_note("accepted",
                                    f"Request queued with params: {params}")
-            print(f"[INFO] On-demand capture queued with params: {params}",
-                  flush=True)
+            console_ui.log(f"On-demand capture queued with params: {params}")
             return
-        print(f"[cannon:{self.instance_name}] Unknown command: {topic}", flush=True)
+        console_ui.log(f"Unknown command: {topic}")
 
     def _apply_cannon_params(self, params):
         failures = []
@@ -360,23 +362,23 @@ class CannonWorkerConsole(threading.Thread):
         self._pending_capture_event.clear()
         if params is None:
             return
-        print("[INFO] On-demand capture starting", flush=True)
+        console_ui.log("On-demand capture starting")
         self._bus.publish_note("capturing", f"Applying params: {params}")
         try:
             failures = self._apply_cannon_params(params)
             for key, err in failures:
-                print(f"[WARN] Param '{key}' failed: {err}")
+                console_ui.warn(f"Param '{key}' failed: {err}")
             img_data = capture_image(self.cam)
             now = dt.now()
             self._last_frame_data = img_data
             self._push_live_frame(img_data, now)
             self._bus.publish_frame_jpeg(img_data, now.isoformat(),
                                          on_demand=True, params=params)
-            print("[INFO] On-demand frame sent via MQTT")
+            console_ui.log("On-demand frame sent via MQTT")
         except Exception as e:
             self._bus.publish_error("error", f"Capture failed: {e}",
                                     on_demand=True)
-            print(f"[ERROR] On-demand capture error: {e}")
+            console_ui.error(f"On-demand capture error: {e}")
 
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
@@ -418,9 +420,9 @@ class CannonWorkerConsole(threading.Thread):
                 pass
         run_focus_iteration(
             self._service, self._grab_focus_frame,
-            on_error=lambda exc, stopped: print(
-                f"[WARN] Focus frame failed: {exc}"
-                f"{' — focus mode disabled' if stopped else ''}", flush=True))
+            on_error=lambda exc, stopped: console_ui.warn(
+                          f"Focus frame failed: {exc}"
+                          f"{' — focus mode disabled' if stopped else ''}"))
 
     def run(self):
         last_fired = (-1, -1)
@@ -428,7 +430,7 @@ class CannonWorkerConsole(threading.Thread):
         self._bus.prepare_status_dir()
         self._bus.subscribe(self._on_mqtt_command)
 
-        print("[INFO] Cannon measurement started")
+        console_ui.log("Cannon measurement started")
         self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
@@ -468,7 +470,7 @@ class CannonWorkerConsole(threading.Thread):
                     self._errors += 1
                     self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        print(f"[ERROR] {consecutive_errors} consecutive errors, stopping")
+                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
@@ -478,7 +480,7 @@ class CannonWorkerConsole(threading.Thread):
 
         self._save_status("stopped", force=True)
         self._bus.shutdown()
-        print("[INFO] Cannon measurement stopped")
+        console_ui.log("Cannon measurement stopped")
 
     def _capture_one(self, now):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
@@ -489,10 +491,10 @@ class CannonWorkerConsole(threading.Thread):
                 fh.write(img_data)
             self._last_frame_data = img_data
             self._push_live_frame(img_data, now)
-            print(f"[INFO] Shot saved: {os.path.basename(filepath)}")
+            console_ui.log(f"Shot saved: {os.path.basename(filepath)}")
             return True
         except Exception as exc:
-            print(f"[ERROR] Capture error: {exc}")
+            console_ui.error(f"Capture error: {exc}")
             return False
 
     def _save_status(self, status, force=False):
@@ -517,9 +519,17 @@ class CannonWorkerConsole(threading.Thread):
         }
         payload.update(cam_info)
         try:
-            payload["system"] = get_system_info(self.output_dir)
+            system = get_system_info(self.output_dir)
+            payload["system"] = system
+            console_ui.update(disk_free_mb=system.get("disk_free_mb"))
         except Exception:
             pass
+        console_ui.update(status=status, frames=self._shots, errors=self._errors,
+                          output_dir=self.output_dir)
+        console_ui.set_section("camera", [
+            (f"{key}:", str(value)) for key, value in cam_info.items()
+        ] + [("Window ends:", self._active_until.strftime("%Y-%m-%d %H:%M:%S")
+              if self._active_until else "-")])
         self._bus.publish_status(payload, force=force)
 
 
@@ -530,12 +540,12 @@ def run_preview_cannon(cam, instance_name):
     """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
     tmp_path = preview_path + ".tmp"
-    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+    console_ui.log(f"Preview mode: writing {preview_path} (Ctrl+C to stop)")
 
     stop = threading.Event()
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping preview...")
+        console_ui.log("Stopping preview…")
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -555,15 +565,15 @@ def run_preview_cannon(cam, instance_name):
             if frames % 10 == 0:
                 elapsed = (dt.now() - t0).total_seconds()
                 fps = frames / elapsed if elapsed > 0 else 0
-                print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+                console_ui.log(f"Preview: {frames} frames, {fps:.1f} FPS")
         except Exception as exc:
-            print(f"[ERROR] Preview frame error: {exc}")
+            console_ui.error(f"Preview frame error: {exc}")
             sleep(0.2)
 
 
-def run_console_cannon(config_path=None, preview=False):
+def run_console_cannon(config_path=None, preview=False, verbose=False):
     """Run Canon camera measurement in console mode."""
-    from utils import load_config
+    from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
@@ -571,98 +581,117 @@ def run_console_cannon(config_path=None, preview=False):
     mqtt_cfg = cfg.get("mqtt", {})
 
     instance_name = cannon_cfg.get("instance_name") or get_instance_name("Cannon")
+    node_name = get_node_name(cfg)
     output_dir = cannon_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     schedule_file = cannon_cfg.get("schedule_file", "")
     capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
 
-    print("=" * 60)
-    print("  Every Camera — Canon Console Mode" + ("  [PREVIEW]" if preview else ""))
-    print(f"  Instance      : {instance_name}")
-    if not preview:
-        print(f"  Capture at    : {capture_seconds} seconds of each minute")
-    print("=" * 60)
+    dash = console_ui.start_dashboard("cannon", instance_name, verbose=verbose)
+    dash.update(status="starting", node_name=node_name, output_dir=output_dir,
+                frames=0, errors=0,
+                schedule=f"capture at {capture_seconds} s of each minute")
+    try:
+        _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
+                            instance_name, node_name, output_dir, status_dir,
+                            schedule_file, capture_seconds)
+    finally:
+        dash.stop()
+
+
+def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
+                        instance_name, node_name, output_dir, status_dir,
+                        schedule_file, capture_seconds):
+    """Body of :func:`run_console_cannon`, with the dashboard already running."""
+    from mqtt_client import create_console_publisher
 
     if preview:
-        print("[INFO] Releasing camera USB...")
+        console_ui.log("Releasing camera USB...")
         release_camera_usb()
         install_gphoto_log_filter()
         try:
             cam = gp.Camera()
         except Exception as exc:
-            print(f"[ERROR] Failed to connect camera: {exc}")
+            console_ui.error(f"Failed to connect camera: {exc}")
             sys.exit(1)
         config = cam._get_config()
         model_name = detect_model(config)
-        print(f"[INFO] Connected: {model_name}")
+        console_ui.log(f"Connected: {model_name}")
         apply_camcfg(config, model_name)
         run_preview_cannon(cam, instance_name)
-        print("[INFO] Done.")
+        console_ui.log("Done.")
         return
 
     if not output_dir or not schedule_file:
-        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_cannon
-        configure_console_cannon(cfg, config_path)
+        with dash.suspended():          # the wizard needs a plain terminal
+            configure_console_cannon(cfg, config_path)
         cannon_cfg = cfg.get("cannon", {})
         instance_name = cannon_cfg.get("instance_name") or get_instance_name("Cannon")
         output_dir = cannon_cfg.get("output_dir", "")
         schedule_file = cannon_cfg.get("schedule_file", "")
         capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
-        print(f"  Instance      : {instance_name}")
-        print(f"  Capture at    : {capture_seconds} seconds of each minute")
+        dash.update(schedule=f"capture at {capture_seconds} s of each minute",
+                    output_dir=output_dir)
 
     if not output_dir:
-        print("[ERROR] output_dir is required.")
+        console_ui.error("output_dir is required.")
         sys.exit(1)
     if not schedule_file:
-        print("[ERROR] schedule_file is required.")
+        console_ui.error("schedule_file is required.")
         sys.exit(1)
     if not os.path.exists(schedule_file):
-        print(f"[ERROR] Schedule file not found: {schedule_file}")
+        console_ui.error(f"Schedule file not found: {schedule_file}")
         sys.exit(1)
 
     entries, errors = load_schedule_file(schedule_file)
     for err in errors:
-        print(f"[WARN] Schedule: {err}")
+        console_ui.warn(f"Schedule: {err}")
     if not entries:
-        print("[ERROR] No valid schedule entries found.")
+        console_ui.error("No valid schedule entries found.")
         sys.exit(1)
 
-    print(f"[INFO] Loaded {len(entries)} schedule intervals")
-    print(f"[INFO] Output directory: {output_dir}")
+    console_ui.log(f"Loaded {len(entries)} schedule intervals")
+    console_ui.log(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
 
     # Connect camera
-    print("[INFO] Releasing camera USB...")
+    console_ui.log("Releasing camera USB...")
     release_camera_usb()
     install_gphoto_log_filter()
     try:
         cam = gp.Camera()
     except Exception as exc:
-        print(f"[ERROR] Failed to connect camera: {exc}")
+        console_ui.error(f"Failed to connect camera: {exc}")
         sys.exit(1)
 
     config = cam._get_config()
     model_name = detect_model(config)
-    print(f"[INFO] Connected: {model_name}")
+    console_ui.log(f"Connected: {model_name}")
+    dash.set_section("device", [("Model:", model_name)])
 
     # Apply camera config
     apply_camcfg(config, model_name)
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "cannon")
+    if mqtt_pub:
+        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
     from frame_server import start_frame_server
-    service = CameraService("cannon", instance_name, output_dir)
+    service = CameraService("cannon", instance_name, output_dir,
+                            node_name=node_name)
     try:
         service.set_current_params(get_camera_settings_info(config))
     except Exception:
         pass
     server = start_frame_server(cfg.get("server", {}), service)
+    if server:
+        dash.update(server_url=server.url)
 
     worker = CannonWorkerConsole(
         cam=cam,
@@ -675,19 +704,24 @@ def run_console_cannon(config_path=None, preview=False):
         mqtt_publisher=mqtt_pub,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
+        node_name=node_name,
     )
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping (Ctrl+C)...")
+        console_ui.log("Ctrl+C — stopping…")
         worker.request_stop()
     signal.signal(signal.SIGINT, _sigint)
 
-    print("[INFO] Starting. Press Ctrl+C to stop.")
-    worker.start()
-    worker.join()
-
-    if server:
-        server.stop()
-    if mqtt_pub:
-        mqtt_pub.disconnect_broker()
-    print("[INFO] Done.")
+    console_ui.log("Starting. Press Ctrl+C to stop.")
+    try:
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    finally:
+        if server:
+            server.stop()
+        if mqtt_pub:
+            try:
+                mqtt_pub.disconnect_broker()
+            except Exception:
+                pass

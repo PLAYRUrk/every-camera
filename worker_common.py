@@ -19,6 +19,8 @@ import time
 
 from datetime import datetime as dt
 
+import console_ui
+
 import frame_archive
 
 from utils import (
@@ -46,10 +48,13 @@ class WorkerMqtt:
 
     def __init__(self, camera_type, instance_name, status_dir,
                  mqtt_publisher=None, mqtt_prefix="every_camera",
-                 service=None, status_suffix=""):
+                 service=None, status_suffix="", node_name=""):
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.status_dir = status_dir
+        # Stamped onto every status snapshot so the monitor can say which
+        # machine a camera is on without every driver remembering to add it.
+        self.node_name = node_name or ""
         self.prefix = mqtt_prefix
         self._mqtt = mqtt_publisher
         self._service = service
@@ -75,18 +80,16 @@ class WorkerMqtt:
         os.makedirs(self.status_dir, exist_ok=True)
         removed = cleanup_stale_status_files(self.status_dir)
         if removed:
-            print(f"[INFO] Removed {removed} stale status file(s) from "
-                  f"{self.status_dir}", flush=True)
+            console_ui.log(f"Removed {removed} stale status file(s) from "
+                           f"{self.status_dir}")
 
     def subscribe(self, callback):
         """Subscribe to the instance command topic. Returns True if wired up."""
         if not self._mqtt:
-            print(f"[{self.camera_type}:{self.instance_name}] "
-                  f"No MQTT — remote commands disabled", flush=True)
+            console_ui.log("No MQTT — remote commands disabled")
             return False
         self._mqtt.subscribe_commands(self.cmd_topic, callback)
-        print(f"[{self.camera_type}:{self.instance_name}] "
-              f"Subscribed to commands: {self.cmd_topic}", flush=True)
+        console_ui.log(f"Subscribed to commands: {self.cmd_topic}")
         return True
 
     # ------------------------------------------------------------------
@@ -98,6 +101,8 @@ class WorkerMqtt:
         ``force=True`` bypasses the throttle (used for terminal states).
         Returns True if the status actually went out.
         """
+        if self.node_name and not payload.get("node_name"):
+            payload = dict(payload, node_name=self.node_name)
         status_name = payload.get("status")
         now = time.monotonic()
         changed = status_name != self._last_status_name
@@ -114,7 +119,7 @@ class WorkerMqtt:
         try:
             write_status_file(self.status_path, payload)
         except Exception as exc:
-            print(f"[WARN] Could not write status file: {exc}", flush=True)
+            console_ui.warn(f"Could not write status file: {exc}")
         if self._mqtt:
             try:
                 self._mqtt.publish(self.status_topic, json.dumps(payload),
@@ -165,8 +170,7 @@ class WorkerMqtt:
                 "too_large",
                 f"Frame payload {len(payload)} bytes exceeds broker limit",
                 ts_iso=ts_iso, on_demand=on_demand)
-            print(f"[WARN] Frame too large ({len(payload)} bytes); not sent",
-                  flush=True)
+            console_ui.warn(f"Frame too large ({len(payload)} bytes); not sent")
             return False
         self._mqtt.publish(self.frame_topic, payload, retain=False)
         return True

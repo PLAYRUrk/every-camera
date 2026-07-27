@@ -22,6 +22,34 @@ class CameraHttpError(Exception):
     """Any failure talking to a camera's frame server."""
 
 
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+def node_name_of(info):
+    """Friendly machine name from a discovery reply or ``/api/info``.
+
+    Falls back through hostname to the bare address, so there is always
+    something to show even for a node that was never given a name.
+    """
+    info = info or {}
+    for key in ("node_name", "hostname"):
+        value = str(info.get(key) or "").strip()
+        if value:
+            return value
+    return str(info.get("host") or "").strip()
+
+
+def node_label(node, default_port=8765):
+    """One-line label for a discovered node: name, camera, address."""
+    node = node or {}
+    host = node.get("host", "?")
+    port = node.get("http_port", default_port)
+    name = node_name_of(node)
+    who = (f"{name} — {node.get('instance_name', '?')}" if name
+           else str(node.get("instance_name", "?")))
+    return f"{who} ({node.get('camera_type', '?')}) — {host}:{port}"
+
+
 class CameraClient:
     """Thin client for one camera's frame server."""
 

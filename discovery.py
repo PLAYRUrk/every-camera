@@ -18,6 +18,8 @@ import socket
 import threading
 import time
 
+import console_ui
+
 DISCOVERY_PORT = 45455
 PROBE = b"EVERYCAM_DISCOVER?"
 SERVICE_TAG = "every-camera"
@@ -50,12 +52,10 @@ class DiscoveryResponder(threading.Thread):
             sock.bind(("", self._port))
             self._sock = sock
         except OSError as exc:
-            print(f"[WARN] Discovery responder disabled (UDP :{self._port}): {exc}",
-                  flush=True)
+            console_ui.warn(f"Discovery responder disabled (UDP :{self._port}): {exc}")
             return False
         self.start()
-        print(f"[INFO] Discovery responder listening on UDP :{self._port}",
-              flush=True)
+        console_ui.log(f"Discovery responder listening on UDP :{self._port}")
         return True
 
     def run(self):
@@ -95,7 +95,7 @@ def start_responder(info_provider, port=DISCOVERY_PORT):
         responder = DiscoveryResponder(info_provider, port)
         return responder if responder.start_safely() else None
     except Exception as exc:
-        print(f"[WARN] Could not start discovery responder: {exc}", flush=True)
+        console_ui.warn(f"Could not start discovery responder: {exc}")
         return None
 
 
@@ -133,7 +133,7 @@ def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(0.3)
     except OSError as exc:
-        print(f"[WARN] Discovery not available: {exc}")
+        console_ui.warn(f"Discovery not available: {exc}")
         return []
 
     targets = _broadcast_addresses()
@@ -183,7 +183,10 @@ if __name__ == "__main__":
     nodes = discover(timeout=args.timeout, port=args.port)
     if not nodes:
         print("No cameras answered.")
-    for node in nodes:
-        print(f"{node.get('instance_name', '?'):<24} "
+    for node in sorted(nodes, key=lambda n: str(n.get("node_name") or
+                                                n.get("hostname") or "")):
+        name = node.get("node_name") or node.get("hostname") or "-"
+        print(f"{name:<20} "
+              f"{node.get('instance_name', '?'):<20} "
               f"{node.get('camera_type', '?'):<8} "
               f"http://{node['host']}:{node.get('http_port')}")

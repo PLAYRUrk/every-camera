@@ -42,7 +42,7 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont
 
 from net_client import (
     CameraClient, CameraHttpError, TaskRunner, DiscoveryTask, MjpegStream,
-    load_settings, save_settings,
+    load_settings, save_settings, node_label, node_name_of,
 )
 
 DEFAULT_HTTP_PORT = 8765
@@ -528,13 +528,12 @@ class FocusWindow(QMainWindow):
 
     def _on_discovered(self, nodes):
         self.cmb_cameras.clear()
-        for node in sorted(nodes, key=lambda n: str(n.get("instance_name"))):
+        for node in sorted(nodes, key=lambda n: (node_name_of(n).lower(),
+                                                 str(n.get("instance_name")))):
             host, port = node.get("host"), node.get("http_port", DEFAULT_HTTP_PORT)
             focus = "" if node.get("supports_focus", True) else "  [view only]"
             self.cmb_cameras.addItem(
-                f"{node.get('instance_name', '?')} "
-                f"({node.get('camera_type', '?')}) — {host}:{port}{focus}",
-                (host, port))
+                node_label(node, DEFAULT_HTTP_PORT) + focus, (host, port))
         for host, port in self._settings.get("recent_hosts", []):
             self.cmb_cameras.addItem(f"{host}:{port}", (host, port))
         if self.cmb_cameras.count() == 0:
@@ -578,7 +577,7 @@ class FocusWindow(QMainWindow):
         self._info = info
         self.lbl_camera.setText(
             f"<b>{info.get('instance_name', '?')}</b> "
-            f"({info.get('camera_type', '?')})<br>{info.get('hostname', '')}")
+            f"({info.get('camera_type', '?')})<br>{node_name_of(info)}")
         if not info.get("supports_focus", True):
             self._status(
                 f"{info.get('instance_name')} streams whatever its daemon "

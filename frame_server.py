@@ -44,6 +44,8 @@ from datetime import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import console_ui
+
 import frame_archive
 
 SERVER_VERSION = "every-camera/1.0"
@@ -137,8 +139,7 @@ class _Handler(BaseHTTPRequestHandler):
     # -- plumbing ------------------------------------------------------
     def log_message(self, fmt, *args):
         if self.verbose:
-            print(f"[frame-server] {self.address_string()} - {fmt % args}",
-                  flush=True)
+            console_ui.log(f"{self.address_string()} - {fmt % args}")
 
     def _send(self, code, body=b"", content_type="application/octet-stream",
               extra_headers=None):
@@ -499,7 +500,7 @@ def start_frame_server(server_cfg, service, verbose=False):
     """
     cfg = server_cfg or {}
     if not cfg.get("enabled", True):
-        print("[INFO] LAN frame server disabled in config.", flush=True)
+        console_ui.log("LAN frame server disabled in config.")
         return None
 
     port = int(cfg.get("port", DEFAULT_PORT))
@@ -518,9 +519,9 @@ def start_frame_server(server_cfg, service, verbose=False):
         httpd = ThreadingHTTPServer((bind, port), handler)
         httpd.daemon_threads = True
     except OSError as exc:
-        print(f"[WARN] LAN frame server not started on {bind}:{port}: {exc}\n"
-              f"       Measurements continue; viewer_app/focus_app cannot "
-              f"connect to this node.", flush=True)
+        console_ui.warn(f"LAN frame server not started on {bind}:{port}: {exc}\n"
+                        f"       Measurements continue; viewer_app/focus_app cannot "
+                        f"connect to this node.")
         return None
 
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.5},
@@ -535,13 +536,17 @@ def start_frame_server(server_cfg, service, verbose=False):
             info = service.info()
             info["http_port"] = port
             info["hostname"] = socket.gethostname()
+            # node_name comes from the service (config); the hostname is the
+            # fallback the observer's programs show when no name was configured.
+            if not info.get("node_name"):
+                info["node_name"] = info["hostname"]
             return info
 
         responder = discovery.start_responder(
             _info, cfg.get("discovery_port", discovery.DISCOVERY_PORT))
 
-    print(f"[INFO] LAN frame server: http://{_local_ip()}:{port}/  "
-          f"(archive: {service.output_dir or 'none'})", flush=True)
+    console_ui.log(f"LAN frame server: http://{_local_ip()}:{port}/  "
+                   f"(archive: {service.output_dir or 'none'})")
     return FrameServer(httpd, thread, responder, port)
 
 
@@ -674,12 +679,16 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--name", default="archive", help="Instance name to report")
+    parser.add_argument("--node-name", default="",
+                        help="Friendly machine name shown to observers "
+                             "(default: hostname)")
     parser.add_argument("--camera-type", default="unknown")
     parser.add_argument("--no-discovery", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    service = NullService(args.output_dir, args.name, args.camera_type)
+    service = NullService(args.output_dir, args.name, args.camera_type,
+                          node_name=args.node_name)
     server = start_frame_server({
         "enabled": True, "port": args.port, "bind": args.bind,
         "discovery": not args.no_discovery,

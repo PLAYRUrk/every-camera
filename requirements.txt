@@ -13,6 +13,14 @@ Pillow>=9.0
 pyusb>=1.2
 astropy>=5.0
 
+# ASI all-sky imager (Princeton Instruments PIXIS)
+pyserial>=3.5
+# astropy (already above) is required, not optional, for this camera
+# System deps:
+#   PICAM SDK — libpicam.so (set PICAM_LIB, or install to /usr/local/lib)
+#   sudo usermod -aG dialout $USER   # serial port of the filter wheel
+# Without the SDK the driver still runs with asi.camera.backend = "sim"
+
 # Infra camera (SW1300)
 # Python deps: numpy (already above), ctypes (stdlib)
 # System deps (install via apt):
@@ -28,3 +36,8 @@ astropy>=5.0
 #     astropy                — optional; without it FITS files are read by the
 #                              built-in minimal parser in frame_archive.py
 # LAN browsing, live view and discovery use only the standard library.
+
+# ---------------------------------------------------------------------------
+# Development only
+# ---------------------------------------------------------------------------
+# pytest>=7.0    — python -m pytest tests -q  (no hardware required)

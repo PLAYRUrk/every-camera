@@ -45,6 +45,7 @@ from PyQt5.QtGui import QPixmap, QImage
 
 from net_client import (
     CameraClient, TaskRunner, DiscoveryTask, load_settings, save_settings,
+    node_label, node_name_of,
 )
 
 DEFAULT_HTTP_PORT = 8765
@@ -274,12 +275,14 @@ class LanPanel(QWidget):
         current = self.cmb_cameras.currentData()
         self.cmb_cameras.blockSignals(True)
         self.cmb_cameras.clear()
-        for node in sorted(nodes, key=lambda n: str(n.get("instance_name"))):
+        # Sorted by node name first: an observer looks for a place, not an
+        # instance id, when several huts are on the same network.
+        for node in sorted(nodes, key=lambda n: (node_name_of(n).lower(),
+                                                 str(n.get("instance_name")))):
             host = node.get("host")
             port = node.get("http_port", DEFAULT_HTTP_PORT)
-            label = (f"{node.get('instance_name', '?')} "
-                     f"({node.get('camera_type', '?')}) — {host}:{port}")
-            self.cmb_cameras.addItem(label, (host, port))
+            self.cmb_cameras.addItem(node_label(node, DEFAULT_HTTP_PORT),
+                                     (host, port))
         for host, port in self._settings.get("recent_hosts", []):
             self.cmb_cameras.addItem(f"{host}:{port}", (host, port))
         self.cmb_cameras.blockSignals(False)
@@ -329,7 +332,7 @@ class LanPanel(QWidget):
     def _on_info(self, info):
         self.lbl_camera.setText(
             f"<b>{info.get('instance_name', '?')}</b> "
-            f"({info.get('camera_type', '?')})<br>{info.get('hostname', '')}"
+            f"({info.get('camera_type', '?')})<br>{node_name_of(info)}"
             f"<br>{info.get('output_dir') or 'no archive directory'}")
         if not info.get("archive_available"):
             self.status.emit(

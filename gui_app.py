@@ -75,7 +75,9 @@ def _start_tab_server(cfg, camera_type, instance_name, output_dir):
     """
     from camera_service import CameraService
     from frame_server import start_frame_server
-    service = CameraService(camera_type, instance_name, output_dir)
+    from utils import get_node_name
+    service = CameraService(camera_type, instance_name, output_dir,
+                            node_name=get_node_name(cfg))
     return service, start_frame_server(cfg.get("server", {}), service)
 
 
@@ -2753,8 +2755,10 @@ class SentryTab(QWidget):
 
         from camera_service import CameraService
         from frame_server import start_frame_server
+        from utils import get_node_name
         self._service = CameraService("sentry", instance, output_dir,
-                                      supports_params=False)
+                                      supports_params=False,
+                                      node_name=get_node_name(self._cfg))
         self._server = start_frame_server(self._cfg.get("server", {}),
                                           self._service)
 
@@ -2813,6 +2817,295 @@ class SentryTab(QWidget):
             self._server = None
         if self.cam and self.cam.is_running():
             self.cam.stop()
+
+
+class AsiTab(QWidget):
+    """GUI tab for the ASI all-sky imager (Princeton PIXIS via PICAM).
+
+    The measurement programme is the console worker, unchanged — running a
+    second implementation of the schedule, dark frames and cooling logic in the
+    GUI is exactly the kind of duplication that lets the two drift apart. This
+    tab starts that worker, mirrors its status through the CameraService and
+    shows its log lines, which it receives through a ``console_ui`` sink.
+    """
+
+    log_line = pyqtSignal(str, str)
+
+    def __init__(self, cfg: dict, log_fn, mqtt_fn=None):
+        super().__init__()
+        self._cfg = cfg
+        self._log = log_fn
+        self._mqtt_fn = mqtt_fn
+        self._worker = None
+        self._server = None
+        self._service = None
+        self._mqtt_pub = None
+        self.cam = None
+        self.log_line.connect(self._append_log)
+        self._build_ui()
+
+    def _build_ui(self):
+        asi_cfg = self._cfg.get("asi", {})
+        camera_cfg = asi_cfg.get("camera", {})
+        layout = QVBoxLayout(self)
+
+        cfg_box = QGroupBox("ASI all-sky imager (Princeton PIXIS via PICAM)")
+        cfg_grid = QGridLayout(cfg_box)
+        cfg_grid.setColumnStretch(1, 1)
+        row = 0
+
+        cfg_grid.addWidget(QLabel("Output dir:"), row, 0)
+        self.le_output = QLineEdit(asi_cfg.get("output_dir", ""))
+        cfg_grid.addWidget(self.le_output, row, 1)
+        btn_browse = QPushButton("Browse…")
+        btn_browse.clicked.connect(self._browse_output)
+        cfg_grid.addWidget(btn_browse, row, 2)
+        row += 1
+
+        cfg_grid.addWidget(QLabel("Instance name:"), row, 0)
+        self.le_instance = QLineEdit(asi_cfg.get("instance_name", ""))
+        self.le_instance.setPlaceholderText("auto")
+        cfg_grid.addWidget(self.le_instance, row, 1)
+        row += 1
+
+        cfg_grid.addWidget(QLabel("Backend:"), row, 0)
+        self.cmb_backend = QComboBox()
+        self.cmb_backend.addItems(["picam", "sim"])
+        self.cmb_backend.setCurrentText(camera_cfg.get("backend", "picam"))
+        cfg_grid.addWidget(self.cmb_backend, row, 1)
+        row += 1
+
+        cfg_grid.addWidget(QLabel("Schedule:"), row, 0)
+        self.lbl_schedule = QLabel("—")
+        self.lbl_schedule.setWordWrap(True)
+        cfg_grid.addWidget(self.lbl_schedule, row, 1, 1, 2)
+        row += 1
+
+        hint = QLabel("Exposures, filters, cooling and the schedule are edited in "
+                      "setup_app.py (tab “ASI”).")
+        hint.setWordWrap(True)
+        cfg_grid.addWidget(hint, row, 0, 1, 3)
+
+        layout.addWidget(cfg_box)
+
+        ctrl_lay = QHBoxLayout()
+        self.btn_start = QPushButton("Start Measurements")
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip("Finishes the current frame and shoots the "
+                                 "closing dark frames before stopping")
+        self.btn_stop.clicked.connect(self._on_stop)
+        ctrl_lay.addWidget(self.btn_start)
+        ctrl_lay.addWidget(self.btn_stop)
+        ctrl_lay.addStretch()
+        layout.addLayout(ctrl_lay)
+
+        status_box = QGroupBox("Status")
+        status_lay = QGridLayout(status_box)
+        status_lay.addWidget(QLabel("Status:"), 0, 0)
+        self.lbl_status = QLabel("stopped")
+        status_lay.addWidget(self.lbl_status, 0, 1)
+        status_lay.addWidget(QLabel("Phase:"), 0, 2)
+        self.lbl_phase = QLabel("—")
+        status_lay.addWidget(self.lbl_phase, 0, 3)
+        status_lay.addWidget(QLabel("Frames (light/dark):"), 1, 0)
+        self.lbl_frames = QLabel("0 / 0")
+        status_lay.addWidget(self.lbl_frames, 1, 1)
+        status_lay.addWidget(QLabel("Sensor temp:"), 1, 2)
+        self.lbl_temp = QLabel("—")
+        status_lay.addWidget(self.lbl_temp, 1, 3)
+        status_lay.addWidget(QLabel("Exposure / binning:"), 2, 0)
+        self.lbl_exp = QLabel("—")
+        status_lay.addWidget(self.lbl_exp, 2, 1)
+        status_lay.addWidget(QLabel("Filter:"), 2, 2)
+        self.lbl_filter = QLabel("—")
+        status_lay.addWidget(self.lbl_filter, 2, 3)
+        status_lay.addWidget(QLabel("Last file:"), 3, 0)
+        self.lbl_last = QLabel("—")
+        status_lay.addWidget(self.lbl_last, 3, 1, 1, 3)
+        layout.addWidget(status_box)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Monospace", 9))
+        layout.addWidget(self.log_text, 1)
+
+        self._poll_timer = QTimer()
+        self._poll_timer.setInterval(2000)
+        self._poll_timer.timeout.connect(self._refresh_status)
+        self._describe_schedule()
+
+    # ------------------------------------------------------------------
+    def _describe_schedule(self):
+        from cameras.asi import config as asi_config
+        try:
+            conf = asi_config.from_dict(self._cfg.get("asi", {}))
+        except Exception as exc:
+            self.lbl_schedule.setText(f"unreadable: {exc}")
+            return
+        sched = conf.schedule
+        if sched.mode == "time":
+            text = (f"time · {len(sched.entries)} slot(s) · period "
+                    f"{sched.period:.0f} s from "
+                    f"{sched.t_start.strftime('%H:%M') if sched.t_start else '?'}")
+        else:
+            text = (f"sun ≤ {sched.sun_max_angle:g}° · "
+                    f"{len(sched.entries)} slot(s)")
+        if conf.errors:
+            text += f"   ⚠ {len(conf.errors)} problem(s)"
+        self.lbl_schedule.setText(text)
+
+    def _browse_output(self):
+        d = QFileDialog.getExistingDirectory(self, "Select output directory",
+                                             self.le_output.text())
+        if d:
+            self.le_output.setText(d)
+
+    def _append_log(self, msg, level):
+        colors = {"info": "#000", "warn": "#aa6600", "error": "#cc0000"}
+        ts = dt.now().strftime("%H:%M:%S")
+        self.log_text.append(
+            f'<span style="color:{colors.get(level.lower(), "#000")}">'
+            f'[{ts}] {msg}</span>')
+
+    def _log_local(self, msg, level="info"):
+        self._append_log(msg, level)
+        self._log(msg, level)
+
+    def _on_console_log(self, msg, level):
+        # Called from the worker thread — hop to the GUI thread via the signal.
+        self.log_line.emit(str(msg), str(level).lower())
+
+    # ------------------------------------------------------------------
+    def _on_start(self):
+        import console_ui
+        from cameras.asi import config as asi_config
+        from cameras.asi_driver import AsiCamera, AsiWorkerConsole
+        from camera_service import CameraService
+        from frame_server import start_frame_server
+        from utils import get_instance_name, get_node_name
+        from pathlib import Path
+
+        asi_cfg = dict(self._cfg.get("asi", {}))
+        asi_cfg["output_dir"] = self.le_output.text().strip()
+        camera_cfg = dict(asi_cfg.get("camera", {}))
+        camera_cfg["backend"] = self.cmb_backend.currentText()
+        asi_cfg["camera"] = camera_cfg
+        self._cfg["asi"] = asi_cfg
+
+        conf = asi_config.from_dict(asi_cfg)
+        for problem in conf.errors:
+            self._log_local(problem, "warn")
+        if not conf.output_dir:
+            self._log_local("Output directory is required.", "error")
+            return
+        if not conf.schedule.entries:
+            self._log_local("The schedule is empty — add slots in setup_app.py.",
+                            "error")
+            return
+
+        instance = self.le_instance.text().strip() or get_instance_name("ASI")
+        node_name = get_node_name(self._cfg)
+        status_dir = self._cfg.get("status_dir") or str(
+            Path.home() / ".every_camera" / "status")
+        os.makedirs(conf.output_dir, exist_ok=True)
+
+        console_ui.add_sink(self._on_console_log)
+        try:
+            self.cam = AsiCamera(conf).open()
+        except Exception as exc:
+            console_ui.remove_sink(self._on_console_log)
+            self._log_local(f"Could not open the camera: {exc}", "error")
+            self.cam = None
+            return
+
+        self._mqtt_pub = self._mqtt_fn("asi", instance) if self._mqtt_fn else None
+        mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
+
+        self._service = CameraService("asi", instance, conf.output_dir,
+                                      node_name=node_name)
+        self._server = start_frame_server(self._cfg.get("server", {}),
+                                          self._service)
+
+        self._worker = AsiWorkerConsole(
+            cam=self.cam,
+            cfg=conf,
+            output_dir=conf.output_dir,
+            instance_name=instance,
+            status_dir=status_dir,
+            mqtt_publisher=self._mqtt_pub,
+            mqtt_prefix=mqtt_prefix,
+            service=self._service,
+            node_name=node_name,
+        )
+        self._worker.start()
+
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._poll_timer.start()
+        self._describe_schedule()
+        self._log_local(f"ASI measurements started — instance: {instance}")
+
+    def _on_stop(self):
+        if self._worker:
+            self._worker.request_stop()
+            self._log_local("Stopping after the current frame and closing darks…")
+        self.btn_stop.setEnabled(False)
+
+    def _refresh_status(self):
+        if self._service is None:
+            return
+        snap = self._service.status()
+        self.lbl_status.setText(str(snap.get("status", "—")))
+        self.lbl_phase.setText(str(snap.get("phase", "—")))
+        self.lbl_frames.setText(f"{snap.get('shots_taken', 0)} / "
+                                f"{snap.get('darks_taken', 0)}")
+        temp = snap.get("ccd_temp")
+        if temp is None:
+            self.lbl_temp.setText("—")
+        else:
+            state = "locked" if snap.get("temp_locked") else "settling"
+            self.lbl_temp.setText(f"{temp} °C ({state})")
+        binning = snap.get("binning") or 1
+        exposure = snap.get("exposure")
+        self.lbl_exp.setText(f"{exposure} s · {binning}x{binning}"
+                             if exposure else f"— · {binning}x{binning}")
+        self.lbl_filter.setText(str(snap.get("filter") or "—"))
+        self.lbl_last.setText(str(snap.get("last_file") or "—"))
+
+        if self._worker is not None and not self._worker.is_alive():
+            self._on_finished()
+
+    def _on_finished(self):
+        import console_ui
+        self._poll_timer.stop()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        console_ui.remove_sink(self._on_console_log)
+        if self._server:
+            self._server.stop()
+            self._server = None
+        if self._mqtt_pub:
+            try:
+                self._mqtt_pub.disconnect_broker()
+            except Exception:
+                pass
+            self._mqtt_pub = None
+        if self.cam:
+            self.cam.close()
+            self.cam = None
+        self._worker = None
+        self._log_local("ASI measurements stopped")
+
+    def cleanup(self):
+        self._poll_timer.stop()
+        if self._worker is not None and self._worker.is_alive():
+            # Forced: closing the window should not block on a run of darks.
+            self._worker.request_stop(force=True)
+            self._worker.join(timeout=10)
+        if self._worker is not None:
+            self._on_finished()
 
 
 # ===========================================================================
@@ -2903,6 +3196,12 @@ class MainWindow(QMainWindow):
                                          self.create_mqtt_publisher)
             self.tab_widget.addTab(self._sentry_tab, "Sentry Camera")
             self._tabs["sentry"] = self._sentry_tab
+
+        if camera_type is None or camera_type == "asi":
+            self._asi_tab = AsiTab(self._cfg, self._log,
+                                   self.create_mqtt_publisher)
+            self.tab_widget.addTab(self._asi_tab, "ASI Camera")
+            self._tabs["asi"] = self._asi_tab
 
         # Monitor tab
         mqtt_cfg = self._cfg.get("mqtt", {})

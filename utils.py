@@ -9,6 +9,8 @@ from datetime import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 
+import console_ui
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -60,6 +62,26 @@ def get_instance_name(camera_name):
     return f"{camera_name}_{last_octet}"
 
 
+def get_node_name(cfg=None):
+    """Human-readable name of this machine, for the observer's programs.
+
+    Scanning the LAN used to show bare IP addresses, which say nothing about
+    which telescope hut a node is standing in. ``node_name`` in config.json fixes
+    that; it describes the *machine*, not one camera, because a single node may
+    run several cameras. The hostname is the fallback, so the name is never
+    empty and an unconfigured node still looks sensible.
+    """
+    name = ""
+    if isinstance(cfg, dict):
+        name = str(cfg.get("node_name", "") or "").strip()
+    if name:
+        return name
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "every-camera"
+
+
 # ---------------------------------------------------------------------------
 # Config management
 # ---------------------------------------------------------------------------
@@ -92,6 +114,56 @@ DEFAULT_CONFIG = {
         "roi": "1280x1024",
         "save_format": "tiff",
     },
+    # ASI all-sky imager: Princeton PIXIS through PICAM + SmartMotor filter wheel.
+    # The schedule lives here rather than in a separate file; ``schedule_file``
+    # is only for stations that already keep a legacy asi-camera schedule.txt.
+    "asi": {
+        "instance_name": "",
+        "output_dir": "",
+        "mode": "sun",                  # "sun" or "time"
+        "sun_max_angle": -10.0,         # sun mode: start below this solar altitude
+        "t_start": "20:00",             # time mode: phase reference of the cycle
+        "dark_frames": 3,
+        "dead_time": 5.0,
+        "wait_for_enter": True,         # time mode: wait for the operator to start
+        "schedule_file": "",            # optional legacy schedule.txt
+        "schedule": [],                 # sun:  {"filter":1,"exposure":55,"seconds":[0]}
+                                        # time: {"delta":100,"filter":3,
+                                        #        "exposure":25,"binning":1}
+        "camera": {
+            "backend": "picam",         # "picam" (real SDK) or "sim"
+            "readout_speed": 2.0,
+            "binning": 4,
+            "gain": 1,                  # 1 Low, 2 Medium, 3 High
+            "frame_timeout_ms": 30000,
+            "readout_control_mode": 1,
+            "shutter_timing_mode": 1,
+            "output_signal": 4,
+            "kinetics_window_height": 50,
+            "demo": False,
+            "demo_model": "Pixis1024F",
+        },
+        "cooling": {
+            "enabled": True,
+            "target_temp": -60.0,
+            "tolerance": 3.0,
+            "wait_on_start": True,
+            "wait_timeout": 1800.0,
+            "warm_on_exit": True,
+            "warm_temp": 13.0,
+            "warm_timeout": 900.0,
+        },
+        "filter_wheel": {
+            "port": "/dev/ttyUSB0",     # "sim" selects the simulator
+            "baudrate": 9600,
+            "move_timeout": 8.0,
+        },
+        "location": {
+            "lat": 0.0,
+            "lon": 0.0,
+            "elevation": 0.0,
+        },
+    },
     "sentry": {
         "instance_name": "",
         "imagerd_rt_dir": "/usr/local/imagerd_rt",
@@ -122,6 +194,9 @@ DEFAULT_CONFIG = {
         "max_list": 2000,
         "focus_ttl": 60,
     },
+    # Friendly name of this machine, shown by viewer_app/focus_app/monitor
+    # instead of a bare IP. Empty means "use the hostname".
+    "node_name": "",
     "status_dir": "",
 }
 
@@ -152,10 +227,10 @@ def load_config(path=None):
             hint = f"Original kept as {backup}."
         except Exception:
             hint = "Could not back it up."
-        print(f"[ERROR] Config {path} is not valid JSON: {exc}\n"
-              f"        Falling back to defaults. {hint}")
+        console_ui.error(f"Config {path} is not valid JSON: {exc}\n"
+                         f"        Falling back to defaults. {hint}")
     except Exception as exc:
-        print(f"[ERROR] Could not read config {path}: {exc}. Using defaults.")
+        console_ui.error(f"Could not read config {path}: {exc}. Using defaults.")
     return cfg
 
 
@@ -170,7 +245,7 @@ def save_config(cfg, path=None):
             json.dump(out, fh, indent=2)
         os.replace(tmp, path)
     except Exception as exc:
-        print(f"[WARN] Could not save config: {exc}")
+        console_ui.warn(f"Could not save config: {exc}")
 
 
 def _deep_copy(d):
@@ -521,6 +596,99 @@ def configure_console_sentry(cfg, config_path=None):
     print("\nConfiguration saved.\n")
 
 
+def configure_console_asi(cfg, config_path=None):
+    """Interactive configuration for the ASI all-sky imager console mode."""
+    asi = cfg.get("asi", _deep_copy(DEFAULT_CONFIG["asi"]))
+    camera = asi.get("camera", _deep_copy(DEFAULT_CONFIG["asi"]["camera"]))
+    cooling = asi.get("cooling", _deep_copy(DEFAULT_CONFIG["asi"]["cooling"]))
+    wheel = asi.get("filter_wheel", _deep_copy(DEFAULT_CONFIG["asi"]["filter_wheel"]))
+    location = asi.get("location", _deep_copy(DEFAULT_CONFIG["asi"]["location"]))
+    print("\n--- ASI (Princeton PIXIS) Camera Configuration ---\n")
+
+    asi["output_dir"] = _ask("Output directory for FITS files", asi.get("output_dir", ""))
+    asi["instance_name"] = _ask("Instance name (auto if empty)",
+                                asi.get("instance_name", ""))
+
+    backend = _ask("Camera backend (picam / sim)", camera.get("backend", "picam"))
+    camera["backend"] = backend if backend in ("picam", "sim") else "picam"
+    camera["binning"] = _ask_int("Binning (1/2/4/8)", camera.get("binning", 4))
+    camera["gain"] = _ask_int("Analog gain (1=Low, 2=Medium, 3=High)",
+                              camera.get("gain", 1))
+    camera["readout_speed"] = _ask_float("ADC readout speed (MHz)",
+                                         camera.get("readout_speed", 2.0))
+
+    cooling["enabled"] = _ask_bool("Use the cooler?", cooling.get("enabled", True))
+    if cooling["enabled"]:
+        cooling["target_temp"] = _ask_float("Sensor setpoint (°C)",
+                                            cooling.get("target_temp", -60.0))
+        cooling["wait_on_start"] = _ask_bool("Wait for the setpoint before measuring?",
+                                             cooling.get("wait_on_start", True))
+        cooling["warm_on_exit"] = _ask_bool("Warm the sensor up on exit?",
+                                            cooling.get("warm_on_exit", True))
+
+    wheel["port"] = _ask("Filter wheel serial port ('sim' for the simulator)",
+                         wheel.get("port", "/dev/ttyUSB0"))
+    if wheel["port"].strip().lower() != "sim":
+        wheel["baudrate"] = _ask_int("Filter wheel baudrate", wheel.get("baudrate", 9600))
+
+    location["lat"] = _ask_float("Site latitude (degrees)", location.get("lat", 0.0))
+    location["lon"] = _ask_float("Site longitude (degrees)", location.get("lon", 0.0))
+    location["elevation"] = _ask_float("Site elevation (m)",
+                                       location.get("elevation", 0.0))
+
+    mode = _ask("Schedule mode (sun / time)", asi.get("mode", "sun"))
+    asi["mode"] = mode if mode in ("sun", "time") else "sun"
+    if asi["mode"] == "sun":
+        asi["sun_max_angle"] = _ask_float(
+            "Start when the solar altitude drops below (degrees)",
+            asi.get("sun_max_angle", -10.0))
+    else:
+        asi["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
+                              asi.get("t_start", "20:00"))
+    asi["dark_frames"] = _ask_int("Dark frames per exposure",
+                                  asi.get("dark_frames", 3))
+    asi["dead_time"] = _ask_float("Dead time between cycles (s)",
+                                  asi.get("dead_time", 5.0))
+
+    schedule_file = _ask("Legacy schedule.txt path (empty = use the slots below)",
+                         asi.get("schedule_file", ""))
+    asi["schedule_file"] = schedule_file
+    if not schedule_file and _ask_bool("Enter the schedule now?",
+                                       not asi.get("schedule")):
+        slots = []
+        while True:
+            print(f"\n  Slot {len(slots) + 1}:")
+            slot = {
+                "filter": _ask_int("    Filter (1-6)", 1),
+                "exposure": _ask_float("    Exposure (s)", 55.0),
+            }
+            if asi["mode"] == "time":
+                slot["delta"] = _ask_float("    Offset from the cycle start (s)", 0.0)
+                slot["binning"] = _ask_int("    Binning", camera.get("binning", 4))
+            else:
+                secs = _ask("    Capture seconds within the minute (comma-separated)",
+                            "0")
+                try:
+                    slot["seconds"] = [int(s.strip()) for s in secs.split(",")
+                                       if s.strip()]
+                except ValueError:
+                    slot["seconds"] = [0]
+            slots.append(slot)
+            if not _ask_bool("  Add another slot?", False):
+                break
+        asi["schedule"] = slots
+
+    asi["camera"] = camera
+    asi["cooling"] = cooling
+    asi["filter_wheel"] = wheel
+    asi["location"] = location
+    cfg["asi"] = asi
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
 def _configure_mqtt(cfg):
     """Interactive MQTT configuration (shared)."""
     mqtt = cfg.get("mqtt", {})
@@ -543,6 +711,10 @@ def _configure_server(cfg):
     srv = cfg.get("server", _deep_copy(DEFAULT_CONFIG["server"]))
     print("\n  The LAN frame server lets viewer_app.py and focus_app.py browse")
     print("  captured frames and watch a live stream over the local network.")
+    # Asked here because it is what the observer sees when scanning the network.
+    cfg["node_name"] = _ask(
+        "Name of this machine, shown to observers instead of its IP",
+        cfg.get("node_name", "") or socket.gethostname())
     if _ask_bool("Enable LAN frame server?", srv.get("enabled", True)):
         srv["enabled"] = True
         srv["port"] = _ask_int("HTTP port", srv.get("port", 8765))

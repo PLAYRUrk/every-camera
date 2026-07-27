@@ -11,6 +11,8 @@ import struct
 import threading
 import argparse
 
+import console_ui
+
 import numpy as np
 
 from datetime import datetime as dt
@@ -287,7 +289,7 @@ class SpttCamera:
                     return
             except usb.core.USBError as e:
                 if attempt < retries - 1:
-                    print(f"  Start attempt {attempt+1} failed: {e}, retrying...")
+                    console_ui.warn(f"Start attempt {attempt + 1} failed: {e}, retrying…")
                     time.sleep(0.5 * (attempt + 1))
                 else:
                     raise RuntimeError(f"Failed to start camera after {retries} attempts: {e}")
@@ -374,38 +376,37 @@ def ensure_firmware_loaded(backend):
     """Load firmware if device is not yet configured."""
     dev = usb.core.find(idVendor=VID, idProduct=PID_CONFIGURED, backend=backend)
     if dev:
-        print(f"Camera already configured (PID=0x{PID_CONFIGURED:04x}), skipping firmware load.")
+        console_ui.log(f"Camera already configured (PID=0x{PID_CONFIGURED:04x}), skipping firmware load.")
         usb.util.dispose_resources(dev)
         return True
 
     dev_raw = usb.core.find(idVendor=VID, idProduct=PID_RAW, backend=backend)
     if not dev_raw:
-        print("ERROR: No SPTT camera found!")
+        console_ui.error("No SPTT camera found.")
         return False
 
-    print("Loading firmware files...")
+    console_ui.log("Loading firmware files…")
     fx2_data, fpga_data = load_firmware_files()
 
-    print(f"\nFound raw FX2 device: {VID:04x}:{PID_RAW:04x}")
+    console_ui.log(f"Found raw FX2 device: {VID:04x}:{PID_RAW:04x}")
     detach_kernel_driver(dev_raw)
     load_fx2_firmware(dev_raw, fx2_data)
 
-    print("\nSending USB bus reset...")
+    console_ui.log("Sending USB bus reset…")
     try:
         dev_raw.reset()
     except usb.core.USBError as e:
-        print(f"  USB reset returned: {e} (expected)")
+        console_ui.log(f"USB reset returned: {e} (expected)")
     usb.util.dispose_resources(dev_raw)
     del dev_raw
 
     dev = wait_for_configured_device(backend)
     if not dev:
-        print("ERROR: Device not found after firmware load!")
+        console_ui.error("Device not found after firmware load.")
         return False
 
     detach_kernel_driver(dev)
     dev.set_configuration()
-    print()
     load_fpga_bitstream(dev, fpga_data)
 
     try:
@@ -414,14 +415,13 @@ def ensure_firmware_loaded(backend):
         pass
     del dev
 
-    print()
     dev_final = wait_for_configured_device(backend, timeout=10.0)
     if dev_final:
-        print("Firmware loaded successfully.")
+        console_ui.log("Firmware loaded successfully.")
         usb.util.dispose_resources(dev_final)
         return True
 
-    print("WARNING: Device not found after initialization.")
+    console_ui.warn("Device not found after initialization.")
     return False
 
 
@@ -433,7 +433,7 @@ def save_fits(filepath, frame, metadata=None):
     try:
         from astropy.io import fits
     except ImportError:
-        print("[WARN] astropy not installed, falling back to raw FITS")
+        console_ui.warn("astropy not installed, falling back to raw FITS")
         _save_fits_minimal(filepath, frame, metadata)
         return
 
@@ -513,7 +513,7 @@ class SpttWorkerConsole(threading.Thread):
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
                  capture_seconds=None, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None):
+                 mqtt_prefix="every_camera", service=None, node_name=""):
         super().__init__(daemon=True)
         self.cam = cam
         self.output_dir = output_dir
@@ -522,7 +522,8 @@ class SpttWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self._service = service
         self._bus = WorkerMqtt("sptt", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service)
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
@@ -591,12 +592,12 @@ class SpttWorkerConsole(threading.Thread):
         self._pending_capture_event.clear()
         if params is None:
             return
-        print("[INFO] On-demand SPTT capture starting", flush=True)
+        console_ui.log("On-demand SPTT capture starting")
         self._bus.publish_note("capturing", f"Applying params: {params}")
         try:
             applied, errors = self._apply_params(params)
             for err in errors:
-                print(f"[WARN] Param apply: {err}")
+                console_ui.warn(f"Param apply: {err}")
             frame = self.cam.grab_frame()
             now = dt.now()
             self._push_live_frame(frame, now)
@@ -604,16 +605,16 @@ class SpttWorkerConsole(threading.Thread):
             self._publish_frame_ok(
                 jpeg_bytes, w, h, now.isoformat(),
                 on_demand=True, params=applied)
-            print("[INFO] On-demand frame sent via MQTT")
+            console_ui.log("On-demand frame sent via MQTT")
         except Exception as e:
             self._publish_frame_error("error", f"Capture failed: {e}",
                                       on_demand=True)
-            print(f"[ERROR] On-demand capture error: {e}")
+            console_ui.error(f"On-demand capture error: {e}")
 
     def _on_mqtt_command(self, topic, payload):
         """Handle incoming MQTT commands (get_frame, capture_frame)."""
-        print(f"[sptt:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
+        console_ui.log(f"MQTT cmd received: {topic} "
+                       f"({len(payload) if payload else 0} bytes)")
         if not self._bus.enabled:
             return
         if topic.endswith("/cmd/get_frame"):
@@ -621,16 +622,16 @@ class SpttWorkerConsole(threading.Thread):
             ts_iso = self._last_shot.isoformat() if self._last_shot else None
             if frame is None:
                 self._publish_frame_error("no_frame", "No frame captured yet")
-                print("[WARN] Frame requested but no frame available yet")
+                console_ui.warn("Frame requested but no frame available yet")
                 return
             try:
                 jpeg_bytes, w, h = self._encode_jpeg(frame)
             except Exception as e:
                 self._publish_frame_error("error", str(e), ts_iso)
-                print(f"[ERROR] Frame encode error: {e}")
+                console_ui.error(f"Frame encode error: {e}")
                 return
             self._publish_frame_ok(jpeg_bytes, w, h, ts_iso)
-            print("[INFO] Frame sent via MQTT")
+            console_ui.log("Frame sent via MQTT")
             return
 
         if topic.endswith("/cmd/capture_frame"):
@@ -643,10 +644,9 @@ class SpttWorkerConsole(threading.Thread):
             self._pending_capture_event.set()
             self._bus.publish_note("accepted",
                                    f"Request queued with params: {params}")
-            print(f"[INFO] On-demand capture queued with params: {params}",
-                  flush=True)
+            console_ui.log(f"On-demand capture queued with params: {params}")
             return
-        print(f"[sptt:{self.instance_name}] Unknown command: {topic}", flush=True)
+        console_ui.log(f"Unknown command: {topic}")
 
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
@@ -679,9 +679,9 @@ class SpttWorkerConsole(threading.Thread):
             self._service.set_current_params(self._current_params())
         run_focus_iteration(
             self._service, self.cam.grab_frame,
-            on_error=lambda exc, stopped: print(
-                f"[WARN] Focus frame failed: {exc}"
-                f"{' — focus mode disabled' if stopped else ''}", flush=True))
+            on_error=lambda exc, stopped: console_ui.warn(
+                          f"Focus frame failed: {exc}"
+                          f"{' — focus mode disabled' if stopped else ''}"))
 
     def run(self):
         last_fired = (-1, -1)
@@ -691,14 +691,14 @@ class SpttWorkerConsole(threading.Thread):
         if self._service is not None:
             self._service.set_current_params(self._current_params())
 
-        print("[INFO] SPTT measurement started (captures at :00 and :30)")
+        console_ui.log("SPTT measurement started (captures at :00 and :30)")
         self._save_status("running", force=True)
 
         # Start continuous capture
         try:
             self.cam.start()
         except Exception as exc:
-            print(f"[ERROR] Failed to start camera: {exc}")
+            console_ui.error(f"Failed to start camera: {exc}")
             self._save_status("error", force=True)
             self._bus.shutdown()
             return
@@ -724,7 +724,7 @@ class SpttWorkerConsole(threading.Thread):
                     self._errors += 1
                     self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        print(f"[ERROR] {consecutive_errors} consecutive errors, stopping")
+                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
@@ -736,7 +736,7 @@ class SpttWorkerConsole(threading.Thread):
         self.cam.stop()
         self._save_status("stopped", force=True)
         self._bus.shutdown()
-        print("[INFO] SPTT measurement stopped")
+        console_ui.log("SPTT measurement stopped")
 
     def _capture_one(self, now):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
@@ -762,12 +762,12 @@ class SpttWorkerConsole(threading.Thread):
             save_fits(filepath, frame, metadata)
             self._last_frame = frame
             self._push_live_frame(frame, now)
-            print(f"[INFO] Frame saved: {os.path.basename(filepath)} "
-                  f"({frame.shape[1]}x{frame.shape[0]}, "
-                  f"exp={self.cam.exposure}s, gain={self.cam.gain})")
+            console_ui.log(f"Frame saved: {os.path.basename(filepath)} "
+                           f"({frame.shape[1]}x{frame.shape[0]}, "
+                           f"exp={self.cam.exposure}s, gain={self.cam.gain})")
             return True
         except Exception as exc:
-            print(f"[ERROR] Capture error: {exc}")
+            console_ui.error(f"Capture error: {exc}")
             return False
 
     def _save_status(self, status, force=False):
@@ -796,9 +796,19 @@ class SpttWorkerConsole(threading.Thread):
         }
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
         try:
-            payload["system"] = get_system_info(self.output_dir)
+            system = get_system_info(self.output_dir)
+            payload["system"] = system
+            console_ui.update(disk_free_mb=system.get("disk_free_mb"))
         except Exception:
             pass
+        console_ui.update(status=status, frames=self._shots, errors=self._errors,
+                          output_dir=self.output_dir)
+        console_ui.set_section("camera", [
+            ("Exposure / gain:", f"{self.cam.exposure} s  ·  {self.cam.gain}"),
+            ("Frame size:", f"{self.cam.w}x{self.cam.h}"),
+            ("Encoding:", "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit"),
+            ("CCD temperature:", str(cam_status.get("temp_ccd", "n/a"))),
+        ])
         self._bus.publish_status(payload, force=force)
 
 
@@ -811,12 +821,12 @@ def run_preview_sptt(cam, instance_name):
 
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
     tmp_path = preview_path + ".tmp"
-    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+    console_ui.log(f"Preview mode: writing {preview_path} (Ctrl+C to stop)")
 
     stop = threading.Event()
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping preview...")
+        console_ui.log("Stopping preview…")
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -842,17 +852,17 @@ def run_preview_sptt(cam, instance_name):
                 if frames % 10 == 0:
                     elapsed = (dt.now() - t0).total_seconds()
                     fps = frames / elapsed if elapsed > 0 else 0
-                    print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+                    console_ui.log(f"Preview: {frames} frames, {fps:.1f} FPS")
             except Exception as exc:
-                print(f"[ERROR] Preview frame error: {exc}")
+                console_ui.error(f"Preview frame error: {exc}")
                 time.sleep(0.1)
     finally:
         cam.stop()
 
 
-def run_console_sptt(config_path=None, preview=False):
+def run_console_sptt(config_path=None, preview=False, verbose=False):
     """Run SPTT camera measurement in console mode."""
-    from utils import load_config
+    from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
@@ -860,6 +870,7 @@ def run_console_sptt(config_path=None, preview=False):
     mqtt_cfg = cfg.get("mqtt", {})
 
     instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
+    node_name = get_node_name(cfg)
     output_dir = sptt_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     exposure = sptt_cfg.get("exposure", 0.88)
@@ -869,22 +880,37 @@ def run_console_sptt(config_path=None, preview=False):
     target_temp = sptt_cfg.get("target_temp")
     capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
-    print("=" * 60)
-    print("  Every Camera — SPTT (CSDU-429) Console Mode" + ("  [PREVIEW]" if preview else ""))
-    print(f"  Instance  : {instance_name}")
-    print(f"  Exposure  : {exposure} s")
-    print(f"  Gain      : {gain}")
-    print(f"  Binning   : {binning}")
-    print(f"  Encoding  : {'12bit' if encoding == ENCODING_12BPP else '8bit'}")
-    if not preview:
-        print(f"  Capture at: {capture_seconds} seconds of each minute")
-    print("=" * 60)
+    dash = console_ui.start_dashboard("sptt", instance_name, verbose=verbose)
+    dash.update(status="starting", node_name=node_name, output_dir=output_dir,
+                frames=0, errors=0,
+                schedule=f"capture at {capture_seconds} s of each minute")
+    dash.set_section("device", [
+        ("Exposure:", f"{exposure} s"),
+        ("Gain:", str(gain)),
+        ("Binning:", str(binning)),
+        ("Encoding:", "12bit" if encoding == ENCODING_12BPP else "8bit"),
+    ])
+    try:
+        _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
+                          instance_name, node_name, output_dir, status_dir,
+                          exposure, gain, binning, encoding, target_temp,
+                          capture_seconds)
+    finally:
+        dash.stop()
+
+
+def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
+                      instance_name, node_name, output_dir, status_dir,
+                      exposure, gain, binning, encoding, target_temp,
+                      capture_seconds):
+    """Body of :func:`run_console_sptt`, with the dashboard already running."""
+    from mqtt_client import create_console_publisher
 
     if preview:
-        print("[INFO] Initializing SPTT camera...")
+        console_ui.log("Initializing SPTT camera...")
         backend = find_libusb_backend()
         if not ensure_firmware_loaded(backend):
-            print("[ERROR] Failed to initialize camera.")
+            console_ui.error("Failed to initialize camera.")
             sys.exit(1)
         time.sleep(1)
         cam = SpttCamera(backend)
@@ -892,21 +918,22 @@ def run_console_sptt(config_path=None, preview=False):
             cam.open()
             cam.configure(exposure=exposure, gain=gain, binning=binning,
                           encoding=encoding, target_temp=target_temp)
-            print(f"[INFO] Camera ready: {cam.w}x{cam.h}")
+            console_ui.log(f"Camera ready: {cam.w}x{cam.h}")
         except Exception as exc:
-            print(f"[ERROR] Failed to configure camera: {exc}")
+            console_ui.error(f"Failed to configure camera: {exc}")
             sys.exit(1)
         try:
             run_preview_sptt(cam, instance_name)
         finally:
             cam.close()
-        print("[INFO] Done.")
+        console_ui.log("Done.")
         return
 
     if not output_dir:
-        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_sptt
-        configure_console_sptt(cfg, config_path)
+        with dash.suspended():          # the wizard needs a plain terminal
+            configure_console_sptt(cfg, config_path)
         sptt_cfg = cfg.get("sptt", {})
         instance_name = sptt_cfg.get("instance_name") or get_instance_name("SPTT")
         output_dir = sptt_cfg.get("output_dir", "")
@@ -916,22 +943,21 @@ def run_console_sptt(config_path=None, preview=False):
         encoding = sptt_cfg.get("encoding", ENCODING_12BPP)
         target_temp = sptt_cfg.get("target_temp")
         capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
-        print(f"  Instance  : {instance_name}")
-        print(f"  Exposure  : {exposure} s")
-        print(f"  Gain      : {gain}")
+        dash.update(output_dir=output_dir,
+                    schedule=f"capture at {capture_seconds} s of each minute")
 
     if not output_dir:
-        print("[ERROR] output_dir is required.")
+        console_ui.error("output_dir is required.")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
 
     # Load firmware and connect
-    print("[INFO] Initializing SPTT camera...")
+    console_ui.log("Initializing SPTT camera...")
     backend = find_libusb_backend()
     if not ensure_firmware_loaded(backend):
-        print("[ERROR] Failed to initialize camera.")
+        console_ui.error("Failed to initialize camera.")
         sys.exit(1)
     time.sleep(1)
 
@@ -942,19 +968,24 @@ def run_console_sptt(config_path=None, preview=False):
             exposure=exposure, gain=gain, binning=binning, encoding=encoding,
             target_temp=target_temp,
         )
-        print(f"[INFO] Camera ready: {cam.w}x{cam.h}")
+        console_ui.log(f"Camera ready: {cam.w}x{cam.h}")
     except Exception as exc:
-        print(f"[ERROR] Failed to configure camera: {exc}")
+        console_ui.error(f"Failed to configure camera: {exc}")
         sys.exit(1)
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "sptt")
+    if mqtt_pub:
+        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
     from frame_server import start_frame_server
-    service = CameraService("sptt", instance_name, output_dir)
+    service = CameraService("sptt", instance_name, output_dir,
+                            node_name=node_name)
     server = start_frame_server(cfg.get("server", {}), service)
+    if server:
+        dash.update(server_url=server.url)
 
     worker = SpttWorkerConsole(
         cam=cam,
@@ -965,20 +996,26 @@ def run_console_sptt(config_path=None, preview=False):
         mqtt_publisher=mqtt_pub,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
+        node_name=node_name,
     )
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping (Ctrl+C)...")
+        console_ui.log("Ctrl+C — stopping…")
         worker.request_stop()
     signal.signal(signal.SIGINT, _sigint)
 
-    print("[INFO] Starting. Press Ctrl+C to stop.")
-    worker.start()
-    worker.join()
-
-    cam.close()
-    if server:
-        server.stop()
-    if mqtt_pub:
-        mqtt_pub.disconnect_broker()
-    print("[INFO] Done.")
+    console_ui.log("Starting. Press Ctrl+C to stop.")
+    try:
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    finally:
+        cam.close()
+        if server:
+            server.stop()
+        if mqtt_pub:
+            try:
+                mqtt_pub.disconnect_broker()
+            except Exception:
+                pass
+    console_ui.log("Done.")

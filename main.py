@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Every Camera — Unified camera control for Canon, SPTT, Infra, and Sentry cameras.
+Every Camera — Unified camera control for Canon, SPTT, Infra, Sentry and ASI.
 
 Usage:
     python main.py                         # Auto-detect: GUI if display, else error
@@ -8,9 +8,15 @@ Usage:
     python main.py --type sptt             # Console mode, CSDU-429 scientific camera
     python main.py --type infra            # Console mode, SW1300 SWIR camera
     python main.py --type sentry           # Console mode, Princeton/imagerd_rt camera
+    python main.py --type asi              # Console mode, ASI all-sky imager (PICAM)
+    python main.py --type asi --verbose    # Plain log lines instead of the dashboard
     python main.py --gui                   # GUI mode (all camera types)
     python main.py --gui --type cannon     # GUI mode, Canon only
     python main.py --config path.json      # Use custom config file
+
+Console mode draws one live status screen that is redrawn in place (console_ui.py)
+and writes a full log to ~/.every_camera/logs/. Use --verbose, or redirect the
+output, to get plain timestamped lines instead.
 
 Monitor is a separate program: python monitor_app.py
 
@@ -19,6 +25,7 @@ Camera drivers live in the cameras/ package:
     cameras/sptt_driver.py    — CSDU-429 via USB (FITS)
     cameras/infra_driver.py   — Tanho SW1300 SWIR (TIFF/PNG/FITS)
     cameras/sentry_driver.py  — Princeton CCD via imagerd_rt daemon (FITS)
+    cameras/asi_driver.py     — ASI all-sky imager: Princeton PIXIS via PICAM (FITS)
 """
 import argparse
 import sys
@@ -40,13 +47,15 @@ Camera types:
   sptt      CSDU-429 scientific camera via USB (captures at :00 and :30, FITS)
   infra     SW1300 SWIR camera (Tanho THCAMSW1300, schedule-based, TIFF/PNG/FITS)
   sentry    Princeton Instruments CCD via imagerd_rt daemon (FITS, autonomous schedule)
+  asi       ASI all-sky imager: Princeton PIXIS via PICAM + filter wheel (FITS)
 
 In console mode (--type), the program runs headless.
 With a display available and no --type flag, GUI mode starts automatically.
 Monitor is a separate program: python monitor_app.py
         """,
     )
-    parser.add_argument("--type", choices=["cannon", "sptt", "infra", "sentry"],
+    parser.add_argument("--type",
+                        choices=["cannon", "sptt", "infra", "sentry", "asi"],
                         help="Camera type (required for console mode)")
     parser.add_argument("--gui", action="store_true",
                         help="Force GUI mode")
@@ -55,6 +64,10 @@ Monitor is a separate program: python monitor_app.py
     parser.add_argument("--preview", action="store_true",
                         help="Preview mode: continuously update preview_{cam}.png/fits "
                              "at max FPS (console mode only)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Console mode: plain timestamped log lines instead of "
+                             "the live dashboard (also the default when the output "
+                             "is not a terminal)")
 
     args = parser.parse_args()
 
@@ -63,23 +76,32 @@ Monitor is a separate program: python monitor_app.py
         # Explicit console mode
         if args.type == "cannon":
             from cameras.cannon_driver import run_console_cannon
-            run_console_cannon(args.config, preview=args.preview)
+            run_console_cannon(args.config, preview=args.preview,
+                               verbose=args.verbose)
         elif args.type == "sptt":
             from cameras.sptt_driver import run_console_sptt
-            run_console_sptt(args.config, preview=args.preview)
+            run_console_sptt(args.config, preview=args.preview,
+                             verbose=args.verbose)
         elif args.type == "infra":
             from cameras.infra_driver import run_console_infra
-            run_console_infra(args.config, preview=args.preview)
+            run_console_infra(args.config, preview=args.preview,
+                              verbose=args.verbose)
         elif args.type == "sentry":
             from cameras.sentry_driver import run_console_sentry
-            run_console_sentry(args.config, preview=args.preview)
+            run_console_sentry(args.config, preview=args.preview,
+                               verbose=args.verbose)
+        elif args.type == "asi":
+            from cameras.asi_driver import run_console_asi
+            run_console_asi(args.config, preview=args.preview,
+                            verbose=args.verbose)
     elif args.gui or (can_use_gui() and not args.type):
         # GUI mode
         from gui_app import run_gui
         run_gui(args)
     else:
         # No display, no --type
-        print("Error: No display available. Use --type <cannon|sptt|infra|sentry> for console mode.")
+        print("Error: No display available. "
+              "Use --type <cannon|sptt|infra|sentry|asi> for console mode.")
         print("       Or use --gui to force GUI mode (requires DISPLAY).")
         parser.print_help()
         sys.exit(1)

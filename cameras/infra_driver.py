@@ -18,6 +18,8 @@ import ctypes
 import threading
 import time
 
+import console_ui
+
 import numpy as np
 
 from datetime import datetime as dt, timezone
@@ -274,8 +276,8 @@ class TanhoCamera:
                 if idle >= idle_streak:
                     break
         if verbose and drained_chunks:
-            print(f"[INFRA] flush: drained {drained_chunks} chunks "
-                  f"({drained_bytes/1024:.0f} KiB)", flush=True)
+            console_ui.log(f"flush: drained {drained_chunks} chunks "
+                           f"({drained_bytes/1024:.0f} KiB)")
         return drained_chunks
 
     def _read_frame_usb(self, verbose_timing: bool = False) -> bytes:
@@ -419,14 +421,14 @@ class TanhoCamera:
             period_str = (f"{frame_period_s*1000:.1f}ms"
                           if frame_period_s is not None else "n/a")
             chosen_str = f"#{chosen_idx}" if chosen_idx >= 0 else "NONE"
-            print(f"[INFRA] usb-read: valid={data_chunks}/{self._num_chunks} "
-                  f"timeouts={timeouts} errors={errors} "
-                  f"first@{first_data_idx} last@{last_data_idx} "
-                  f"sync_markers={len(real_markers)} (raw={len(markers)}, "
-                  f"misaligned_rejected={rejected_misaligned}) "
-                  f"chosen={chosen_str} wait={wait_ms:.0f}ms "
-                  f"span={data_span_ms:.0f}ms total={total_ms:.0f}ms "
-                  f"frame_period={period_str}", flush=True)
+            console_ui.log(f"usb-read: valid={data_chunks}/{self._num_chunks} "
+                           f"timeouts={timeouts} errors={errors} "
+                           f"first@{first_data_idx} last@{last_data_idx} "
+                           f"sync_markers={len(real_markers)} (raw={len(markers)}, "
+                           f"misaligned_rejected={rejected_misaligned}) "
+                           f"chosen={chosen_str} wait={wait_ms:.0f}ms "
+                           f"span={data_span_ms:.0f}ms total={total_ms:.0f}ms "
+                           f"frame_period={period_str}")
 
         return frame_bytes
 
@@ -441,8 +443,8 @@ class TanhoCamera:
             if frame_bytes is not None:
                 break
             if verbose_timing:
-                print(f"[INFRA] grab: attempt {attempt+1}/{MAX_GRAB_RETRIES} "
-                      "no valid frame, retrying", flush=True)
+                console_ui.log(f"grab: attempt {attempt+1}/{MAX_GRAB_RETRIES} "
+                               "no valid frame, retrying")
         else:
             raise RuntimeError(
                 f"Failed to grab frame after {MAX_GRAB_RETRIES} attempts "
@@ -455,14 +457,13 @@ class TanhoCamera:
             if period_s is not None:
                 measured_ms = period_s * 1000.0
                 delta_ms = measured_ms - exp_ms
-                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
-                      f"measured_frame_period={measured_ms:.1f}ms "
-                      f"(delta={delta_ms:+.1f}ms) grab_total={grab_ms:.0f}ms",
-                      flush=True)
+                console_ui.log(f"grab: requested_exposure={exp_ms:.1f}ms "
+                               f"measured_frame_period={measured_ms:.1f}ms "
+                               f"(delta={delta_ms:+.1f}ms) grab_total={grab_ms:.0f}ms")
             else:
-                print(f"[INFRA] grab: requested_exposure={exp_ms:.1f}ms "
-                      f"measured_frame_period=n/a (only 1 real frame in stream) "
-                      f"grab_total={grab_ms:.0f}ms", flush=True)
+                console_ui.log(f"grab: requested_exposure={exp_ms:.1f}ms "
+                               f"measured_frame_period=n/a (only 1 real frame in stream) "
+                               f"grab_total={grab_ms:.0f}ms")
 
         raw_16 = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(
             self._raw_h, self._raw_w
@@ -473,18 +474,12 @@ class TanhoCamera:
         frame[:, self._raw_w:] = raw_16[1::2]
 
         if verbose_timing:
-            # Fingerprint: MD5 of raw bytes + stats. If two consecutive
-            # captures print the SAME md5 the pipeline is replaying the same
-            # buffer; if md5 differs but stats are near-identical the sensor
-            # is just seeing a stable scene dominated by fixed-pattern noise.
-            import hashlib
-            md5 = hashlib.md5(frame_bytes).hexdigest()[:12]
-            print(f"[INFRA] frame-stats: md5={md5} "
-                  f"mean={frame.mean():.1f} std={frame.std():.1f} "
-                  f"min={int(frame.min())} max={int(frame.max())} "
-                  f"first4={frame_bytes[:4].hex()} "
-                  f"mid4={frame_bytes[len(frame_bytes)//2:len(frame_bytes)//2+4].hex()}",
-                  flush=True)
+            # Enough to tell a replayed buffer from a fresh one; the byte-level
+            # fingerprint (md5 + hex dumps) that used to be printed here was pure
+            # bring-up debugging and has no place on a running station.
+            console_ui.debug(f"frame-stats: mean={frame.mean():.1f} "
+                             f"std={frame.std():.1f} min={int(frame.min())} "
+                             f"max={int(frame.max())}")
 
         return frame
 
@@ -514,8 +509,8 @@ class TanhoCamera:
         cmd2[6] = tb[3]; cmd2[7] = tb[2]
         self._execute_raw_cmd(cmd2)
 
-        print(f"[INFRA] set_exposure: {microseconds/1000:.1f}ms "
-              f"({ticks} ticks @ 7.5us)", flush=True)
+        console_ui.log(f"set_exposure: {microseconds/1000:.1f}ms "
+                       f"({ticks} ticks @ 7.5us)")
 
     def set_gain(self, gain: int):
         """Set gain (0-120)."""
@@ -600,7 +595,7 @@ class _CameraStreamThread(threading.Thread):
                 self._error_count = 0
             except Exception as exc:
                 self._error_count += 1
-                print(f"[INFRA] stream: error #{self._error_count}: {exc}", flush=True)
+                console_ui.log(f"stream: error #{self._error_count}: {exc}")
                 if self._error_count >= 5:
                     self._stop_event.wait(1.0)
 
@@ -637,7 +632,7 @@ class _CameraStreamThread(threading.Thread):
         self._paused.set()
         ok = self._pause_ack.wait(timeout=timeout)
         if not ok:
-            print("[WARN] Stream pause timeout — proceeding anyway", flush=True)
+            console_ui.warn("Stream pause timeout — proceeding anyway")
         return ok
 
     def resume(self):
@@ -737,7 +732,8 @@ class InfraWorkerConsole(threading.Thread):
 
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
-                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
+                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None,
+                 node_name=""):
         super().__init__(daemon=True)
         self.cam = cam
         self.schedule = schedule
@@ -748,11 +744,13 @@ class InfraWorkerConsole(threading.Thread):
         self.save_format = save_format
         self._service = service
         self._bus = WorkerMqtt("infra", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service)
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
         self._last_shot = None
+        self._last_file = None
         self._last_frame = None
         self._active_until = None
         self._pending_capture = None
@@ -834,18 +832,18 @@ class InfraWorkerConsole(threading.Thread):
         try:
             self.cam._flush_usb()
         except Exception as e:
-            print(f"[INFRA] resync flush error: {e}", flush=True)
+            console_ui.log(f"resync flush error: {e}")
         discarded = 0
         for i in range(skip_frames):
             try:
                 self.cam.grab_frame(verbose_timing=False)
                 discarded += 1
             except Exception as e:
-                print(f"[INFRA] resync skip-frame {i} error: {e}", flush=True)
+                console_ui.log(f"resync skip-frame {i} error: {e}")
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(f"[INFRA] resync done: settle={settle_s*1000:.0f}ms, "
-              f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
-              f"(exposure={self.cam.exposure_us/1000:.1f}ms)", flush=True)
+        console_ui.log(f"resync done: settle={settle_s*1000:.0f}ms, "
+                       f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
+                       f"(exposure={self.cam.exposure_us/1000:.1f}ms)")
 
     def _handle_pending_capture(self, stream: "_CameraStreamThread"):
         with self._pending_capture_lock:
@@ -854,12 +852,12 @@ class InfraWorkerConsole(threading.Thread):
         self._pending_capture_event.clear()
         if params is None:
             return
-        print("[INFO] On-demand Infra capture starting", flush=True)
+        console_ui.log("On-demand Infra capture starting")
         self._bus.publish_note("capturing", f"Applying params: {params}")
 
         applied, errors = self._apply_params(params, stream)
         for err in errors:
-            print(f"[WARN] Param apply: {err}")
+            console_ui.warn(f"Param apply: {err}")
 
         exp_s = self.cam.exposure_us / 1e6
         timeout = max(exp_s * 2 + 10.0, 30.0)
@@ -872,45 +870,45 @@ class InfraWorkerConsole(threading.Thread):
             if f is None:
                 self._publish_error("error", "Timeout during warm-up",
                                     on_demand=True)
-                print("[ERROR] On-demand warm-up timeout")
+                console_ui.error("On-demand warm-up timeout")
                 return
 
-        print(f"[INFRA] === on-demand capture ===", flush=True)
+        console_ui.log(f"=== on-demand capture ===")
         frame, frame_ts = stream.wait_for_frame(timeout=timeout,
                                                 stop_event=self._stop_event)
         if frame is None:
             self._publish_error("error", "Timeout waiting for frame",
                                 on_demand=True)
-            print("[ERROR] On-demand capture timeout")
+            console_ui.error("On-demand capture timeout")
             return
         try:
             jpeg_bytes = frame_to_jpeg_bytes(frame)
             self._publish_ok(jpeg_bytes, frame_ts.isoformat(),
                              on_demand=True, params=applied)
-            print("[INFO] On-demand frame sent via MQTT")
+            console_ui.log("On-demand frame sent via MQTT")
         except Exception as exc:
             self._publish_error("error", f"Encode error: {exc}", on_demand=True)
-            print(f"[ERROR] On-demand encode: {exc}")
+            console_ui.error(f"On-demand encode: {exc}")
 
     def _on_mqtt_command(self, topic, payload):
-        print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
+        console_ui.log(f"MQTT cmd received: {topic} "
+                       f"({len(payload) if payload else 0} bytes)")
         if not self._bus.enabled:
             return
         if topic.endswith("/cmd/get_frame"):
             if self._last_frame is None:
                 self._publish_error("no_frame", "No frame captured yet")
-                print("[WARN] Frame requested but no frame available yet")
+                console_ui.warn("Frame requested but no frame available yet")
                 return
             ts = self._last_shot.isoformat() if self._last_shot else None
             try:
                 jpeg_data = frame_to_jpeg_bytes(self._last_frame)
             except Exception as e:
                 self._publish_error("error", str(e), ts)
-                print(f"[ERROR] Frame encode error: {e}")
+                console_ui.error(f"Frame encode error: {e}")
                 return
             self._publish_ok(jpeg_data, ts)
-            print("[INFO] Frame sent via MQTT")
+            console_ui.log("Frame sent via MQTT")
             return
         if topic.endswith("/cmd/capture_frame"):
             params, err = parse_command_params(payload)
@@ -922,10 +920,9 @@ class InfraWorkerConsole(threading.Thread):
             self._pending_capture_event.set()
             self._bus.publish_note("accepted",
                                    f"Request queued with params: {params}")
-            print(f"[INFO] On-demand capture queued with params: {params}",
-                  flush=True)
+            console_ui.log(f"On-demand capture queued with params: {params}")
             return
-        print(f"[infra:{self.instance_name}] Unknown command: {topic}", flush=True)
+        console_ui.log(f"Unknown command: {topic}")
 
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
@@ -972,9 +969,9 @@ class InfraWorkerConsole(threading.Thread):
         # захват без пауз, идентично preview-режиму.
         stream = _CameraStreamThread(self.cam)
         stream.start()
-        print("[INFO] Infra camera stream thread started")
+        console_ui.log("Infra camera stream thread started")
 
-        print("[INFO] Infra camera measurement started")
+        console_ui.log("Infra camera measurement started")
         self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
@@ -1011,7 +1008,7 @@ class InfraWorkerConsole(threading.Thread):
                     self._errors += 1
                     self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        print(f"[ERROR] {consecutive_errors} consecutive errors, stopping")
+                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
@@ -1023,7 +1020,7 @@ class InfraWorkerConsole(threading.Thread):
         stream.join(timeout=frame_timeout)
         self._save_status("stopped", force=True)
         self._bus.shutdown()
-        print("[INFO] Infra camera measurement stopped")
+        console_ui.log("Infra camera measurement stopped")
 
     def _capture_one_stream(self, now, stream: "_CameraStreamThread",
                              timeout: float) -> bool:
@@ -1039,20 +1036,20 @@ class InfraWorkerConsole(threading.Thread):
         ext = ext_map.get(self.save_format, "tiff")
         filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
 
-        print(f"[INFRA] === scheduled capture {timestamp} — "
-              f"waiting for frame (timeout={timeout:.0f}s) ===", flush=True)
+        console_ui.log(f"=== scheduled capture {timestamp} — "
+                       f"waiting for frame (timeout={timeout:.0f}s) ===")
         t0 = time.perf_counter()
         frame, frame_ts = stream.wait_for_frame(timeout=timeout,
                                                 stop_event=self._stop_event)
         wait_ms = (time.perf_counter() - t0) * 1000.0
 
         if frame is None:
-            print(f"[ERROR] Capture timeout after {wait_ms/1000:.1f}s "
-                  f"(scheduled {timestamp})", flush=True)
+            console_ui.error(f"Capture timeout after {wait_ms/1000:.1f}s "
+                             f"(scheduled {timestamp})")
             return False
 
-        print(f"[INFRA] Frame received: waited {wait_ms:.0f}ms, "
-              f"frame_ts={frame_ts.isoformat()}", flush=True)
+        console_ui.log(f"Frame received: waited {wait_ms:.0f}ms, "
+                       f"frame_ts={frame_ts.isoformat()}")
         try:
             if self.save_format == "fits":
                 save_fits(filepath, frame,
@@ -1064,12 +1061,13 @@ class InfraWorkerConsole(threading.Thread):
             else:
                 save_png(filepath, frame)
             self._last_frame = frame
+            self._last_file = os.path.basename(filepath)
             if self._service is not None:
                 self._service.publish_frame(frame, frame_ts or now)
-            print(f"[INFO] Shot saved: {os.path.basename(filepath)}")
+            console_ui.log(f"Shot saved: {self._last_file}")
             return True
         except Exception as exc:
-            print(f"[ERROR] Save error: {exc}")
+            console_ui.error(f"Save error: {exc}")
             return False
 
     def _save_status(self, status, force=False):
@@ -1090,9 +1088,21 @@ class InfraWorkerConsole(threading.Thread):
             "last_update": dt.now().isoformat(),
         }
         try:
-            payload["system"] = get_system_info(self.output_dir)
+            system = get_system_info(self.output_dir)
+            payload["system"] = system
+            console_ui.update(disk_free_mb=system.get("disk_free_mb"))
         except Exception:
             pass
+        console_ui.update(status=status, frames=self._shots, errors=self._errors,
+                          output_dir=self.output_dir,
+                          last_file=self._last_file)
+        console_ui.set_section("camera", [
+            ("Exposure:", f"{self.cam.exposure_us / 1000:.1f} ms"),
+            ("Gain:", str(self.cam.gain)),
+            ("ROI:", f"{self.cam.roi_width}x{self.cam.roi_height}"),
+            ("Window ends:", self._active_until.strftime("%Y-%m-%d %H:%M:%S")
+             if self._active_until else "-"),
+        ])
         self._bus.publish_status(payload, force=force)
 
 
@@ -1105,12 +1115,12 @@ def run_preview_infra(cam, instance_name):
     # Write to a scratch file and rename into place: writing straight to
     # preview_path let readers pick up a half-written FITS.
     tmp_path = preview_path + ".tmp"
-    print(f"[INFO] Preview mode: writing {preview_path} (Ctrl+C to stop)")
+    console_ui.log(f"Preview mode: writing {preview_path} (Ctrl+C to stop)")
 
     stop = threading.Event()
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping preview...")
+        console_ui.log("Stopping preview…")
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -1127,15 +1137,15 @@ def run_preview_infra(cam, instance_name):
             if frames % 10 == 0:
                 elapsed = (dt.now() - t0).total_seconds()
                 fps = frames / elapsed if elapsed > 0 else 0
-                print(f"[INFO] Preview: {frames} frames, {fps:.1f} FPS")
+                console_ui.log(f"Preview: {frames} frames, {fps:.1f} FPS")
         except Exception as exc:
-            print(f"[ERROR] Preview frame error: {exc}")
+            console_ui.error(f"Preview frame error: {exc}")
             time.sleep(0.1)
 
 
-def run_console_infra(config_path=None, preview=False):
+def run_console_infra(config_path=None, preview=False, verbose=False):
     """Run Infra camera measurement in console mode."""
-    from utils import load_config
+    from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
@@ -1143,6 +1153,7 @@ def run_console_infra(config_path=None, preview=False):
     mqtt_cfg = cfg.get("mqtt", {})
 
     instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
+    node_name = get_node_name(cfg)
     output_dir = infra_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     schedule_file = infra_cfg.get("schedule_file", "")
@@ -1152,43 +1163,58 @@ def run_console_infra(config_path=None, preview=False):
     roi = infra_cfg.get("roi", DEFAULT_ROI)
     save_format = infra_cfg.get("save_format", "tiff")
 
-    print("=" * 60)
-    print("  Every Camera -- Infra (SW1300 SWIR) Console Mode" + ("  [PREVIEW]" if preview else ""))
-    print(f"  Instance      : {instance_name}")
-    if not preview:
-        print(f"  Capture at    : {capture_seconds} seconds of each minute")
-    print(f"  Exposure      : {exposure_us} us")
-    print(f"  Gain          : {gain_val}")
-    print(f"  ROI           : {roi}")
-    if not preview:
-        print(f"  Save format   : {save_format}")
-    print("=" * 60)
+    dash = console_ui.start_dashboard("infra", instance_name, verbose=verbose)
+    dash.update(status="starting", node_name=node_name, output_dir=output_dir,
+                frames=0, errors=0,
+                schedule=f"capture at {capture_seconds} s of each minute")
+    dash.set_section("device", [
+        ("Exposure:", f"{exposure_us} us"),
+        ("Gain:", str(gain_val)),
+        ("ROI:", str(roi)),
+        ("Save format:", save_format),
+    ])
+    try:
+        _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
+                           instance_name, node_name, output_dir, status_dir,
+                           schedule_file, capture_seconds, exposure_us, gain_val,
+                           roi, save_format)
+    finally:
+        dash.stop()
+
+
+def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
+                       instance_name, node_name, output_dir, status_dir,
+                       schedule_file, capture_seconds, exposure_us, gain_val,
+                       roi, save_format):
+    """Body of :func:`run_console_infra`, with the dashboard already running."""
+    from mqtt_client import create_console_publisher
 
     if preview:
-        print("[INFO] Connecting to Infra camera...")
+        console_ui.log("Connecting to Infra camera...")
         cam = TanhoCamera()
         try:
             cam.connect()
         except Exception as exc:
-            print(f"[ERROR] Failed to connect camera: {exc}")
+            console_ui.error(f"Failed to connect camera: {exc}")
             sys.exit(1)
         cam.set_exposure(exposure_us)
         cam.set_gain(gain_val)
         if roi in ROI_MODES:
             w, h = ROI_MODES[roi]
             cam.set_roi(w, h)
-        print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height}")
+        console_ui.log(f"Connected: {cam.roi_width}x{cam.roi_height}")
         try:
             run_preview_infra(cam, instance_name)
         finally:
             cam.disconnect()
-        print("[INFO] Done.")
+        console_ui.log("Done.")
         return
 
     if not output_dir or not schedule_file:
-        print("[INFO] Configuration incomplete. Starting setup wizard...")
+        console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_infra
-        configure_console_infra(cfg, config_path)
+        with dash.suspended():          # the wizard needs a plain terminal
+            configure_console_infra(cfg, config_path)
         infra_cfg = cfg.get("infra", {})
         instance_name = infra_cfg.get("instance_name") or get_instance_name("Infra")
         output_dir = infra_cfg.get("output_dir", "")
@@ -1200,34 +1226,34 @@ def run_console_infra(config_path=None, preview=False):
         save_format = infra_cfg.get("save_format", "tiff")
 
     if not output_dir:
-        print("[ERROR] output_dir is required.")
+        console_ui.error("output_dir is required.")
         sys.exit(1)
     if not schedule_file:
-        print("[ERROR] schedule_file is required.")
+        console_ui.error("schedule_file is required.")
         sys.exit(1)
     if not os.path.exists(schedule_file):
-        print(f"[ERROR] Schedule file not found: {schedule_file}")
+        console_ui.error(f"Schedule file not found: {schedule_file}")
         sys.exit(1)
 
     entries, errors = load_schedule_file(schedule_file)
     for err in errors:
-        print(f"[WARN] Schedule: {err}")
+        console_ui.warn(f"Schedule: {err}")
     if not entries:
-        print("[ERROR] No valid schedule entries found.")
+        console_ui.error("No valid schedule entries found.")
         sys.exit(1)
 
-    print(f"[INFO] Loaded {len(entries)} schedule intervals")
-    print(f"[INFO] Output directory: {output_dir}")
+    console_ui.log(f"Loaded {len(entries)} schedule intervals")
+    console_ui.log(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
 
     # Connect camera
-    print("[INFO] Connecting to Infra camera...")
+    console_ui.log("Connecting to Infra camera...")
     cam = TanhoCamera()
     try:
         cam.connect()
     except Exception as exc:
-        print(f"[ERROR] Failed to connect camera: {exc}")
+        console_ui.error(f"Failed to connect camera: {exc}")
         sys.exit(1)
 
     # Order matters: set_roi() resets exposure/gain registers, so ROI first,
@@ -1240,8 +1266,8 @@ def run_console_infra(config_path=None, preview=False):
     time.sleep(0.05)
     cam.set_exposure(exposure_us)
     time.sleep(0.05)
-    print(f"[INFO] Connected: {cam.roi_width}x{cam.roi_height} "
-          f"exposure_us={exposure_us} gain={gain_val}")
+    console_ui.log(f"Connected: {cam.roi_width}x{cam.roi_height} "
+                   f"exposure_us={exposure_us} gain={gain_val}")
 
     # Let the camera settle after exposure/gain/ROI so the first scheduled
     # frame is actually captured with the configured exposure, not a stale
@@ -1259,17 +1285,22 @@ def run_console_infra(config_path=None, preview=False):
         try:
             cam.grab_frame(verbose_timing=False)
         except Exception as exc:
-            print(f"[WARN] Warm-up frame {i} failed: {exc}")
-    print(f"[INFO] Warm-up done (settle={settle_s*1000:.0f}ms + {skip_n} skip frames)")
+            console_ui.warn(f"Warm-up frame {i} failed: {exc}")
+    console_ui.log(f"Warm-up done (settle={settle_s*1000:.0f}ms + {skip_n} skip frames)")
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "infra")
+    if mqtt_pub:
+        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
     from frame_server import start_frame_server
-    service = CameraService("infra", instance_name, output_dir)
+    service = CameraService("infra", instance_name, output_dir,
+                            node_name=node_name)
     server = start_frame_server(cfg.get("server", {}), service)
+    if server:
+        dash.update(server_url=server.url)
 
     worker = InfraWorkerConsole(
         cam=cam,
@@ -1282,20 +1313,25 @@ def run_console_infra(config_path=None, preview=False):
         mqtt_publisher=mqtt_pub,
         mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
+        node_name=node_name,
     )
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping (Ctrl+C)...")
+        console_ui.log("Ctrl+C — stopping…")
         worker.request_stop()
     signal.signal(signal.SIGINT, _sigint)
 
-    print("[INFO] Starting. Press Ctrl+C to stop.")
-    worker.start()
-    worker.join()
-
-    cam.disconnect()
-    if server:
-        server.stop()
-    if mqtt_pub:
-        mqtt_pub.disconnect_broker()
-    print("[INFO] Done.")
+    console_ui.log("Starting. Press Ctrl+C to stop.")
+    try:
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    finally:
+        cam.disconnect()
+        if server:
+            server.stop()
+        if mqtt_pub:
+            try:
+                mqtt_pub.disconnect_broker()
+            except Exception:
+                pass

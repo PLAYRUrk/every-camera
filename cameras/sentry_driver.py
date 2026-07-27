@@ -32,6 +32,8 @@ import subprocess
 import threading
 import time
 
+import console_ui
+
 import numpy as np
 
 from datetime import datetime as dt
@@ -208,24 +210,23 @@ class SentryCamera:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        print(f"[SENTRY] Launched {self._start_bin}", flush=True)
+        console_ui.log(f"Launched {self._start_bin}")
 
     def stop(self):
         """Request graceful shutdown by writing '10' to stop_file."""
         try:
             self._stop_file.write_text("10")
-            print("[SENTRY] Wrote stop_file=10, daemon will stop after current cycle.",
-                  flush=True)
+            console_ui.log("Wrote stop_file=10, daemon will stop after current cycle.")
         except Exception as exc:
-            print(f"[SENTRY] Could not write stop_file: {exc}", flush=True)
+            console_ui.log(f"Could not write stop_file: {exc}")
 
     def resume(self):
         """Resume imaging by writing '11' to stop_file."""
         try:
             self._stop_file.write_text("11")
-            print("[SENTRY] Wrote stop_file=11, resuming imaging.", flush=True)
+            console_ui.log("Wrote stop_file=11, resuming imaging.")
         except Exception as exc:
-            print(f"[SENTRY] Could not write stop_file: {exc}", flush=True)
+            console_ui.log(f"Could not write stop_file: {exc}")
 
     # ------------------------------------------------------------------
     # Status reads
@@ -270,8 +271,7 @@ class SentryCamera:
             os.replace(tmp, target)
             return target
         except Exception as exc:
-            print(f"[WARN] SENTRY: could not archive image.fits: {exc}",
-                  flush=True)
+            console_ui.warn(f"SENTRY: could not archive image.fits: {exc}")
             try:
                 os.remove(tmp)
             except OSError:
@@ -288,7 +288,7 @@ class SentryCamera:
         with open(tmp, "w") as f:
             f.write(text)
         os.replace(tmp, str(self._schedule_conf))
-        print(f"[SENTRY] Wrote {self._schedule_conf}", flush=True)
+        console_ui.log(f"Wrote {self._schedule_conf}")
 
 
 # Kept as module-level names for backwards compatibility; the implementations
@@ -312,7 +312,7 @@ class SentryWorkerConsole(threading.Thread):
     def __init__(self, cam: SentryCamera, output_dir: str, instance_name: str,
                  status_dir: str, capture_seconds: list,
                  mqtt_publisher=None, mqtt_prefix: str = "every_camera",
-                 service=None):
+                 service=None, node_name: str = ""):
         super().__init__(daemon=True)
         self.cam = cam
         self.output_dir = output_dir
@@ -321,7 +321,8 @@ class SentryWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds)
         self._service = service
         self._bus = WorkerMqtt("sentry", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service)
+                               mqtt_publisher, mqtt_prefix, service=service,
+                               node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0          # frames published (not necessarily captured)
         self._errors = 0
@@ -354,8 +355,8 @@ class SentryWorkerConsole(threading.Thread):
     # MQTT commands
     # ------------------------------------------------------------------
     def _on_mqtt_command(self, topic: str, payload):
-        print(f"[sentry:{self.instance_name}] MQTT cmd: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
+        console_ui.log(f"MQTT cmd: {topic} "
+                       f"({len(payload) if payload else 0} bytes)")
         if not self._bus.enabled:
             return
         if topic.endswith("/cmd/get_frame"):
@@ -365,7 +366,7 @@ class SentryWorkerConsole(threading.Thread):
             # sentry camera schedule is autonomous; treat as get_frame
             self._pending_get_frame.set()
             return
-        print(f"[sentry:{self.instance_name}] Unknown command: {topic}", flush=True)
+        console_ui.log(f"Unknown command: {topic}")
 
     # ------------------------------------------------------------------
     # Main loop
@@ -376,14 +377,14 @@ class SentryWorkerConsole(threading.Thread):
 
         # Start daemon if not already running
         if not self.cam.is_running():
-            print("[SENTRY] imagerd_rt not running — starting daemon...", flush=True)
+            console_ui.log("imagerd_rt not running — starting daemon...")
             try:
                 self.cam.start()
                 time.sleep(2)  # give it a moment to initialise
             except Exception as exc:
-                print(f"[ERROR] Could not start imagerd_rt: {exc}", flush=True)
+                console_ui.error(f"Could not start imagerd_rt: {exc}")
 
-        print("[INFO] Sentry measurement worker started")
+        console_ui.log("Sentry measurement worker started")
         self._save_status("running", force=True)
 
         last_fired = (-1, -1)
@@ -418,12 +419,12 @@ class SentryWorkerConsole(threading.Thread):
 
         # Graceful stop
         if self.cam.is_running():
-            print("[SENTRY] Stopping imagerd_rt daemon...", flush=True)
+            console_ui.log("Stopping imagerd_rt daemon...")
             self.cam.stop()
 
         self._save_status("stopped", force=True)
         self._bus.shutdown()
-        print("[INFO] Sentry measurement worker stopped")
+        console_ui.log("Sentry measurement worker stopped")
 
     def _archive_latest(self, now):
         """Keep a dated copy of the daemon's latest FITS in output_dir."""
@@ -431,7 +432,7 @@ class SentryWorkerConsole(threading.Thread):
             return
         path = self.cam.archive_latest_image(self.output_dir, now)
         if path:
-            print(f"[INFO] SENTRY archived: {os.path.basename(path)}")
+            console_ui.log(f"SENTRY archived: {os.path.basename(path)}")
 
     def _handle_focus(self, now):
         """Publish new daemon frames to the LAN live view.
@@ -458,7 +459,7 @@ class SentryWorkerConsole(threading.Thread):
                 "no_frame", "No image available yet (aux/image.fits missing)",
                 ts_iso=dt.now().isoformat(), on_demand=on_demand,
             )
-            print("[WARN] SENTRY: no image.fits available yet")
+            console_ui.warn("SENTRY: no image.fits available yet")
             return
         try:
             meta = self.cam.get_metadata()
@@ -470,12 +471,12 @@ class SentryWorkerConsole(threading.Thread):
             jpeg = frame_to_jpeg_bytes(frame)
             ts = meta.get("ExpoTime") or dt.now().isoformat()
             self._publish_frame(jpeg, ts, metadata=meta, on_demand=on_demand)
-            print(f"[INFO] SENTRY frame published (seqno={self._last_seqno})")
+            console_ui.log(f"SENTRY frame published (seqno={self._last_seqno})")
         except Exception as exc:
             self._errors += 1
             self._publish_frame_error("error", str(exc), ts_iso=dt.now().isoformat(),
                                       on_demand=on_demand)
-            print(f"[ERROR] SENTRY frame publish: {exc}")
+            console_ui.error(f"SENTRY frame publish: {exc}")
 
     def _save_status(self, status: str, force: bool = False):
         meta = self.cam.get_metadata()
@@ -500,9 +501,22 @@ class SentryWorkerConsole(threading.Thread):
             if key in meta:
                 payload[key.lower()] = meta[key]
         try:
-            payload["system"] = get_system_info(self.output_dir or None)
+            system = get_system_info(self.output_dir or None)
+            payload["system"] = system
+            console_ui.update(disk_free_mb=system.get("disk_free_mb"))
         except Exception:
             pass
+        console_ui.update(status=status, frames=self._shots, errors=self._errors,
+                          output_dir=self.output_dir,
+                          detail=f"seqno {seqno}" if seqno and seqno > 0 else None)
+        console_ui.set_section("camera", [
+            ("Daemon:", "running" if payload["daemon_running"] else "not running"),
+            ("Sequence number:", str(seqno)),
+            ("Sensor temperature:", str(meta.get("CCDTemp", "n/a"))),
+            ("Exposure / binning:", f"{meta.get('Exposure', '?')} · "
+                                    f"{meta.get('Binning', '?')}"),
+            ("Filter:", str(meta.get("FilterPo", "?"))),
+        ])
         self._bus.publish_status(payload, force=force)
 
 
@@ -512,13 +526,13 @@ class SentryWorkerConsole(threading.Thread):
 def run_preview_sentry(cam: SentryCamera, instance_name: str):
     """Continuously read aux/image.fits and overwrite preview_{name}.fits."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.fits")
-    print(f"[INFO] SENTRY preview: reading {cam._image_file} → {preview_path}")
-    print("[INFO] Press Ctrl+C to stop.")
+    console_ui.log(f"SENTRY preview: reading {cam._image_file} → {preview_path}")
+    console_ui.log("Press Ctrl+C to stop.")
 
     stop = threading.Event()
 
     def _sigint(sig, frame):
-        print("\n[INFO] Stopping preview...")
+        console_ui.log("Stopping preview…")
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -538,20 +552,20 @@ def run_preview_sentry(cam: SentryCamera, instance_name: str):
                     elapsed = (dt.now() - t0).total_seconds()
                     fps = frames / elapsed if elapsed > 0 else 0
                     meta = cam.get_metadata()
-                    print(f"[INFO] Preview: frame {frames}, {fps:.2f} fps, "
-                          f"seqno={seqno}, "
-                          f"temp={meta.get('CCDTemp', '?')}")
+                    console_ui.log(f"Preview: frame {frames}, {fps:.2f} fps, "
+                                   f"seqno={seqno}, "
+                                   f"temp={meta.get('CCDTemp', '?')}")
             except Exception as exc:
-                print(f"[ERROR] Preview copy: {exc}")
+                console_ui.error(f"Preview copy: {exc}")
         time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
-def run_console_sentry(config_path=None, preview=False):
+def run_console_sentry(config_path=None, preview=False, verbose=False):
     """Run Sentry (imagerd_rt) camera in console mode."""
-    from utils import load_config
+    from utils import load_config, get_node_name
     from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
@@ -559,79 +573,89 @@ def run_console_sentry(config_path=None, preview=False):
     mqtt_cfg = cfg.get("mqtt", {})
 
     instance_name = sentry_cfg.get("instance_name") or get_instance_name("Sentry")
+    node_name = get_node_name(cfg)
     imagerd_rt_dir = sentry_cfg.get("imagerd_rt_dir", "/usr/local/imagerd_rt")
     output_dir = sentry_cfg.get("output_dir", "")
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
     capture_seconds = sentry_cfg.get("capture_seconds", SENTRY_CAPTURE_SECONDS)
 
-    print("=" * 60)
-    print("  Every Camera — Sentry (imagerd_rt) Console Mode"
-          + ("  [PREVIEW]" if preview else ""))
-    print(f"  Instance       : {instance_name}")
-    print(f"  imagerd_rt dir : {imagerd_rt_dir}")
-    if not preview:
-        print(f"  Capture at     : {capture_seconds} seconds of each minute")
-    print("=" * 60)
+    dash = console_ui.start_dashboard("sentry", instance_name, verbose=verbose)
+    dash.update(status="starting", node_name=node_name, output_dir=output_dir,
+                frames=0, errors=0)
+    dash.set_section("device", [
+        ("imagerd_rt dir:", imagerd_rt_dir),
+        ("Publish at:", f"{capture_seconds} s of each minute"),
+    ])
 
     cam = SentryCamera(imagerd_rt_dir)
+    mqtt_pub = None
+    server = None
+    try:
+        if not cam.is_available():
+            console_ui.error(f"imagerd_rt not found at: {imagerd_rt_dir} — set "
+                             f"sentry.imagerd_rt_dir in config.json.")
+            return
 
-    if not cam.is_available():
-        print(f"[ERROR] imagerd_rt not found at: {imagerd_rt_dir}")
-        print("        Set sentry.imagerd_rt_dir in config.json to the correct path.")
-        sys.exit(1)
+        if preview:
+            run_preview_sentry(cam, instance_name)
+            return
 
-    if preview:
-        run_preview_sentry(cam, instance_name)
-        print("[INFO] Done.")
-        return
+        # Write schedule.conf from config if slots are defined
+        if sentry_cfg.get("slots"):
+            try:
+                cam.write_schedule_conf(sentry_cfg)
+            except Exception as exc:
+                console_ui.warn(f"Could not write schedule.conf: {exc}")
 
-    # Write schedule.conf from config if slots are defined
-    if sentry_cfg.get("slots"):
-        try:
-            cam.write_schedule_conf(sentry_cfg)
-        except Exception as exc:
-            print(f"[WARN] Could not write schedule.conf: {exc}")
+        if not output_dir:
+            console_ui.log("sentry.output_dir not set. Status/MQTT still work; "
+                           "FITS archives go wherever imagerd_rt is configured.")
 
-    if not output_dir:
-        print("[INFO] sentry.output_dir not set. Status/MQTT still work; "
-              "FITS archives go wherever imagerd_rt is configured.")
+        os.makedirs(status_dir, exist_ok=True)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
-    os.makedirs(status_dir, exist_ok=True)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "sentry")
+        if mqtt_pub:
+            dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
-    mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "sentry")
+        # LAN frame server (archive browsing + live view). Never fatal.
+        # imagerd_rt owns exposure/schedule, so no remote parameter editing.
+        from camera_service import CameraService
+        from frame_server import start_frame_server
+        service = CameraService("sentry", instance_name, output_dir,
+                                supports_params=False, node_name=node_name)
+        server = start_frame_server(cfg.get("server", {}), service)
+        if server:
+            dash.update(server_url=server.url)
 
-    # LAN frame server (archive browsing + live view). Never fatal.
-    # imagerd_rt owns exposure/schedule, so no remote parameter editing.
-    from camera_service import CameraService
-    from frame_server import start_frame_server
-    service = CameraService("sentry", instance_name, output_dir,
-                            supports_params=False)
-    server = start_frame_server(cfg.get("server", {}), service)
+        worker = SentryWorkerConsole(
+            cam=cam,
+            output_dir=output_dir,
+            instance_name=instance_name,
+            status_dir=status_dir,
+            capture_seconds=capture_seconds,
+            mqtt_publisher=mqtt_pub,
+            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
+            service=service,
+            node_name=node_name,
+        )
 
-    worker = SentryWorkerConsole(
-        cam=cam,
-        output_dir=output_dir,
-        instance_name=instance_name,
-        status_dir=status_dir,
-        capture_seconds=capture_seconds,
-        mqtt_publisher=mqtt_pub,
-        mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
-        service=service,
-    )
+        def _sigint(sig, frame):
+            console_ui.log("Ctrl+C — stopping…")
+            worker.request_stop()
+        signal.signal(signal.SIGINT, _sigint)
 
-    def _sigint(sig, frame):
-        print("\n[INFO] Stopping (Ctrl+C)...")
-        worker.request_stop()
-    signal.signal(signal.SIGINT, _sigint)
-
-    print("[INFO] Starting. Press Ctrl+C to stop.")
-    worker.start()
-    worker.join()
-
-    if server:
-        server.stop()
-    if mqtt_pub:
-        mqtt_pub.disconnect_broker()
-    print("[INFO] Done.")
+        console_ui.log("Starting. Press Ctrl+C to stop.")
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    finally:
+        if server:
+            server.stop()
+        if mqtt_pub:
+            try:
+                mqtt_pub.disconnect_broker()
+            except Exception:
+                pass
+        dash.stop()

@@ -65,6 +65,31 @@ PARAM_SCHEMAS = {
          "choices": [{"value": "1280x1024", "label": "1280 x 1024"},
                      {"value": "1280x256", "label": "1280 x 256"}]},
     ],
+    # The ASI driver applies these between exposures, never during one, so the
+    # observing programme is never interrupted; the next scheduled slot restores
+    # whatever the schedule asks for.
+    "asi": [
+        {"name": "exposure", "label": "Exposure (s)", "type": "float",
+         "min": 0.001, "max": 3600.0, "step": 0.5},
+        {"name": "binning", "label": "Binning", "type": "choice",
+         "choices": [{"value": 1, "label": "1x1"},
+                     {"value": 2, "label": "2x2"},
+                     {"value": 4, "label": "4x4"},
+                     {"value": 8, "label": "8x8"}]},
+        {"name": "gain", "label": "Analog gain", "type": "choice",
+         "choices": [{"value": 1, "label": "1 — Low"},
+                     {"value": 2, "label": "2 — Medium"},
+                     {"value": 3, "label": "3 — High"}]},
+        {"name": "filter", "label": "Filter", "type": "choice",
+         "choices": [{"value": 1, "label": "1 — 557.7 nm"},
+                     {"value": 2, "label": "2 — 630.0 nm"},
+                     {"value": 3, "label": "3 — OH broadband"},
+                     {"value": 4, "label": "4 — 840.0 nm"},
+                     {"value": 5, "label": "5 — 846.5 nm"},
+                     {"value": 6, "label": "6 — 857.0 nm"}]},
+        {"name": "target_temp", "label": "Sensor setpoint (°C)", "type": "float",
+         "min": -80.0, "max": 25.0, "step": 1.0},
+    ],
     # imagerd_rt owns the sentry schedule; parameters live in schedule.conf and
     # only take effect on a daemon restart, so live editing is not offered.
     "sentry": [],
@@ -83,10 +108,13 @@ class CameraService:
     """Shared state between one camera worker and the local frame server."""
 
     def __init__(self, camera_type, instance_name, output_dir="",
-                 supports_focus=True, supports_params=True):
+                 supports_focus=True, supports_params=True, node_name=""):
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.output_dir = output_dir or ""
+        # Friendly name of the machine; travels with every status snapshot and
+        # discovery reply so observers see a place, not an address.
+        self.node_name = node_name or ""
         self.supports_focus = bool(supports_focus)
         self.supports_params = bool(supports_params)
 
@@ -102,7 +130,7 @@ class CameraService:
 
         # Status snapshot
         self._status = {"status": "starting", "instance_name": instance_name,
-                        "camera_type": camera_type}
+                        "camera_type": camera_type, "node_name": self.node_name}
 
         # Parameter requests: single pending slot, latest wins
         self._pending_params = None      # (req_id, params_dict)
@@ -252,6 +280,7 @@ class CameraService:
     def status(self):
         with self._lock:
             snap = dict(self._status)
+            snap.setdefault("node_name", self.node_name)
             snap["focus_active"] = time.monotonic() < self._focus_deadline
             if self._focus_disabled_reason:
                 snap["focus_note"] = self._focus_disabled_reason
@@ -266,6 +295,7 @@ class CameraService:
             return {
                 "instance_name": self.instance_name,
                 "camera_type": self.camera_type,
+                "node_name": self.node_name,
                 "output_dir": self.output_dir,
                 "supports_focus": self.supports_focus,
                 "supports_params": self.supports_params and bool(self._param_schema),
@@ -332,9 +362,12 @@ class NullService(CameraService):
     camera is attached.
     """
 
-    def __init__(self, output_dir, instance_name="archive", camera_type="unknown"):
+    def __init__(self, output_dir, instance_name="archive", camera_type="unknown",
+                 node_name=""):
         super().__init__(camera_type, instance_name, output_dir,
-                         supports_focus=False, supports_params=False)
+                         supports_focus=False, supports_params=False,
+                         node_name=node_name)
         self.publish_status({"status": "archive-only",
                              "instance_name": instance_name,
-                             "camera_type": camera_type})
+                             "camera_type": camera_type,
+                             "node_name": self.node_name})

@@ -7,6 +7,8 @@ import json
 import socket
 import uuid
 
+import console_ui
+
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
@@ -79,14 +81,13 @@ class MqttPublisherConsole:
         self._check_timer = None
 
     def connect_broker(self):
-        print(f"[INFO] MQTT connecting to {self._host}:{self._port}...",
-              flush=True)
+        console_ui.log(f"MQTT connecting to {self._host}:{self._port}...")
         try:
             self._client.reconnect_delay_set(min_delay=2, max_delay=30)
             self._client.connect_async(self._host, self._port, keepalive=120)
             self._client.loop_start()
         except Exception as exc:
-            print(f"[WARN] MQTT connect error: {exc}", flush=True)
+            console_ui.warn(f"MQTT connect error: {exc}")
             return
         # Async — schedule a diagnostic check after a few seconds.
         import threading as _th
@@ -94,9 +95,9 @@ class MqttPublisherConsole:
         def _check_connected():
             if self._client.is_connected():
                 return
-            print(f"[WARN] MQTT still NOT connected to {self._host}:{self._port} "
-                  f"after 3s. Check network/firewall/credentials. "
-                  f"Commands from monitor will not be received.", flush=True)
+            console_ui.warn(f"MQTT still NOT connected to {self._host}:{self._port} "
+                            f"after 3s. Check network/firewall/credentials. "
+                            f"Commands from monitor will not be received.")
         self._check_timer = _th.Timer(3.0, _check_connected)
         self._check_timer.daemon = True
         self._check_timer.start()
@@ -139,36 +140,33 @@ class MqttPublisherConsole:
         self._on_command_cb = callback
         if self._client.is_connected():
             self._client.subscribe(self._sub_topic, qos=1)
-            print(f"[INFO] MQTT subscribed: {topic}", flush=True)
+            console_ui.log(f"MQTT subscribed: {topic}")
         else:
-            print(f"[INFO] MQTT subscription pending (not connected yet): {topic}",
-                  flush=True)
+            console_ui.log(f"MQTT subscription pending (not connected yet): {topic}")
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
-            print("[INFO] MQTT connected", flush=True)
+            console_ui.log("MQTT connected")
             if self._sub_topic:
                 client.subscribe(self._sub_topic, qos=1)
-                print(f"[INFO] MQTT subscribed on connect: {self._sub_topic}",
-                      flush=True)
+                console_ui.log(f"MQTT subscribed on connect: {self._sub_topic}")
         else:
-            print(f"[WARN] MQTT connection refused (rc={reason_code})", flush=True)
+            console_ui.warn(f"MQTT connection refused (rc={reason_code})")
 
     def _on_disconnect(self, client, userdata, disconnect_flags=None,
                        reason_code=None, properties=None):
-        print(f"[WARN] MQTT disconnected (rc={reason_code})", flush=True)
+        console_ui.warn(f"MQTT disconnected (rc={reason_code})")
 
     def _on_message(self, client, userdata, msg):
-        print(f"[INFO] MQTT message received: {msg.topic} "
-              f"({len(msg.payload)} bytes)", flush=True)
+        console_ui.log(f"MQTT message received: {msg.topic} "
+                       f"({len(msg.payload)} bytes)")
         if self._on_command_cb:
             try:
                 self._on_command_cb(msg.topic, msg.payload)
             except Exception as e:
-                print(f"[ERROR] MQTT callback error: {e}", flush=True)
+                console_ui.error(f"MQTT callback error: {e}")
         else:
-            print("[WARN] MQTT message received but no callback registered",
-                  flush=True)
+            console_ui.warn("MQTT message received but no callback registered")
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +363,7 @@ def create_console_publisher(mqtt_cfg, instance_name=None, camera_type=None):
     """
     if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
         if mqtt_cfg.get("enabled") and not MQTT_AVAILABLE:
-            print("[WARN] MQTT disabled: install paho-mqtt")
+            console_ui.warn("MQTT disabled: install paho-mqtt")
         return None
     will_topic = will_payload = None
     if instance_name:
@@ -385,5 +383,5 @@ def create_console_publisher(mqtt_cfg, instance_name=None, camera_type=None):
         pub.connect_broker()
         return pub
     except Exception as exc:
-        print(f"[WARN] MQTT setup failed: {exc}")
+        console_ui.warn(f"MQTT setup failed: {exc}")
         return None
