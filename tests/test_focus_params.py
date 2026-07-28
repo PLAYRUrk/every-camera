@@ -28,6 +28,9 @@ SCHEMA = [
      "min": 0.001, "max": 60.0, "step": 0.1},
     {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
      "true_label": "open", "false_label": "closed"},
+    {"name": "filter", "label": "Filter", "type": "choice",
+     "choices": [{"value": 0, "label": "0 — home"},
+                 {"value": 1, "label": "1 — 557.7 nm"}]},
 ]
 
 
@@ -83,6 +86,16 @@ def test_an_unknown_state_is_shown_unticked_rather_than_guessed(qt_app):
 # -- what gets sent ----------------------------------------------------------
 def test_an_untouched_form_sends_nothing(form):
     assert form.values() == {}
+
+
+def test_a_field_the_camera_never_reported_is_not_sent(qt_app):
+    # The ASI wheel reports no position until a move is confirmed, so the combo
+    # shows its first choice — "home". Reading that back as an edit made Apply
+    # command a ten-second homing move that nobody had asked for.
+    form = ParamForm()
+    form.build(SCHEMA, {"exposure": 2.0, "shutter": False})   # no filter
+    form._widgets["shutter"][1].setChecked(True)
+    assert form.values() == {"shutter": True}
 
 
 def test_ticking_the_box_sends_the_new_state(form):
@@ -146,6 +159,24 @@ def test_the_mark_goes_away_once_the_camera_has_the_value(form):
     assert form._labels["shutter"].text() == "Shutter"
     assert form.edited_fields() == []
     assert form.values() == {}
+
+
+def test_the_mark_goes_out_when_the_camera_reports_the_applied_value(form):
+    # The bug this covers: Apply worked, the camera reported the new value on
+    # the next poll, and the field stayed starred as if it had never been sent.
+    _checkbox(form).setChecked(True)
+    assert form.edited_fields() == ["shutter"]
+    form.set_current({"shutter": True})          # an ordinary poll, no reset
+    assert form.edited_fields() == []
+    assert form._labels["shutter"].text() == "Shutter"
+    assert form.values() == {}
+
+
+def test_a_value_the_camera_rounds_still_counts_as_applied(form):
+    # The spin box shows three decimals; the camera answers 2.0000001.
+    form._widgets["exposure"][1].setValue(2.5)
+    form.set_current({"exposure": 2.5000001})
+    assert form.edited_fields() == []
 
 
 def test_a_reading_shown_differently_is_not_mistaken_for_an_edit(form):

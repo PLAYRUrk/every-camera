@@ -418,11 +418,13 @@ class ParamForm(QGroupBox):
         self._widgets = {}
         self._labels = {}
         self._schema = []
-        # What each widget was last *shown* by the camera. Comparing against
-        # this — rather than against the raw reading — is what makes "has the
-        # operator edited this?" exact: 2 and 2.000 are the same reading, but
-        # only the widget knows how it renders one.
-        self._displayed = {}
+        # Fields the operator has changed and not yet sent. Taken from the
+        # widgets' own signals rather than inferred by comparing values: a
+        # camera that reports nothing for a field (a wheel whose position is
+        # unknown) would otherwise make the widget's default look like an
+        # intention, and Apply would send a filter change nobody asked for.
+        self._touched = set()
+        self._updating = False      # True while the form writes to its widgets
         self._layout = QVBoxLayout(self)
         self._form = QFormLayout()
         self._layout.addLayout(self._form)
@@ -458,7 +460,7 @@ class ParamForm(QGroupBox):
             self._form.removeRow(0)
         self._widgets.clear()
         self._labels.clear()
-        self._displayed.clear()
+        self._touched.clear()
         self._schema = list(schema or [])
         self._current = dict(current or {})
 
@@ -478,6 +480,7 @@ class ParamForm(QGroupBox):
             self._widgets[field["name"]] = (field, widget)
             self._form.addRow(field.get("label", field["name"]), widget)
             self._labels[field["name"]] = self._form.labelForField(widget)
+            self._watch(field["name"], widget)
 
         self._reset_fields()
         self._hint.setText(
@@ -522,6 +525,20 @@ class ParamForm(QGroupBox):
         line.setPlaceholderText(field.get("hint", ""))
         return line
 
+    def _watch(self, name, widget):
+        """Notice when the operator changes this field, and only then."""
+        for signal in ("currentIndexChanged", "toggled", "valueChanged",
+                       "textEdited"):
+            if hasattr(widget, signal):
+                getattr(widget, signal).connect(
+                    lambda *_a, _n=name: self._on_user_change(_n))
+
+    def _on_user_change(self, name):
+        if self._updating:
+            return              # the form filling itself in is not an edit
+        self._touched.add(name)
+        self._mark_edited()
+
     def set_current(self, current, reset=False):
         """Show a fresh reading from the camera.
 
@@ -535,15 +552,19 @@ class ParamForm(QGroupBox):
         for name in self._widgets:
             if name not in self._current or self._current[name] is None:
                 continue
-            if reset or not self.is_edited(name):
-                self._show_value(name, self._current[name])
+            value = self._current[name]
+            if self._widget_shows(name, value):
+                # The camera has caught up with the edit — it *is* the reading
+                # now, so the field is no longer pending. Without this the star
+                # never went out after a successful Apply.
+                self._touched.discard(name)
+            elif reset or not self.is_edited(name):
+                self._show_value(name, value)
         self._mark_edited()
 
     def is_edited(self, name):
-        """True if this field no longer shows what the camera last reported."""
-        if name not in self._displayed:
-            return False        # nothing was ever shown here to differ from
-        return self._widget_value(name) != self._displayed[name]
+        """True if the operator has changed this field and not yet sent it."""
+        return name in self._touched
 
     def edited_fields(self):
         return [name for name in self._widgets if self.is_edited(name)]
@@ -551,30 +572,61 @@ class ParamForm(QGroupBox):
     def _reset_fields(self):
         self.set_current(self._current, reset=True)
 
-    def _show_value(self, name, value):
-        """Put a value from the camera into its widget and remember it."""
+    def _widget_shows(self, name, value):
+        """True if the widget already holds ``value``, as it would hold it.
+
+        Compared against the *rendered* value, never the raw reading: a camera
+        reporting 2 and a spin box showing 2.000 are the same setting, and a
+        camera reporting a filter the wheel is between is no setting at all.
+        """
+        rendered = self._rendered(name, value)
+        return rendered is not None and rendered == self._widget_value(name)
+
+    def _rendered(self, name, value):
+        """``value`` as this widget would hold it, or None if it cannot hold it."""
         _field, widget = self._widgets[name]
         if isinstance(widget, QComboBox):
             index = widget.findData(value)
             if index < 0:
                 index = widget.findText(str(value))
-            if index >= 0:
-                widget.setCurrentIndex(index)
-        elif isinstance(widget, QCheckBox):
-            widget.setChecked(as_bool(value))
-        elif isinstance(widget, QSpinBox):
+            if index < 0:
+                return None             # not one of the choices on offer
+            data = widget.itemData(index)
+            return widget.itemText(index) if data is None else data
+        if isinstance(widget, QCheckBox):
+            return as_bool(value)
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
             try:
-                widget.setValue(int(value))
+                number = (int(value) if isinstance(widget, QSpinBox)
+                          else round(float(value), widget.decimals()))
             except (TypeError, ValueError):
-                return
-        elif isinstance(widget, QDoubleSpinBox):
-            try:
-                widget.setValue(float(value))
-            except (TypeError, ValueError):
-                return
-        else:
-            widget.setText(str(value))
-        self._displayed[name] = self._widget_value(name)
+                return None
+            # setValue clamps and rounds; predicting it is what keeps a value
+            # outside the field's range from looking like an operator's edit.
+            return max(widget.minimum(), min(widget.maximum(), number))
+        return str(value).strip()
+
+    def _show_value(self, name, value):
+        """Put a value from the camera into its widget, without calling it an edit."""
+        rendered = self._rendered(name, value)
+        if rendered is None:
+            return
+        _field, widget = self._widgets[name]
+        self._updating = True
+        try:
+            if isinstance(widget, QComboBox):
+                index = widget.findData(rendered)
+                widget.setCurrentIndex(index if index >= 0
+                                       else widget.findText(str(rendered)))
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(rendered)
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widget.setValue(rendered)
+            else:
+                widget.setText(rendered)
+        finally:
+            self._updating = False
+        self._touched.discard(name)
 
     def _widget_value(self, name):
         """What the widget holds now, in the form it would be sent in."""
@@ -604,14 +656,13 @@ class ParamForm(QGroupBox):
                 label.setToolTip("")
 
     def values(self):
-        """Only the fields that actually differ from the camera's state."""
+        """Only what the operator changed — never a widget's own default."""
         out = {}
-        for name, (_field, widget) in self._widgets.items():
+        for name in self._touched:
+            _field, widget = self._widgets[name]
             value = self._widget_value(name)
             if isinstance(widget, QLineEdit) and not value:
-                continue
-            if name in self._displayed and value == self._displayed[name]:
-                continue
+                continue        # a cleared box means "leave it alone"
             out[name] = value
         return out
 

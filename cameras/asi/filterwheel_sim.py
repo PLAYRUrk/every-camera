@@ -8,7 +8,7 @@ from time import sleep
 
 import console_ui
 
-from .filterwheel import FILTER_MAX, FILTER_MIN
+from .filterwheel import FILTER_MAX, FILTER_MIN, HOME
 
 MOVE_SECONDS = 1.0
 
@@ -16,11 +16,13 @@ MOVE_SECONDS = 1.0
 class SimFilterWheel:
     def __init__(self, port: str = "sim", baudrate: int = 9600,
                  move_timeout: float = 8.0) -> None:
-        self.current_filter: int = 0
+        # None until homed, exactly as the real controller — see filterwheel.py.
+        self.current_filter: int | None = None
         self.shutter_open: bool = False
 
     def __enter__(self) -> SimFilterWheel:
         console_ui.log("Filter wheel: SIMULATOR (no serial port in use)")
+        self.current_filter = HOME
         return self
 
     def __exit__(self, *args) -> None:
@@ -37,7 +39,7 @@ class SimFilterWheel:
 
     def home(self) -> None:
         sleep(MOVE_SECONDS)
-        self.current_filter = 0
+        self.current_filter = HOME
 
     def set_shutter(self, open: bool) -> None:
         self.shutter_open = open

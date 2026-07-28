@@ -70,8 +70,7 @@ def test_a_change_the_schedule_made_reaches_the_client(worker, service):
     assert current["exposure"] == 7.5
 
 
-def test_the_state_keeps_up_rather_than_freezing_at_the_first_reading(worker,
-                                                                     service):
+def test_the_state_keeps_up_rather_than_freezing(worker, service):
     worker.cam.set_shutter(True)
     worker._save_status("running")
     worker.cam.set_shutter(False)

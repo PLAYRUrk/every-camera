@@ -54,6 +54,9 @@ from worker_common import (
 from cameras.asi import config as asi_config
 from cameras.asi import devices, picam, schedule as asi_schedule
 from cameras.asi.fits import write_fits
+# Safe to import here: the wheel module pulls in pyserial only when it opens a
+# port, so a machine with no hardware still imports this driver.
+from cameras.asi.filterwheel import HOME as FILTER_HOME
 
 # How much slack a focus frame needs before the next scheduled capture: the
 # exposure itself, readout, and a margin. Below this the frame is skipped.
@@ -87,6 +90,13 @@ def _as_bool(value):
 
 def _shutter_text(state):
     return "unknown" if state is None else ("open" if state else "closed")
+
+
+def _filter_text(position):
+    """Word a wheel position. Home is a place; unknown is a failed move."""
+    if position is None:
+        return "unknown"
+    return "home" if position == FILTER_HOME else str(position)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +176,19 @@ class AsiCamera:
 
     @property
     def current_filter(self):
+        """Wheel position: 0 at home, 1..6 in a filter, None if unknown."""
         return self.wheel.current_filter
+
+    @property
+    def filter_number(self):
+        """The position as a number for file names and FITS headers.
+
+        An unconfirmed move leaves the position unknown; the archive has always
+        recorded that as 0 and keeps doing so, rather than growing a second
+        spelling of "no filter" that existing tooling would have to learn.
+        """
+        position = self.wheel.current_filter
+        return FILTER_HOME if position is None else position
 
     @property
     def shutter_open(self):
@@ -212,6 +234,11 @@ class AsiCamera:
 
     def select_filter(self, number):
         return self.wheel.select(int(number))
+
+    def home_filter(self):
+        """Park the wheel at its home position (0)."""
+        self.wheel.home()
+        return self.wheel.current_filter == FILTER_HOME
 
     def set_shutter(self, is_open):
         self.wheel.set_shutter(bool(is_open))
@@ -313,7 +340,7 @@ class AsiWorkerConsole(threading.Thread):
              f"{exposure:g} s  ·  {binning}x{binning}" if exposure
              else f"-  ·  {binning}x{binning}"),
             ("Gain:", str(self.cam.current_gain)),
-            ("Filter:", str(self.cam.current_filter or "unknown")),
+            ("Filter:", _filter_text(self.cam.current_filter)),
             ("Shutter:", _shutter_text(self.cam.shutter_open)),
             ("Sensor temperature:", temp_text),
         ]
@@ -401,11 +428,19 @@ class AsiWorkerConsole(threading.Thread):
                     applied[name] = gain
                 elif name == "filter":
                     number = int(value)
-                    if not asi_schedule.FILTER_MIN <= number <= asi_schedule.FILTER_MAX:
+                    if number == FILTER_HOME:
+                        # Home is one of the positions the form offers, so it
+                        # has to be a position one can go back to.
+                        if self.cam.home_filter():
+                            applied[name] = number
+                        else:
+                            errors.append("filter: wheel did not reach home")
+                    elif not (asi_schedule.FILTER_MIN <= number
+                              <= asi_schedule.FILTER_MAX):
                         raise ValueError(
-                            f"filter must be {asi_schedule.FILTER_MIN}.."
-                            f"{asi_schedule.FILTER_MAX}")
-                    if self.cam.select_filter(number):
+                            f"filter must be {FILTER_HOME} (home) or "
+                            f"{asi_schedule.FILTER_MIN}..{asi_schedule.FILTER_MAX}")
+                    elif self.cam.select_filter(number):
                         applied[name] = number
                     else:
                         errors.append(f"filter: wheel did not reach position {number}")
@@ -475,7 +510,10 @@ class AsiWorkerConsole(threading.Thread):
         """
         if phase:
             self._set_phase(phase)
-        self._next_slot = target if isinstance(target, dt) else None
+        # In setup mode this is an idle tick, not a scheduled capture;
+        # publishing it as "next slot" told the monitor a measurement was due.
+        self._next_slot = (target if isinstance(target, dt) and not self.setup_mode
+                           else None)
         self._dash_update(next_at=self._next_slot)
         last_status = 0.0
         cooling = None
@@ -527,7 +565,7 @@ class AsiWorkerConsole(threading.Thread):
             exposure_sec=exposure,
             binning=self.cam.current_binning,
             readout_speed=self.cfg.camera.readout_speed,
-            filter_num=self.cam.current_filter,
+            filter_num=self.cam.filter_number,
             ccd_temp=cooling.get("ccd_temp"),
             image_type=image_type,
             obs_mode=obs_mode,
@@ -549,7 +587,7 @@ class AsiWorkerConsole(threading.Thread):
         """Take, save and publish one frame. Returns True on success."""
         obs_mode = obs_mode or self.cfg.schedule.mode
         cooling = self._refresh_camera_section()
-        label = label or f"{image_type} filter={self.cam.current_filter}"
+        label = label or f"{image_type} filter={_filter_text(self.cam.current_filter)}"
         if self._dash is not None:
             self._dash.capture_begin(label, exposure)
         try:
@@ -569,7 +607,7 @@ class AsiWorkerConsole(threading.Thread):
             return False
 
         suffix = "_bg" if image_type == "DARK" else ""
-        name = f"{now.strftime('%Y%m%dT%H%M%S')}_{self.cam.current_filter}{suffix}.fits"
+        name = f"{now.strftime('%Y%m%dT%H%M%S')}_{self.cam.filter_number}{suffix}.fits"
         path = os.path.join(self.output_dir, name)
         try:
             self._write_frame(path, image, now, exposure, image_type, obs_mode,

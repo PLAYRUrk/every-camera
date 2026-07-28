@@ -49,6 +49,10 @@ STATUS_COLORS = {
     "offline": QColor(200, 80, 0),
     "idle":    QColor(80, 80, 200),
     "stale":   QColor(200, 80, 0),
+    # A camera up for focusing only: nothing is being archived, which is a
+    # state of its own and not a fault. Same orange the apps badge it with.
+    "setup":   QColor(200, 112, 0),
+    "starting": QColor(80, 80, 200),
     "unknown": QColor(100, 100, 100),
 }
 

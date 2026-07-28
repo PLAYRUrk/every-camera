@@ -102,6 +102,43 @@ def test_the_current_state_is_published_to_the_client(worker, cam):
     assert worker._current_params()["shutter"] is True
 
 
+# -- the wheel's position ----------------------------------------------------
+def test_a_homed_wheel_reports_home_not_unknown(cam):
+    # The complaint this fixes: a camera just started, wheel homed and idle,
+    # showed "filter: unknown" as though the position had been lost.
+    cam.wheel.__enter__()
+    assert cam.current_filter == 0
+    assert asi_driver._filter_text(cam.current_filter) == "home"
+
+
+def test_a_position_that_was_never_confirmed_stays_unknown():
+    from cameras.asi.filterwheel import FilterWheel
+
+    wheel = FilterWheel("/dev/null", 9600)
+    assert wheel.current_filter is None
+    assert asi_driver._filter_text(wheel.current_filter) == "unknown"
+
+
+def test_an_unknown_position_is_still_written_to_the_archive_as_zero(cam):
+    # File names and FITS headers have always used 0 here; growing a second
+    # spelling would break tooling that reads the archive.
+    assert cam.current_filter is None
+    assert cam.filter_number == 0
+
+
+def test_home_is_a_position_the_form_can_ask_for(worker, cam):
+    cam.wheel.select(3)
+    applied, errors = worker._apply_params({"filter": 0})
+    assert errors == []
+    assert applied == {"filter": 0}
+    assert cam.current_filter == 0
+
+
+def test_the_schema_offers_home_as_a_filter_choice():
+    field = next(f for f in PARAM_SCHEMAS["asi"] if f["name"] == "filter")
+    assert [c["value"] for c in field["choices"]][0] == 0
+
+
 def test_the_schema_offers_the_shutter_as_a_switch():
     # focus_app renders whatever the camera describes; without this field there
     # is no shutter control in the app at all.

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 FILTER_MIN = 1
 FILTER_MAX = 6
+HOME = 0            # the position GOSUB5 parks the wheel at
 
 
 class FilterWheel:
@@ -32,7 +33,11 @@ class FilterWheel:
         self._move_timeout = move_timeout    # max seconds to wait for the wheel to arrive
         self._poll_interval = poll_interval  # status-poll cadence while the wheel moves
         self._ser: Serial | None = None
-        self.current_filter: int = 0
+        # 0 is the home position — a real place the wheel is parked at, and
+        # where it sits from ``__enter__`` until a filter is chosen. None means
+        # the position is genuinely unknown (a move that never confirmed), and
+        # the two must not be shown as the same thing.
+        self.current_filter: int | None = None
         # None until the shutter has actually been commanded: the controller
         # never reports its state on its own, and focus_app must not be shown a
         # guess as if it were a reading.
@@ -50,6 +55,7 @@ class FilterWheel:
         sleep(10)
         response = self._ser.readline().decode().strip()
         console_ui.log(f"Filter controller: {response}")
+        self.current_filter = HOME       # GOSUB5 is the homing command
         return self
 
     def __exit__(self, *args) -> None:
@@ -65,9 +71,10 @@ class FilterWheel:
         # is only a safety ceiling for a stuck move.
         #
         # Returns True when arrival was confirmed. A move that only timed out leaves
-        # ``current_filter`` unknown (0): the wheel may be anywhere, and labelling
+        # ``current_filter`` unknown (None): the wheel may be anywhere, and labelling
         # frames with a filter the instrument never reached would silently corrupt a
-        # night of data.
+        # night of data. Unknown is not home — home is where the wheel actually is
+        # after GOSUB5, and reporting one as the other hides a failed move.
         if not FILTER_MIN <= n <= FILTER_MAX:
             raise ValueError(f"Filter must be {FILTER_MIN}..{FILTER_MAX}, got {n}")
         if n == self.current_filter:
@@ -91,7 +98,7 @@ class FilterWheel:
         if arrived:
             self.current_filter = n
         else:
-            self.current_filter = 0
+            self.current_filter = None
             console_ui.warn(f"Filter wheel did not confirm position {n} within "
                             f"{self._move_timeout:.0f} s — position unknown")
         return arrived
@@ -101,7 +108,7 @@ class FilterWheel:
         self._ser.write(("GOSUB5" + chr(13)).encode())
         sleep(10)
         self._ser.readline()
-        self.current_filter = 0
+        self.current_filter = HOME
 
     def set_shutter(self, open: bool) -> None:
         val = 1 if open else 0
