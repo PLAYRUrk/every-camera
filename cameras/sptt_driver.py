@@ -25,8 +25,9 @@ from utils import (
     APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, run_focus_iteration,
-    MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode, SETUP_STATUS,
+    WorkerMqtt, parse_command_params, publish_current_params,
+    run_focus_iteration, MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode,
+    SETUP_STATUS,
 )
 
 from .sptt_load_firmware import (
@@ -784,6 +785,10 @@ class SpttWorkerConsole(threading.Thread):
             return False
 
     def _save_status(self, status, force=False):
+        # focus_app only sees the values published from here, so they are
+        # refreshed on the status cadence rather than left as they were at
+        # startup — see worker_common.publish_current_params.
+        publish_current_params(self._service, self._current_params)
         cam_status = {}
         try:
             cam_status = self.cam.get_status_info()

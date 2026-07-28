@@ -26,7 +26,8 @@ from focus_app import ParamForm, as_bool                       # noqa: E402
 SCHEMA = [
     {"name": "exposure", "label": "Exposure (s)", "type": "float",
      "min": 0.001, "max": 60.0, "step": 0.1},
-    {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open"},
+    {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
+     "true_label": "open", "false_label": "closed"},
 ]
 
 
@@ -108,3 +109,50 @@ def test_reset_fields_puts_the_box_back_to_the_camera_state(form):
     form._reset_fields()
     assert not _checkbox(form).isChecked()
     assert form.values() == {}
+
+
+# -- following the camera ----------------------------------------------------
+def test_the_form_is_only_rebuilt_when_the_controls_themselves_change(form):
+    assert form.matches_schema(SCHEMA)
+    assert not form.matches_schema(SCHEMA[:1])
+
+
+def test_an_untouched_field_follows_the_camera(form):
+    # The schedule opened the shutter; nobody in the app asked for it.
+    form.set_current({"exposure": 2.0, "shutter": True})
+    assert _checkbox(form).isChecked()
+    assert form.values() == {}          # following is not an edit to send
+
+
+def test_a_field_being_edited_survives_the_refresh(form):
+    _checkbox(form).setChecked(True)
+    form.set_current({"exposure": 9.0, "shutter": False})
+    assert _checkbox(form).isChecked()          # the operator's edit is kept
+    assert form._widgets["exposure"][1].value() == 9.0   # the rest follows
+    assert form.values() == {"shutter": True}
+
+
+def test_an_edit_that_survived_is_marked_and_explained(form):
+    _checkbox(form).setChecked(True)
+    form.set_current({"shutter": False})
+    label = form._labels["shutter"]
+    assert label.text().endswith("*")
+    assert "closed" in label.toolTip()           # what the camera says instead
+
+
+def test_the_mark_goes_away_once_the_camera_has_the_value(form):
+    _checkbox(form).setChecked(True)
+    form.set_current({"shutter": True}, reset=True)   # the Apply went through
+    assert form._labels["shutter"].text() == "Shutter"
+    assert form.edited_fields() == []
+    assert form.values() == {}
+
+
+def test_a_reading_shown_differently_is_not_mistaken_for_an_edit(form):
+    # The camera says 2, the spin box shows 2.000. Comparing the two as text
+    # would call the field edited and freeze it there for good.
+    form.set_current({"exposure": 2, "shutter": False})
+    assert form.edited_fields() == []
+    assert form.values() == {}
+    form.set_current({"exposure": 3, "shutter": False})
+    assert form._widgets["exposure"][1].value() == 3.0

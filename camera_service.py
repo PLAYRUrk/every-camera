@@ -91,6 +91,7 @@ PARAM_SCHEMAS = {
         # shut between runs and for darks, so focusing without a way to open it
         # meant staring at dark frames and wondering what was wrong.
         {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
+         "true_label": "open", "false_label": "closed",
          "tooltip": "The wheel controller's shutter. Closed means the sensor "
                     "sees nothing — dark frames are taken this way."},
         {"name": "target_temp", "label": "Sensor setpoint (°C)", "type": "float",

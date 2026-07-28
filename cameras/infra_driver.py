@@ -32,7 +32,8 @@ from utils import (
     get_local_ip, get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, announce_setup_mode, SETUP_STATUS,
+    WorkerMqtt, parse_command_params, publish_current_params,
+    announce_setup_mode, SETUP_STATUS,
 )
 
 # ---------------------------------------------------------------------------
@@ -1079,6 +1080,10 @@ class InfraWorkerConsole(threading.Thread):
             return False
 
     def _save_status(self, status, force=False):
+        # focus_app only sees the values published from here, so they are
+        # refreshed on the status cadence rather than left as they were at
+        # startup — see worker_common.publish_current_params.
+        publish_current_params(self._service, self._current_params)
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "infra",

@@ -23,8 +23,8 @@ from utils import (
     get_local_ip, get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, run_focus_iteration,
-    announce_setup_mode, SETUP_STATUS,
+    WorkerMqtt, parse_command_params, publish_current_params,
+    run_focus_iteration, announce_setup_mode, SETUP_STATUS,
 )
 
 # ---------------------------------------------------------------------------
@@ -513,6 +513,10 @@ class CannonWorkerConsole(threading.Thread):
             cam_info = get_camera_settings_info(self.config)
         except Exception:
             pass
+        # The same values focus_app edits; publishing them here keeps it from
+        # showing settings the camera left behind hours ago — see
+        # worker_common.publish_current_params.
+        publish_current_params(self._service, lambda: cam_info)
 
         payload = {
             "instance_name": self.instance_name,

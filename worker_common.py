@@ -49,6 +49,28 @@ def announce_setup_mode(reason=None):
                    "restart to begin measuring.")
 
 
+def publish_current_params(service, snapshot):
+    """Hand ``focus_app`` the camera's parameter values, as of now.
+
+    ``snapshot`` is a callable returning the driver's current values, called
+    here so that a camera that cannot answer costs a warning rather than a
+    broken status tick.
+
+    Every driver used to publish this once at startup and again only after a
+    change *it had been asked for*, which made it a lie for most of a night: a
+    schedule moves the exposure, the filter and the ASI shutter by itself, so an
+    observer connecting later was shown the values the process had started with.
+    Drivers therefore call this on their status cadence. It must stay cheap and
+    hardware-free — the values it reads are ones the driver already caches.
+    """
+    if service is None:
+        return
+    try:
+        service.set_current_params(snapshot())
+    except Exception as exc:
+        console_ui.warn(f"Could not publish current parameters: {exc}")
+
+
 class WorkerMqtt:
     """Status and frame publishing for one camera worker.
 

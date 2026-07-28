@@ -37,7 +37,8 @@ from utils import (
 from mqtt_client import MQTT_AVAILABLE, MqttPublisher
 from monitor import MonitorWidget
 from worker_common import (
-    MQTT_MAX_PAYLOAD_BYTES, WorkerMqtt, run_focus_iteration,
+    MQTT_MAX_PAYLOAD_BYTES, WorkerMqtt, publish_current_params,
+    run_focus_iteration,
 )
 
 
@@ -399,12 +400,9 @@ class CannonWorkerQt(QThread):
             self._service.complete_param_request(
                 req_id, applied=params,
                 errors=[f"{k}: {e}" for k, e in failures])
-            try:
-                from cannon_driver import get_camera_settings_info
-                self._service.set_current_params(
-                    get_camera_settings_info(self.config))
-            except Exception:
-                pass
+            from cannon_driver import get_camera_settings_info
+            publish_current_params(
+                self._service, lambda: get_camera_settings_info(self.config))
         run_focus_iteration(
             self._service, lambda: self._grab_focus_frame(),
             on_error=lambda exc, stopped: self.log_msg.emit(
@@ -433,6 +431,9 @@ class CannonWorkerQt(QThread):
             cam_info = get_camera_settings_info(self.config)
         except Exception:
             pass
+        # Keep focus_app's view of the camera current — see
+        # worker_common.publish_current_params.
+        publish_current_params(self._service, lambda: cam_info)
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "cannon",
@@ -1141,6 +1142,10 @@ class SpttScheduledWorkerQt(QThread):
         self.log_msg.emit("SPTT measurement stopped", "info")
         self.finished.emit()
 
+    def _current_params(self):
+        """What focus_app should show for this camera, right now."""
+        return {"exposure": self.cam.exposure, "gain": self.cam.gain,
+                "binning": self.cam.binning}
 
     def _handle_focus(self, now):
         """Serve the LAN focus tool between scheduled shots.
@@ -1158,9 +1163,7 @@ class SpttScheduledWorkerQt(QThread):
         if params:
             applied, errors = self._apply_sptt_params(params)
             self._service.complete_param_request(req_id, applied, errors)
-            self._service.set_current_params({
-                "exposure": self.cam.exposure, "gain": self.cam.gain,
-                "binning": self.cam.binning})
+            publish_current_params(self._service, self._current_params)
         run_focus_iteration(
             self._service, lambda: self.cam.grab_frame(),
             on_error=lambda exc, stopped: self.log_msg.emit(
@@ -1177,6 +1180,9 @@ class SpttScheduledWorkerQt(QThread):
 
     def _save_status(self, status, force=False):
         from sptt_driver import ENCODING_12BPP
+        # Keep focus_app's view of the camera current — see
+        # worker_common.publish_current_params.
+        publish_current_params(self._service, self._current_params)
         cam_status = {}
         try:
             cam_status = self.cam.get_status_info()
@@ -1955,6 +1961,10 @@ class InfraWorkerQt(QThread):
         self.log_msg.emit("Infra measurement stopped", "info")
         self.finished.emit()
 
+    def _current_params(self):
+        """What focus_app should show for this camera, right now."""
+        return {"exposure_us": self.cam.exposure_us, "gain": self.cam.gain,
+                "roi": f"{self.cam.roi_width}x{self.cam.roi_height}"}
 
     def _handle_focus(self, now):
         """Serve the LAN focus tool between scheduled shots.
@@ -1971,9 +1981,7 @@ class InfraWorkerQt(QThread):
         if params:
             applied, errors = self._apply_infra_params(params)
             self._service.complete_param_request(req_id, applied, errors)
-            self._service.set_current_params({
-                "exposure_us": self.cam.exposure_us, "gain": self.cam.gain,
-                "roi": f"{self.cam.roi_width}x{self.cam.roi_height}"})
+            publish_current_params(self._service, self._current_params)
         run_focus_iteration(
             self._service, lambda: self.cam.grab_frame(),
             on_error=lambda exc, stopped: self.log_msg.emit(
@@ -1989,6 +1997,9 @@ class InfraWorkerQt(QThread):
                 pass
 
     def _save_status(self, status, force=False):
+        # Keep focus_app's view of the camera current — see
+        # worker_common.publish_current_params.
+        publish_current_params(self._service, self._current_params)
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "infra",

@@ -48,6 +48,7 @@ from net_client import (
 
 DEFAULT_HTTP_PORT = 8765
 HEARTBEAT_MS = 20_000        # keep the focus session alive
+PARAMS_POLL_MS = 4_000       # re-read what the camera is actually set to
 FOCUS_TTL_SECONDS = 60       # camera stops free-running this long after the last ping
 SHARPNESS_HISTORY = 120
 ROI_MIN = 32                 # below this the sharpness metric has nothing to chew on
@@ -61,6 +62,19 @@ STRETCH_MODES = [
 
 
 TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
+
+
+def _display_text(field, value):
+    """A camera's value as the field words it — "2 — Medium", not "2"."""
+    if value is None:
+        return "nothing"
+    if field.get("type") == "bool":
+        return field.get("true_label" if as_bool(value) else "false_label",
+                         "on" if as_bool(value) else "off")
+    for choice in field.get("choices", []):
+        if str(choice.get("value")) == str(value):
+            return str(choice.get("label", value))
+    return str(value)
 
 
 def as_bool(value):
@@ -387,13 +401,28 @@ class SharpnessPlot(QWidget):
 # Parameter form built from the camera's own schema
 # ---------------------------------------------------------------------------
 class ParamForm(QGroupBox):
-    """Editable camera parameters, described by the camera itself."""
+    """Editable camera parameters, described by the camera itself.
+
+    The values shown are a *reading*, refreshed while the window is open: a
+    camera changes its own settings between frames — a schedule moves the
+    exposure, the filter, the ASI shutter — and the form has to follow, or the
+    operator is looking at the state the camera had when they connected.
+    Following must not fight the operator, so a field that has been edited and
+    not yet applied keeps what was typed and is marked with a ``*``.
+    """
 
     apply_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__("Camera parameters", parent)
         self._widgets = {}
+        self._labels = {}
+        self._schema = []
+        # What each widget was last *shown* by the camera. Comparing against
+        # this — rather than against the raw reading — is what makes "has the
+        # operator edited this?" exact: 2 and 2.000 are the same reading, but
+        # only the widget knows how it renders one.
+        self._displayed = {}
         self._layout = QVBoxLayout(self)
         self._form = QFormLayout()
         self._layout.addLayout(self._form)
@@ -415,10 +444,22 @@ class ParamForm(QGroupBox):
 
         self._current = {}
 
+    def matches_schema(self, schema):
+        """True if ``schema`` is the one already on screen.
+
+        The form is rebuilt only when the camera describes different controls;
+        rebuilding it on every refresh would throw away an edit in progress and
+        the keyboard focus with it.
+        """
+        return list(schema or []) == self._schema
+
     def build(self, schema, current, editable=True):
         while self._form.rowCount():
             self._form.removeRow(0)
         self._widgets.clear()
+        self._labels.clear()
+        self._displayed.clear()
+        self._schema = list(schema or [])
         self._current = dict(current or {})
 
         if not schema:
@@ -436,11 +477,15 @@ class ParamForm(QGroupBox):
                 continue
             self._widgets[field["name"]] = (field, widget)
             self._form.addRow(field.get("label", field["name"]), widget)
+            self._labels[field["name"]] = self._form.labelForField(widget)
 
         self._reset_fields()
         self._hint.setText(
             "Change a value and press Apply — the camera applies it between "
-            "frames." if editable else "Read-only camera.")
+            "frames. The values shown are re-read from the camera; a field "
+            "marked * holds an edit that has not been sent yet."
+            if editable else "Read-only camera. The values shown are re-read "
+            "from the camera.")
         self.btn_apply.setEnabled(editable)
         self.btn_revert.setEnabled(editable)
 
@@ -477,54 +522,95 @@ class ParamForm(QGroupBox):
         line.setPlaceholderText(field.get("hint", ""))
         return line
 
-    def set_current(self, current):
+    def set_current(self, current, reset=False):
+        """Show a fresh reading from the camera.
+
+        Fields the operator has not touched follow the camera. One that is
+        being edited keeps the edit — the operator is mid-thought and an Apply
+        must still send what they typed — and is marked instead. ``reset``
+        takes the camera's word for everything, which is what an applied change
+        or the Reset button means.
+        """
         self._current = dict(current or {})
-        self._reset_fields()
+        for name in self._widgets:
+            if name not in self._current or self._current[name] is None:
+                continue
+            if reset or not self.is_edited(name):
+                self._show_value(name, self._current[name])
+        self._mark_edited()
+
+    def is_edited(self, name):
+        """True if this field no longer shows what the camera last reported."""
+        if name not in self._displayed:
+            return False        # nothing was ever shown here to differ from
+        return self._widget_value(name) != self._displayed[name]
+
+    def edited_fields(self):
+        return [name for name in self._widgets if self.is_edited(name)]
 
     def _reset_fields(self):
+        self.set_current(self._current, reset=True)
+
+    def _show_value(self, name, value):
+        """Put a value from the camera into its widget and remember it."""
+        _field, widget = self._widgets[name]
+        if isinstance(widget, QComboBox):
+            index = widget.findData(value)
+            if index < 0:
+                index = widget.findText(str(value))
+            if index >= 0:
+                widget.setCurrentIndex(index)
+        elif isinstance(widget, QCheckBox):
+            widget.setChecked(as_bool(value))
+        elif isinstance(widget, QSpinBox):
+            try:
+                widget.setValue(int(value))
+            except (TypeError, ValueError):
+                return
+        elif isinstance(widget, QDoubleSpinBox):
+            try:
+                widget.setValue(float(value))
+            except (TypeError, ValueError):
+                return
+        else:
+            widget.setText(str(value))
+        self._displayed[name] = self._widget_value(name)
+
+    def _widget_value(self, name):
+        """What the widget holds now, in the form it would be sent in."""
+        _field, widget = self._widgets[name]
+        if isinstance(widget, QComboBox):
+            value = widget.currentData()
+            return widget.currentText() if value is None else value
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            return widget.value()
+        return widget.text().strip()
+
+    def _mark_edited(self):
+        """Star the rows holding an unapplied edit, and say what the camera says."""
         for name, (field, widget) in self._widgets.items():
-            value = self._current.get(name)
-            if value is None:
+            label = self._labels.get(name)
+            if label is None:
                 continue
-            if isinstance(widget, QComboBox):
-                index = widget.findData(value)
-                if index < 0:
-                    index = widget.findText(str(value))
-                if index >= 0:
-                    widget.setCurrentIndex(index)
-            elif isinstance(widget, QCheckBox):
-                widget.setChecked(as_bool(value))
-            elif isinstance(widget, QSpinBox):
-                try:
-                    widget.setValue(int(value))
-                except (TypeError, ValueError):
-                    pass
-            elif isinstance(widget, QDoubleSpinBox):
-                try:
-                    widget.setValue(float(value))
-                except (TypeError, ValueError):
-                    pass
+            title = field.get("label", name)
+            if self.is_edited(name):
+                label.setText(f"{title} *")
+                label.setToolTip("Not applied yet. The camera reports "
+                                 f"{_display_text(field, self._current.get(name))}.")
             else:
-                widget.setText(str(value))
+                label.setText(title)
+                label.setToolTip("")
 
     def values(self):
         """Only the fields that actually differ from the camera's state."""
         out = {}
-        for name, (field, widget) in self._widgets.items():
-            if isinstance(widget, QComboBox):
-                value = widget.currentData()
-                if value is None:
-                    value = widget.currentText()
-            elif isinstance(widget, QCheckBox):
-                value = widget.isChecked()
-            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
-                value = widget.value()
-            else:
-                text = widget.text().strip()
-                if not text:
-                    continue
-                value = text
-            if name in self._current and str(self._current[name]) == str(value):
+        for name, (_field, widget) in self._widgets.items():
+            value = self._widget_value(name)
+            if isinstance(widget, QLineEdit) and not value:
+                continue
+            if name in self._displayed and value == self._displayed[name]:
                 continue
             out[name] = value
         return out
@@ -564,6 +650,13 @@ class FocusWindow(QMainWindow):
         self._metrics = QTimer(self)
         self._metrics.setInterval(1000)
         self._metrics.timeout.connect(self._update_metrics)
+
+        # The camera changes its own settings between frames, so the form is
+        # re-read rather than filled in once at connect.
+        self._params_poll = QTimer(self)
+        self._params_poll.setInterval(PARAMS_POLL_MS)
+        self._params_poll.timeout.connect(self._poll_params)
+        self._params_inflight = False
 
     # -- UI ------------------------------------------------------------
     def _build_ui(self):
@@ -846,9 +939,37 @@ class FocusWindow(QMainWindow):
         self._tasks.run(client.params, self._on_params, self._on_error)
         self._start_stream()
 
-    def _on_params(self, payload):
-        self.params.build(payload.get("schema", []), payload.get("current", {}),
-                          editable=payload.get("editable", False))
+    def _on_params(self, payload, reset=True):
+        """Show what the camera reports. ``reset`` overrides unapplied edits."""
+        schema = payload.get("schema", [])
+        current = payload.get("current", {})
+        if self.params.matches_schema(schema):
+            self.params.set_current(current, reset=reset)
+        else:
+            self.params.build(schema, current,
+                              editable=payload.get("editable", False))
+
+    def _poll_params(self):
+        """Re-read the camera's settings; it moves them without being asked.
+
+        Only fields the operator is not editing follow — see
+        :meth:`ParamForm.set_current`. A poll that fails is passed over in
+        silence: the stream label already says when the camera is unreachable,
+        and this runs every few seconds.
+        """
+        if not self._client or self._params_inflight:
+            return
+        client = self._client
+        self._params_inflight = True
+
+        def _done(payload):
+            self._params_inflight = False
+            self._on_params(payload, reset=False)
+
+        def _failed(_message):
+            self._params_inflight = False
+
+        self._tasks.run(client.params, _done, _failed)
 
     def _start_stream(self):
         self._stop_stream()
@@ -866,6 +987,7 @@ class FocusWindow(QMainWindow):
         self._send_heartbeat()
         self._heartbeat.start()
         self._metrics.start()
+        self._params_poll.start()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._status("Live view running — focus mode is on while this window streams")
@@ -877,6 +999,7 @@ class FocusWindow(QMainWindow):
     def _stop_stream(self):
         self._heartbeat.stop()
         self._metrics.stop()
+        self._params_poll.stop()
         if self._stream is not None:
             self._stream.stop()
             self._stream.wait(3000)

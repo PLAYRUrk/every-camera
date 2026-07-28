@@ -47,8 +47,8 @@ from utils import (
     get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, run_focus_iteration,
-    announce_setup_mode, SETUP_STATUS,
+    WorkerMqtt, parse_command_params, publish_current_params,
+    run_focus_iteration, announce_setup_mode, SETUP_STATUS,
 )
 
 from cameras.asi import config as asi_config
@@ -328,6 +328,9 @@ class AsiWorkerConsole(threading.Thread):
 
     def _save_status(self, status, force=False, cooling=None):
         cooling = cooling or {}
+        # The schedule moves the filter, the exposure and the shutter on its
+        # own; focus_app only ever sees what is published from here.
+        publish_current_params(self._service, self._current_params)
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "asi",
