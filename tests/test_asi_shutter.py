@@ -126,17 +126,20 @@ def test_an_unknown_position_is_still_written_to_the_archive_as_zero(cam):
     assert cam.filter_number == 0
 
 
-def test_home_is_a_position_the_form_can_ask_for(worker, cam):
+def test_home_cannot_be_asked_for_it_is_only_where_the_wheel_starts(worker, cam):
     cam.wheel.select(3)
     applied, errors = worker._apply_params({"filter": 0})
-    assert errors == []
-    assert applied == {"filter": 0}
-    assert cam.current_filter == 0
+    assert applied == {}
+    assert errors and "1..6" in errors[0]
+    assert cam.current_filter == 3          # the wheel was not moved
 
 
-def test_the_schema_offers_home_as_a_filter_choice():
+def test_the_schema_reports_home_without_offering_it(cam):
+    # It has to be shown — a camera parked at home must not read as being in
+    # whichever filter happens to be first — but it is not a choice.
     field = next(f for f in PARAM_SCHEMAS["asi"] if f["name"] == "filter")
-    assert [c["value"] for c in field["choices"]][0] == 0
+    assert 0 not in [choice["value"] for choice in field["choices"]]
+    assert [state["value"] for state in field["states"]] == [0]
 
 
 def test_the_schema_offers_the_shutter_as_a_switch():

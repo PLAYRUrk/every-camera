@@ -235,11 +235,6 @@ class AsiCamera:
     def select_filter(self, number):
         return self.wheel.select(int(number))
 
-    def home_filter(self):
-        """Park the wheel at its home position (0)."""
-        self.wheel.home()
-        return self.wheel.current_filter == FILTER_HOME
-
     def set_shutter(self, is_open):
         self.wheel.set_shutter(bool(is_open))
 
@@ -428,19 +423,14 @@ class AsiWorkerConsole(threading.Thread):
                     applied[name] = gain
                 elif name == "filter":
                     number = int(value)
-                    if number == FILTER_HOME:
-                        # Home is one of the positions the form offers, so it
-                        # has to be a position one can go back to.
-                        if self.cam.home_filter():
-                            applied[name] = number
-                        else:
-                            errors.append("filter: wheel did not reach home")
-                    elif not (asi_schedule.FILTER_MIN <= number
-                              <= asi_schedule.FILTER_MAX):
+                    # Home is a state the wheel starts in, not a position to be
+                    # sent to: the schedule always names a real filter.
+                    if not (asi_schedule.FILTER_MIN <= number
+                            <= asi_schedule.FILTER_MAX):
                         raise ValueError(
-                            f"filter must be {FILTER_HOME} (home) or "
-                            f"{asi_schedule.FILTER_MIN}..{asi_schedule.FILTER_MAX}")
-                    elif self.cam.select_filter(number):
+                            f"filter must be {asi_schedule.FILTER_MIN}.."
+                            f"{asi_schedule.FILTER_MAX}")
+                    if self.cam.select_filter(number):
                         applied[name] = number
                     else:
                         errors.append(f"filter: wheel did not reach position {number}")

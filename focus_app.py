@@ -71,7 +71,7 @@ def _display_text(field, value):
     if field.get("type") == "bool":
         return field.get("true_label" if as_bool(value) else "false_label",
                          "on" if as_bool(value) else "off")
-    for choice in field.get("choices", []):
+    for choice in list(field.get("choices", [])) + list(field.get("states", [])):
         if str(choice.get("value")) == str(value):
             return str(choice.get("label", value))
     return str(value)
@@ -505,6 +505,16 @@ class ParamForm(QGroupBox):
             for choice in field.get("choices", []):
                 combo.addItem(str(choice.get("label", choice.get("value"))),
                               choice.get("value"))
+            # States a camera can report but nobody can ask for — a filter
+            # wheel at home is where it parks itself, not somewhere to send it.
+            # Listed so the reading can be shown honestly, and greyed out so it
+            # cannot be picked.
+            for state in field.get("states", []):
+                combo.addItem(str(state.get("label", state.get("value"))),
+                              state.get("value"))
+                item = combo.model().item(combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
             return combo
         if kind == "bool":
             # A shutter, a cooler — things that are simply on or off. The hint is
@@ -550,9 +560,16 @@ class ParamForm(QGroupBox):
         """
         self._current = dict(current or {})
         for name in self._widgets:
-            if name not in self._current or self._current[name] is None:
+            if name not in self._current:
                 continue
             value = self._current[name]
+            if value is None:
+                # The camera is not saying — a wheel whose move never confirmed
+                # knows no position. Leaving the last filter on screen would
+                # claim knowledge nobody has.
+                if reset or not self.is_edited(name):
+                    self._show_nothing(name)
+                continue
             if self._widget_shows(name, value):
                 # The camera has caught up with the edit — it *is* the reading
                 # now, so the field is no longer pending. Without this the star
@@ -605,6 +622,23 @@ class ParamForm(QGroupBox):
             # outside the field's range from looking like an operator's edit.
             return max(widget.minimum(), min(widget.maximum(), number))
         return str(value).strip()
+
+    def _show_nothing(self, name):
+        """Show that the camera reports no value here, where the widget can.
+
+        Only a combo box has a way to say it: no selection at all. A number
+        field has no blank state, so it keeps its last reading rather than
+        pretend to a zero the camera never mentioned.
+        """
+        _field, widget = self._widgets[name]
+        if not isinstance(widget, QComboBox):
+            return
+        self._updating = True
+        try:
+            widget.setCurrentIndex(-1)
+        finally:
+            self._updating = False
+        self._touched.discard(name)
 
     def _show_value(self, name, value):
         """Put a value from the camera into its widget, without calling it an edit."""

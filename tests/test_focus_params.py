@@ -29,8 +29,9 @@ SCHEMA = [
     {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
      "true_label": "open", "false_label": "closed"},
     {"name": "filter", "label": "Filter", "type": "choice",
-     "choices": [{"value": 0, "label": "0 — home"},
-                 {"value": 1, "label": "1 — 557.7 nm"}]},
+     "states": [{"value": 0, "label": "home (after startup)"}],
+     "choices": [{"value": 1, "label": "1 — 557.7 nm"},
+                 {"value": 2, "label": "2 — 630.0 nm"}]},
 ]
 
 
@@ -122,6 +123,51 @@ def test_reset_fields_puts_the_box_back_to_the_camera_state(form):
     form._reset_fields()
     assert not _checkbox(form).isChecked()
     assert form.values() == {}
+
+
+# -- states a camera reports but nobody can ask for --------------------------
+def _combo(form):
+    return form._widgets["filter"][1]
+
+
+def test_a_reported_state_is_shown_but_cannot_be_chosen(qt_app):
+    form = ParamForm()
+    form.build(SCHEMA, {"filter": 0})
+    combo = _combo(form)
+    assert combo.currentData() == 0
+    assert "home" in combo.currentText()
+    # Greyed out in the list: the wheel parks itself there, it is not a place
+    # to send it to.
+    index = combo.findData(0)
+    assert not combo.model().item(index).isEnabled()
+    assert form.values() == {}
+
+
+def test_choosing_a_real_filter_still_works(form):
+    combo = _combo(form)
+    combo.setCurrentIndex(combo.findData(2))
+    assert form.values() == {"filter": 2}
+
+
+def test_a_position_the_camera_does_not_know_is_left_blank(qt_app):
+    # An unconfirmed move leaves the wheel's position unknown. Keeping the last
+    # filter on screen would claim knowledge nobody has.
+    form = ParamForm()
+    form.build(SCHEMA, {"filter": 2})
+    assert _combo(form).currentData() == 2
+    form.set_current({"filter": None})
+    assert _combo(form).currentIndex() == -1
+    assert form.values() == {}
+
+
+def test_an_unknown_position_does_not_overwrite_an_edit(qt_app):
+    form = ParamForm()
+    form.build(SCHEMA, {"filter": 1})
+    combo = _combo(form)
+    combo.setCurrentIndex(combo.findData(2))
+    form.set_current({"filter": None})
+    assert combo.currentData() == 2
+    assert form.values() == {"filter": 2}
 
 
 # -- following the camera ----------------------------------------------------

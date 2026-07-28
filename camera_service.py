@@ -81,11 +81,12 @@ PARAM_SCHEMAS = {
                      {"value": 2, "label": "2 — Medium"},
                      {"value": 3, "label": "3 — High"}]},
         {"name": "filter", "label": "Filter", "type": "choice",
-         # Home is where the wheel parks itself on startup, so the form has to
-         # be able to show it — otherwise a just-started camera reads as being
-         # in whichever filter happened to be first in the list.
-         "choices": [{"value": 0, "label": "0 — home (no filter)"},
-                     {"value": 1, "label": "1 — 557.7 nm"},
+         # Home is where the wheel parks itself on startup. It is a state the
+         # form must be able to *show* — otherwise a just-started camera reads
+         # as being in whichever filter happens to be first in the list — but
+         # not a position to send it to, so it lives in "states", not "choices".
+         "states": [{"value": 0, "label": "home (after startup)"}],
+         "choices": [{"value": 1, "label": "1 — 557.7 nm"},
                      {"value": 2, "label": "2 — 630.0 nm"},
                      {"value": 3, "label": "3 — OH broadband"},
                      {"value": 4, "label": "4 — 840.0 nm"},
