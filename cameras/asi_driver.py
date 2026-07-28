@@ -64,6 +64,30 @@ FOCUS_SLACK_SECONDS = 3.0
 # focus session starts being served promptly.
 TICK = 0.2
 
+# Words that may stand for a shutter state. A remote parameter arrives as JSON
+# from focus_app (a real bool) or hand-typed over MQTT, and "closed" must never
+# be read as truthy just because it is a non-empty string.
+_TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
+_FALSE_WORDS = {"0", "false", "no", "off", "closed", "close", "shut"}
+
+
+def _as_bool(value):
+    """Interpret a remote on/off value, refusing anything ambiguous."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    raise ValueError(f"expected open/closed, got {value!r}")
+
+
+def _shutter_text(state):
+    return "unknown" if state is None else ("open" if state else "closed")
+
 
 # ---------------------------------------------------------------------------
 # Hardware facade
@@ -96,6 +120,13 @@ class AsiCamera:
             self.cam.__exit__(None, None, None)
             self._opened = False
             raise
+        # The controller never volunteers the shutter's state, so command it
+        # shut: after this the state reported to focus_app is a fact rather than
+        # an assumption, and closed is where every run starts anyway.
+        try:
+            self.set_shutter(False)
+        except Exception as exc:
+            console_ui.warn(f"Could not close the shutter at startup: {exc}")
         self._info = self.cam.info()
         return self
 
@@ -136,6 +167,11 @@ class AsiCamera:
     @property
     def current_filter(self):
         return self.wheel.current_filter
+
+    @property
+    def shutter_open(self):
+        """True/False once the shutter has been commanded, None while unknown."""
+        return getattr(self.wheel, "shutter_open", None)
 
     @property
     def target_temperature(self):
@@ -278,6 +314,7 @@ class AsiWorkerConsole(threading.Thread):
              else f"-  ·  {binning}x{binning}"),
             ("Gain:", str(self.cam.current_gain)),
             ("Filter:", str(self.cam.current_filter or "unknown")),
+            ("Shutter:", _shutter_text(self.cam.shutter_open)),
             ("Sensor temperature:", temp_text),
         ]
 
@@ -308,6 +345,7 @@ class AsiWorkerConsole(threading.Thread):
             "binning": self.cam.current_binning,
             "gain": self.cam.current_gain,
             "filter": self.cam.current_filter,
+            "shutter": self.cam.shutter_open,
             "next_slot": self._next_slot.isoformat() if self._next_slot else None,
             "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
@@ -337,6 +375,7 @@ class AsiWorkerConsole(threading.Thread):
             "binning": self.cam.current_binning,
             "gain": self.cam.current_gain,
             "filter": self.cam.current_filter,
+            "shutter": self.cam.shutter_open,
             "target_temp": self.cam.target_temperature,
         }
 
@@ -367,6 +406,17 @@ class AsiWorkerConsole(threading.Thread):
                         applied[name] = number
                     else:
                         errors.append(f"filter: wheel did not reach position {number}")
+                elif name == "shutter":
+                    is_open = _as_bool(value)
+                    self.cam.set_shutter(is_open)
+                    applied[name] = is_open
+                    # Only the darks are supposed to shoot shut. Closing it from
+                    # focus_app during a run would quietly turn every scheduled
+                    # frame into a dark, so say so where the operator will see it.
+                    if not is_open and not self.setup_mode:
+                        console_ui.warn(
+                            "Shutter closed remotely — scheduled frames stay "
+                            "dark until it is opened again")
                 elif name == "target_temp":
                     # Report what the camera took, not what was asked for.
                     applied[name] = self.cam.set_target_temperature(float(value))
@@ -623,6 +673,15 @@ class AsiWorkerConsole(threading.Thread):
         reason a camera without a schedule can now be focused at all.
         """
         self._dash_update(schedule="setup mode — no scheduled captures")
+        # Nothing here opens the shutter otherwise — the schedule modes do it
+        # after their pre-darks — and a focus session on a shut camera produces
+        # nothing but dark frames. Closing it again is the caller's ``finally``.
+        try:
+            self.cam.set_shutter(True)
+            console_ui.log("Setup mode: shutter opened for focusing "
+                           "(toggle it from focus_app)")
+        except Exception as exc:
+            console_ui.warn(f"Could not open the shutter: {exc}")
         while not self._stop_event.is_set():
             if not self._wait_seconds(5.0, phase="setup"):
                 return

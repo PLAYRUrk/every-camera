@@ -33,6 +33,10 @@ class FilterWheel:
         self._poll_interval = poll_interval  # status-poll cadence while the wheel moves
         self._ser: Serial | None = None
         self.current_filter: int = 0
+        # None until the shutter has actually been commanded: the controller
+        # never reports its state on its own, and focus_app must not be shown a
+        # guess as if it were a reading.
+        self.shutter_open: bool | None = None
 
     def __enter__(self) -> FilterWheel:
         # Imported here so the simulator backend runs without pyserial installed.
@@ -106,3 +110,4 @@ class FilterWheel:
         self._ser.write(("GOSUB6" + chr(13)).encode())
         sleep(0.1)
         self._ser.readline()  # controller ack (bounded by the serial read timeout)
+        self.shutter_open = bool(open)

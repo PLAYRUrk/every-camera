@@ -87,6 +87,12 @@ PARAM_SCHEMAS = {
                      {"value": 4, "label": "4 — 840.0 nm"},
                      {"value": 5, "label": "5 — 846.5 nm"},
                      {"value": 6, "label": "6 — 857.0 nm"}]},
+        # The shutter sits on the filter-wheel controller, not the camera. It is
+        # shut between runs and for darks, so focusing without a way to open it
+        # meant staring at dark frames and wondering what was wrong.
+        {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
+         "tooltip": "The wheel controller's shutter. Closed means the sensor "
+                    "sees nothing — dark frames are taken this way."},
         {"name": "target_temp", "label": "Sensor setpoint (°C)", "type": "float",
          "min": -80.0, "max": 25.0, "step": 1.0},
     ],

@@ -60,6 +60,23 @@ STRETCH_MODES = [
 ]
 
 
+TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
+
+
+def as_bool(value):
+    """Read an on/off value a camera reported. Unknown words mean off.
+
+    The camera answers in JSON, so this is usually already a bool; a camera that
+    words it ("open") must not be read as off, and a state the camera does not
+    know is shown unticked rather than guessed at.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in TRUE_WORDS
+
+
 # ---------------------------------------------------------------------------
 # Live view with an optional measurement region
 # ---------------------------------------------------------------------------
@@ -428,6 +445,12 @@ class ParamForm(QGroupBox):
         self.btn_revert.setEnabled(editable)
 
     def _make_widget(self, field):
+        widget = self._build_widget(field)
+        if widget is not None and field.get("tooltip"):
+            widget.setToolTip(field["tooltip"])
+        return widget
+
+    def _build_widget(self, field):
         kind = field.get("type", "text")
         if kind == "choice":
             combo = QComboBox()
@@ -435,6 +458,10 @@ class ParamForm(QGroupBox):
                 combo.addItem(str(choice.get("label", choice.get("value"))),
                               choice.get("value"))
             return combo
+        if kind == "bool":
+            # A shutter, a cooler — things that are simply on or off. The hint is
+            # the caption next to the box ("open"), the label says what it is.
+            return QCheckBox(field.get("hint", ""))
         if kind == "int":
             spin = QSpinBox()
             spin.setRange(int(field.get("min", 0)), int(field.get("max", 1_000_000)))
@@ -465,6 +492,8 @@ class ParamForm(QGroupBox):
                     index = widget.findText(str(value))
                 if index >= 0:
                     widget.setCurrentIndex(index)
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(as_bool(value))
             elif isinstance(widget, QSpinBox):
                 try:
                     widget.setValue(int(value))
@@ -486,6 +515,8 @@ class ParamForm(QGroupBox):
                 value = widget.currentData()
                 if value is None:
                     value = widget.currentText()
+            elif isinstance(widget, QCheckBox):
+                value = widget.isChecked()
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 value = widget.value()
             else:
