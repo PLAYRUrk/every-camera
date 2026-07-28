@@ -15,6 +15,7 @@ Topics (``prefix`` defaults to ``every_camera``):
 """
 import json
 import os
+import signal
 import time
 
 from datetime import datetime as dt
@@ -272,6 +273,33 @@ def parse_command_params(payload):
     if not isinstance(params, dict):
         return {}, None
     return params, None
+
+
+def install_stop_handler(handler):
+    """Route both stop signals to ``handler``: Ctrl+C and ``systemctl stop``.
+
+    Every driver used to listen for SIGINT alone, which is fine at a terminal
+    and wrong under a service manager: ``systemctl stop`` and a reboot send
+    SIGTERM, whose default disposition kills the process outright. For a camera
+    that means the closing dark frames are lost — and, on the ASI, that the
+    sensor never runs its warm-up, because that lives in the shutdown path the
+    process no longer reaches. The two signals mean the same thing to us, so
+    they get the same handler.
+
+    Python delivers signals on the main thread only, so this has to be called
+    from there; every driver does, from its ``run_*`` entry point.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, handler)
+
+
+def stop_signal_name(sig):
+    """What to call the signal in a log line.
+
+    "Ctrl+C" is what the operator did at a terminal, and nonsense in a journal
+    where the request came from ``systemctl stop``.
+    """
+    return "Ctrl+C" if sig == signal.SIGINT else "SIGTERM"
 
 
 def run_focus_iteration(service, grab, on_error=None):

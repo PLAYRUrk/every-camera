@@ -5,7 +5,6 @@ Uses pyusb for camera control.
 import os
 import sys
 import json
-import signal
 import time
 import struct
 import threading
@@ -27,7 +26,7 @@ from utils import (
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
     run_focus_iteration, MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode,
-    SETUP_STATUS,
+    SETUP_STATUS, install_stop_handler, stop_signal_name,
 )
 
 from .sptt_load_firmware import (
@@ -844,10 +843,10 @@ def run_preview_sptt(cam, instance_name):
 
     stop = threading.Event()
 
-    def _sigint(sig, frame):
-        console_ui.log("Stopping preview…")
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping preview…")
         stop.set()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     cam.start()
     frames = 0
@@ -1028,10 +1027,10 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         node_name=node_name,
     )
 
-    def _sigint(sig, frame):
-        console_ui.log("Ctrl+C — stopping…")
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping…")
         worker.request_stop()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     console_ui.log("Starting. Press Ctrl+C to stop.")
     try:

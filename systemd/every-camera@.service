@@ -1,0 +1,66 @@
+# every-camera as a system service, one instance per camera type.
+#
+#   systemctl enable --now every-camera@asi
+#
+# The instance name after the "@" is the camera type — asi, sentry, cannon,
+# sptt or infra — and is passed straight to main.py --type.
+#
+# Unlike the legacy imagerd_rt unit, this is Type=simple: every-camera does not
+# daemonise, so there is no PID file and no start/stop wrapper script. systemd
+# owns the process directly, which is what makes `systemctl status` and the
+# journal tell the truth about it.
+#
+# Nothing here changes how the program is run by hand. `python3 main.py --type
+# asi` still works exactly as before; this unit only supplies the same command
+# line with an explicit config path and an environment a login shell would
+# otherwise have provided.
+#
+# Install with systemd/install.sh, which fills in the paths below.
+
+[Unit]
+Description=Every Camera — %i
+Documentation=file:@APP_DIR@/README.md
+# The LAN frame server binds a port and the MQTT client dials out, so the
+# network wants to be genuinely up, not merely configured.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@APP_DIR@
+ExecStart=@PYTHON@ @APP_DIR@/main.py --type %i --config @CONFIG_DIR@/%i.json
+
+# Logs, status files and instance locks are written under $HOME. Running as
+# root would put them in /root, where the operator's monitor_app.py — which
+# reads ~/.every_camera/status — would never find them. Pointing HOME at the
+# operator's home keeps one set of files for both ways of starting the program.
+Environment=HOME=@USER_HOME@
+Environment=PYTHONUNBUFFERED=1
+
+# The PICAM SDK is found through the environment a login shell sets up, and a
+# service gets none of it. Uncomment and correct for this machine's install.
+#Environment=LD_LIBRARY_PATH=/usr/local/lib/picam
+#Environment=PICAM_INSTALL_PATH=/usr/local/picam
+
+# The console dashboard turns itself into plain log lines when stdout is not a
+# terminal, so the journal gets readable text without --verbose.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=every-camera-%i
+
+Restart=on-failure
+RestartSec=30
+
+# Stopping is not instant and must not be hurried. On SIGTERM the driver
+# finishes the frame it is exposing, shoots the closing dark frames, and — on
+# the ASI — warms the sensor from its operating temperature before the camera
+# is released. That last step alone is allowed up to asi.cooling.warm_timeout
+# (900 s by default). systemd's stock 90 s would SIGKILL the run in the middle
+# of it, so the budget here is deliberately generous.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=1800
+
+[Install]
+WantedBy=multi-user.target

@@ -13,7 +13,6 @@ import os
 import io
 import sys
 import json
-import signal
 import ctypes
 import threading
 import time
@@ -34,6 +33,7 @@ from utils import (
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
     announce_setup_mode, SETUP_STATUS,
+    install_stop_handler, stop_signal_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -1133,10 +1133,10 @@ def run_preview_infra(cam, instance_name):
 
     stop = threading.Event()
 
-    def _sigint(sig, frame):
-        console_ui.log("Stopping preview…")
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping preview…")
         stop.set()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     frames = 0
     t0 = dt.now()
@@ -1339,10 +1339,10 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
         setup_mode=setup_mode,
     )
 
-    def _sigint(sig, frame):
-        console_ui.log("Ctrl+C — stopping…")
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping…")
         worker.request_stop()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     console_ui.log("Starting. Press Ctrl+C to stop.")
     try:

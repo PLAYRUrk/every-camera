@@ -234,6 +234,32 @@ DEFAULT_CONFIG = {
         "schedule_len": None,           # cycle length, s (None = derive from slots)
         "dark_frames": 3,
         "dead_time": 5.0,
+        # sun_cycle only: shoot the bright twilight between two solar setpoints,
+        # on the main schedule but with the exposure chosen automatically to
+        # hold a mean frame intensity. Off by default.
+        "preflight": {
+            "enabled": False,
+            "sun_start_angle": -6.0,    # first setpoint; must be ABOVE sun_max_angle
+            "target_mean": 20000.0,     # mean frame intensity to hold, ADU 0..65535
+            "tolerance": 0.15,          # deadband, as a fraction of the target
+            "min_exposure": 0.05,       # shortest exposure the loop may pick, s
+            "max_exposure": None,       # None = no longer than the slot's own
+            "max_step": 4.0,            # largest exposure change per measurement
+            "bias": 0.0,                # pedestal, ADU; used when there are no darks
+        },
+        # Cycle modes: divide a slot's frame into shorter sub-frames when it
+        # comes back over the threshold, so a filter cannot saturate. Off by
+        # default.
+        "overexposure": {
+            "enabled": False,
+            "threshold": 55000.0,       # mean ADU above which the slot divides
+            "release": 0.85,            # hysteresis on the way back to one frame
+            "max_splits": 4,
+            "min_exposure": 0.05,       # shortest sub-frame, s
+            "margin": 0.5,              # slack kept inside the slot budget, s
+            "min_frame_gap": 1.0,       # sub-frames stay this far apart, s
+            "bias": 0.0,                # pedestal, ADU; used when there are no darks
+        },
         "wait_for_enter": True,         # time mode: wait for the operator to start
         "schedule_file": "",            # legacy schedule.txt or converted .json
         "schedule": [],                 # sun:   {"filter":1,"exposure":55,"seconds":[0]}
@@ -815,6 +841,43 @@ def configure_console_asi(cfg, config_path=None):
                                   asi.get("dark_frames", 3))
     asi["dead_time"] = _ask_float("Dead time between cycles (s)",
                                   asi.get("dead_time", 5.0))
+
+    # Both intensity loops keep the keys they are not asked about — the
+    # pedestal, the deadband, the step limits — so a station that tuned them by
+    # hand does not lose them to a pass through the wizard.
+    if asi["mode"] == "sun_cycle":
+        preflight = _deep_copy(DEFAULT_CONFIG["asi"]["preflight"])
+        preflight.update(asi.get("preflight") or {})
+        preflight["enabled"] = _ask_bool(
+            "Shoot the bright twilight first, with automatic exposure?",
+            preflight.get("enabled", False))
+        if preflight["enabled"]:
+            preflight["sun_start_angle"] = _ask_float(
+                f"  Start the automatic stage below (degrees, above "
+                f"{asi['sun_max_angle']:g})",
+                preflight.get("sun_start_angle", -6.0))
+            preflight["target_mean"] = _ask_float(
+                "  Mean frame intensity to hold (ADU, 0-65535)",
+                preflight.get("target_mean", 20000.0))
+            preflight["min_exposure"] = _ask_float(
+                "  Shortest exposure the loop may pick (s)",
+                preflight.get("min_exposure", 0.05))
+        asi["preflight"] = preflight
+
+    if asi["mode"] in ("time", "sun_cycle"):
+        guard = _deep_copy(DEFAULT_CONFIG["asi"]["overexposure"])
+        guard.update(asi.get("overexposure") or {})
+        guard["enabled"] = _ask_bool(
+            "Split a slot's frame in two when it over-exposes?",
+            guard.get("enabled", False))
+        if guard["enabled"]:
+            guard["threshold"] = _ask_float(
+                "  Mean intensity above which the slot splits (ADU, 0-65535)",
+                guard.get("threshold", 55000.0))
+            guard["max_splits"] = _ask_int(
+                "  Most sub-frames one slot may be divided into",
+                guard.get("max_splits", 4))
+        asi["overexposure"] = guard
 
     schedule_file = _ask("Schedule file path, .txt or .json "
                          "(empty = use the slots below)",

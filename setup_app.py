@@ -838,6 +838,94 @@ class AsiConfigTab:
 
         root.addWidget(sched_box)
 
+        # ── Intensity control ──────────────────────────────────────────────
+        # Only the settings an operator changes between nights are on screen;
+        # the pedestal, the deadband and the step limits stay in the file and
+        # are carried through by get_config().
+        pre = c.get("preflight") or {}
+        guard = c.get("overexposure") or {}
+        int_box, igrid = _group_grid("Intensity control")
+        row = 0
+        self.cb_preflight = QCheckBox("sun_cycle: shoot the bright twilight "
+                                      "first, with automatic exposure")
+        self.cb_preflight.setChecked(bool(pre.get("enabled", False)))
+        self.cb_preflight.setToolTip(
+            "Starts the cycle one solar setpoint earlier and holds a mean frame "
+            "intensity instead of using the slot exposures. At the angle above "
+            "the automation stops and the normal cycle takes over.")
+        igrid.addWidget(self.cb_preflight, row, 0, 1, 2); row += 1
+
+        self.sb_pre_angle = QDoubleSpinBox()
+        self.sb_pre_angle.setRange(-90.0, 90.0)
+        self.sb_pre_angle.setDecimals(1)
+        self.sb_pre_angle.setSuffix("°")
+        self.sb_pre_angle.setToolTip("The first setpoint. Must be ABOVE the "
+                                     "solar altitude above: the sun passes it "
+                                     "first on the way down.")
+        self.sb_pre_angle.setValue(float(pre.get("sun_start_angle", -6.0)))
+        _add_label_row(igrid, row, "Automatic stage below:", self.sb_pre_angle)
+        row += 1
+
+        self.sb_pre_target = QDoubleSpinBox()
+        self.sb_pre_target.setRange(0.0, 65535.0)
+        self.sb_pre_target.setDecimals(0)
+        self.sb_pre_target.setSuffix(" ADU")
+        self.sb_pre_target.setToolTip("Mean frame intensity the automatic stage "
+                                      "holds, in 16-bit counts (0-65535)")
+        self.sb_pre_target.setValue(float(pre.get("target_mean", 20000.0)))
+        _add_label_row(igrid, row, "Target mean intensity:", self.sb_pre_target)
+        row += 1
+
+        self.sb_pre_min_exp = QDoubleSpinBox()
+        self.sb_pre_min_exp.setRange(0.001, 3600.0)
+        self.sb_pre_min_exp.setDecimals(3)
+        self.sb_pre_min_exp.setSuffix(" s")
+        self.sb_pre_min_exp.setToolTip("Shortest exposure the loop may pick; it "
+                                       "never goes longer than the slot's own")
+        self.sb_pre_min_exp.setValue(float(pre.get("min_exposure", 0.05)))
+        _add_label_row(igrid, row, "Shortest automatic exposure:",
+                       self.sb_pre_min_exp)
+        row += 1
+
+        self.cb_overexp = QCheckBox("Cycle modes: split a slot's frame when it "
+                                    "over-exposes")
+        self.cb_overexp.setChecked(bool(guard.get("enabled", False)))
+        self.cb_overexp.setToolTip(
+            "When a slot comes back brighter than the threshold, its next visit "
+            "takes several shorter frames instead of one — enough of them that "
+            "none saturates, and never more time than the slot already had.")
+        igrid.addWidget(self.cb_overexp, row, 0, 1, 2); row += 1
+
+        self.sb_overexp_limit = QDoubleSpinBox()
+        self.sb_overexp_limit.setRange(0.0, 65535.0)
+        self.sb_overexp_limit.setDecimals(0)
+        self.sb_overexp_limit.setSuffix(" ADU")
+        self.sb_overexp_limit.setToolTip("Mean frame intensity above which the "
+                                         "slot divides, in 16-bit counts")
+        self.sb_overexp_limit.setValue(float(guard.get("threshold", 55000.0)))
+        _add_label_row(igrid, row, "Split above:", self.sb_overexp_limit)
+        row += 1
+
+        self.sb_overexp_max = QSpinBox()
+        self.sb_overexp_max.setRange(2, 16)
+        self.sb_overexp_max.setToolTip("Most sub-frames one slot may be divided "
+                                       "into. The slot's own timing may allow "
+                                       "fewer.")
+        self.sb_overexp_max.setValue(int(guard.get("max_splits", 4)))
+        _add_label_row(igrid, row, "Most sub-frames:", self.sb_overexp_max)
+        row += 1
+
+        for box, widgets in ((self.cb_preflight, (self.sb_pre_angle,
+                                                  self.sb_pre_target,
+                                                  self.sb_pre_min_exp)),
+                             (self.cb_overexp, (self.sb_overexp_limit,
+                                                self.sb_overexp_max))):
+            for widget in widgets:
+                box.toggled.connect(widget.setEnabled)
+                widget.setEnabled(box.isChecked())
+
+        root.addWidget(int_box)
+
         # ── Slot table ─────────────────────────────────────────────────────
         slot_box = QGroupBox("Schedule slots  (delta+binning: time mode · "
                              "seconds: sun mode)")
@@ -921,7 +1009,8 @@ class AsiConfigTab:
         """
         merged = copy.deepcopy(self._orig)
         merged.update(self._edited())
-        for section in ("camera", "cooling", "filter_wheel", "location"):
+        for section in ("camera", "cooling", "filter_wheel", "location",
+                        "preflight", "overexposure"):
             base = self._orig.get(section)
             if isinstance(base, dict):
                 merged[section] = {**base, **merged[section]}
@@ -968,6 +1057,17 @@ class AsiConfigTab:
                 "lat": self.sb_lat.value(),
                 "lon": self.sb_lon.value(),
                 "elevation": self.sb_elev.value(),
+            },
+            "preflight": {
+                "enabled": self.cb_preflight.isChecked(),
+                "sun_start_angle": self.sb_pre_angle.value(),
+                "target_mean": self.sb_pre_target.value(),
+                "min_exposure": self.sb_pre_min_exp.value(),
+            },
+            "overexposure": {
+                "enabled": self.cb_overexp.isChecked(),
+                "threshold": self.sb_overexp_limit.value(),
+                "max_splits": self.sb_overexp_max.value(),
             },
         }
 

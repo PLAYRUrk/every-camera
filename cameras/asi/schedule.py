@@ -322,6 +322,36 @@ def cycle_period(entries, dead_time):
     return (last.delta or 0.0) + last.exposure + readout
 
 
+def slot_gap(entries, period, entry):
+    """Seconds from this slot to the next one in the cycle, wrapping at the end.
+
+    Entries are ordered by delta, the way :func:`next_cycle_slot` orders them.
+    The last slot's gap runs into the next iteration, so it is measured to the
+    first slot of that one rather than to the end of the cycle.
+    """
+    if not entries:
+        return float(period)
+    deltas = sorted(float(e.delta or 0.0) for e in entries)
+    mine = float(entry.delta or 0.0)
+    later = [d for d in deltas if d > mine]
+    if later:
+        return later[0] - mine
+    return float(period) - mine + deltas[0]
+
+
+def slot_budget(entries, period, entry, dead_time):
+    """How long an exposure at this slot may actually run.
+
+    The gap to the next slot, less the time the frame needs after the shutter
+    closes — the entry's own readout when it names one, otherwise the
+    schedule-wide dead time. Nothing in a well-formed schedule exceeds this; it
+    is the guard that stops an automatically chosen exposure from pushing the
+    following slot late.
+    """
+    readout = entry.readout if entry.readout is not None else dead_time
+    return max(slot_gap(entries, period, entry) - float(readout), 0.0)
+
+
 def next_cycle_slot(t_start, period, entries, now):
     """``(slot_time, entry, iteration)`` of the next capture, phase-locked to ``t_start``.
 

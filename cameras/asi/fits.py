@@ -93,6 +93,9 @@ def write_fits(
     filter_description: str = "",
     fw_temp: float | None = None,
     legacy_version: str = LEGACY_VERSION,
+    sky_mean: float | None = None,
+    split_count: int = 1,
+    split_index: int = 1,
 ) -> None:
     if data is None:
         raise ValueError(f"Cannot write FITS '{path}': image data is None (capture failed)")
@@ -108,7 +111,9 @@ def write_fits(
     h["CCD-TEMP"] = (ccd_temp if ccd_temp is not None else UNKNOWN_TEMP,
                      "[C] CCD sensor temperature")
     h["IMAGETYP"] = (image_type, "frame type: LIGHT or DARK")
-    h["OBSMODE"] = (obs_mode, "observation mode: sun, time, sun_cycle, or dark")
+    # ``sun_cycle_auto`` is the preflight stage: the sun_cycle schedule shot with
+    # automatically chosen exposures, before the programme proper starts.
+    h["OBSMODE"] = (obs_mode, "observation mode; see also SPLITNUM")
     h["INSTRUME"] = (camera_model, "camera model")
     h["VENDOR"] = (camera_vendor, "camera manufacturer")
     h["CAMSN"] = (camera_sn, "camera serial number")
@@ -123,6 +128,15 @@ def write_fits(
         h["GAIN"] = (gain, "ADC analog gain: 1 Low, 2 Medium, 3 High")
     if set_temp is not None:
         h["SETTEMP"] = (set_temp, "[C] sensor temperature setpoint")
+    # What the intensity-control loops measured and decided. SKYMEAN is written
+    # for every frame because it costs one pass over the array and answers the
+    # first question anyone asks of an archived frame; the SPLIT* pair appears
+    # only when a slot was actually divided.
+    if sky_mean is not None:
+        h["SKYMEAN"] = (round(float(sky_mean), 2), "[ADU] mean frame intensity")
+    if split_count and split_count > 1:
+        h["SPLITNUM"] = (int(split_count), "sub-frames this slot was divided into")
+        h["SPLITIDX"] = (int(split_index), "index of this sub-frame, 1-based")
 
     _write_legacy_keys(
         h,

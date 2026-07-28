@@ -26,6 +26,17 @@ DEFAULT_MODE = "sun"
 # astropy.
 DEFAULT_LEGACY_VERSION = "3.0"
 
+# Full scale of this 16-bit instrument, the range every intensity setting is
+# expressed in. Spelled here for the same reason as the version above: reading a
+# config must not pull in numpy through .exposure.
+SATURATION_ADU = 65535.0
+
+# The archive file name resolves to one second (``paths.frame_name``), so two
+# frames closer together than this cannot both be filed under the name the
+# station's processing program expects. The overexposure guard therefore never
+# plans sub-frames tighter than this, whatever the config asks for.
+ARCHIVE_NAME_RESOLUTION = 1.0
+
 # The Tory instrument's wheel, from imagerd_rt's imager.conf. Overridable
 # through ``asi.filters``; a station with a different wheel says so there.
 DEFAULT_FILTERS = [
@@ -125,6 +136,39 @@ class ScheduleCfg:
 
 
 @dataclass
+class PreflightCfg:
+    """The bright-twilight stage of ``sun_cycle``, with automatic exposure.
+
+    ``sun_start_angle`` is the first setpoint and must sit *above*
+    ``ScheduleCfg.sun_max_angle``: the sun descends through them in that order,
+    and the stage lives in the gap between the two.
+    """
+
+    enabled: bool = False
+    sun_start_angle: float = -6.0
+    target_mean: float = 20000.0      # ADU, 0..65535
+    tolerance: float = 0.15           # deadband, as a fraction of the target
+    min_exposure: float = 0.05        # s
+    max_exposure: float = None        # None: no longer than the slot's own
+    max_step: float = 4.0             # largest exposure change per measurement
+    bias: float = 0.0                 # pedestal, ADU; used when there are no darks
+
+
+@dataclass
+class OverexposureCfg:
+    """Dividing a slot's frame into shorter sub-frames when it over-exposes."""
+
+    enabled: bool = False
+    threshold: float = 55000.0        # mean ADU above which the slot divides
+    release: float = 0.85             # hysteresis on the way back down
+    max_splits: int = 4
+    min_exposure: float = 0.05        # shortest sub-frame, s
+    margin: float = 0.5               # slack kept inside the slot budget, s
+    min_frame_gap: float = 1.0        # sub-frames stay this far apart, s
+    bias: float = 0.0                 # pedestal, ADU; used when there are no darks
+
+
+@dataclass
 class AsiConfig:
     output_dir: str = ""
     camera: CameraCfg = field(default_factory=CameraCfg)
@@ -134,6 +178,8 @@ class AsiConfig:
     station: StationCfg = field(default_factory=StationCfg)
     filters: list = field(default_factory=list)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
+    preflight: PreflightCfg = field(default_factory=PreflightCfg)
+    overexposure: OverexposureCfg = field(default_factory=OverexposureCfg)
     wait_for_enter: bool = True
     errors: list = field(default_factory=list)
 
@@ -325,6 +371,15 @@ def from_dict(asi_cfg):
         schedule_len=schedule_len,
     )
 
+    preflight = _preflight(_sub(asi_cfg, "preflight"), sched, errors)
+    overexposure = _overexposure(_sub(asi_cfg, "overexposure"), errors)
+    if (preflight.enabled and overexposure.enabled
+            and overexposure.threshold <= preflight.target_mean):
+        errors.append(
+            f"asi.overexposure.threshold ({overexposure.threshold:g}) is at or "
+            f"below asi.preflight.target_mean ({preflight.target_mean:g}); the "
+            f"two loops would work against each other")
+
     fw_temp = settings.get("fw_temp")
     station = StationCfg(
         site_id=str(settings.get("site_id", "") or ""),
@@ -343,9 +398,106 @@ def from_dict(asi_cfg):
         station=station,
         filters=filters,
         schedule=sched,
+        preflight=preflight,
+        overexposure=overexposure,
         wait_for_enter=_bool(asi_cfg, "wait_for_enter", True),
         errors=errors,
     )
+
+
+def _preflight(raw, sched, errors):
+    """The preflight block, validated against the schedule it has to fit inside.
+
+    A misconfigured stage is switched off rather than corrected into something
+    the operator did not ask for: shooting the twilight at the wrong exposure is
+    worse than not shooting it.
+    """
+    cfg = PreflightCfg(
+        enabled=_bool(raw, "enabled", False),
+        sun_start_angle=_float(raw, "sun_start_angle", -6.0),
+        target_mean=_float(raw, "target_mean", 20000.0),
+        tolerance=_float(raw, "tolerance", 0.15),
+        min_exposure=_float(raw, "min_exposure", 0.05),
+        max_exposure=None,
+        max_step=_float(raw, "max_step", 4.0),
+        bias=_float(raw, "bias", 0.0),
+    )
+    raw_max = raw.get("max_exposure")
+    if raw_max not in (None, "", 0, 0.0):
+        cfg.max_exposure = _float(raw, "max_exposure", 0.0) or None
+
+    if cfg.enabled and sched.mode != "sun_cycle":
+        errors.append(f"asi.preflight works only in 'sun_cycle' mode (mode is "
+                      f"{sched.mode!r}); the preflight stage is off")
+        cfg.enabled = False
+    if cfg.enabled and cfg.sun_start_angle <= sched.sun_max_angle:
+        errors.append(f"asi.preflight.sun_start_angle ({cfg.sun_start_angle:g}) "
+                      f"must be above asi.sun_max_angle "
+                      f"({sched.sun_max_angle:g}); the preflight stage is off")
+        cfg.enabled = False
+    if not 0.0 < cfg.target_mean < SATURATION_ADU:
+        errors.append(f"asi.preflight.target_mean must be between 0 and "
+                      f"{SATURATION_ADU:.0f} ADU, got "
+                      f"{cfg.target_mean:g}; the preflight stage is off")
+        cfg.enabled = False
+    if cfg.min_exposure <= 0:
+        errors.append(f"asi.preflight.min_exposure must be positive, got "
+                      f"{cfg.min_exposure:g}; using 0.05")
+        cfg.min_exposure = 0.05
+    if not 0.0 <= cfg.tolerance < 1.0:
+        errors.append(f"asi.preflight.tolerance must be between 0 and 1, got "
+                      f"{cfg.tolerance:g}; using 0.15")
+        cfg.tolerance = 0.15
+    if cfg.max_step <= 1.0:
+        errors.append(f"asi.preflight.max_step must be greater than 1, got "
+                      f"{cfg.max_step:g}; using 4.0")
+        cfg.max_step = 4.0
+    return cfg
+
+
+def _overexposure(raw, errors):
+    """The overexposure block. Same rule: unusable settings switch it off."""
+    cfg = OverexposureCfg(
+        enabled=_bool(raw, "enabled", False),
+        threshold=_float(raw, "threshold", 55000.0),
+        release=_float(raw, "release", 0.85),
+        max_splits=_int(raw, "max_splits", 4),
+        min_exposure=_float(raw, "min_exposure", 0.05),
+        margin=_float(raw, "margin", 0.5),
+        min_frame_gap=_float(raw, "min_frame_gap", 1.0),
+        bias=_float(raw, "bias", 0.0),
+    )
+    if not 0.0 < cfg.threshold <= SATURATION_ADU:
+        errors.append(f"asi.overexposure.threshold must be between 0 and "
+                      f"{SATURATION_ADU:.0f} ADU, got "
+                      f"{cfg.threshold:g}; the overexposure guard is off")
+        cfg.enabled = False
+    if cfg.enabled and cfg.max_splits < 2:
+        errors.append(f"asi.overexposure.max_splits must be at least 2, got "
+                      f"{cfg.max_splits}; the overexposure guard is off")
+        cfg.enabled = False
+    if cfg.min_exposure <= 0:
+        errors.append(f"asi.overexposure.min_exposure must be positive, got "
+                      f"{cfg.min_exposure:g}; using 0.05")
+        cfg.min_exposure = 0.05
+    if not 0.0 < cfg.release <= 1.0:
+        errors.append(f"asi.overexposure.release must be between 0 and 1, got "
+                      f"{cfg.release:g}; using 0.85")
+        cfg.release = 0.85
+    if cfg.margin < 0:
+        errors.append(f"asi.overexposure.margin must not be negative, got "
+                      f"{cfg.margin:g}; using 0.0")
+        cfg.margin = 0.0
+    # Not negotiable: sub-frames packed tighter than the archive's own name
+    # resolution would overwrite each other, and a frame taken is a frame that
+    # has to reach the disk. A config asking for less is raised, with a note.
+    if cfg.min_frame_gap < ARCHIVE_NAME_RESOLUTION:
+        errors.append(f"asi.overexposure.min_frame_gap must be at least "
+                      f"{ARCHIVE_NAME_RESOLUTION:g} s — the archive file name "
+                      f"resolves to one second — got {cfg.min_frame_gap:g}; "
+                      f"using {ARCHIVE_NAME_RESOLUTION:g}")
+        cfg.min_frame_gap = ARCHIVE_NAME_RESOLUTION
+    return cfg
 
 
 def _filters(raw):

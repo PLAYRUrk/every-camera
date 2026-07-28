@@ -26,7 +26,6 @@ Config in config.json (human-readable, replaces raw schedule.conf):
 import os
 import sys
 import json
-import signal
 import shutil
 import subprocess
 import threading
@@ -45,7 +44,10 @@ from utils import (
     claim_instance_name, get_instance_name, get_local_ip,
     get_system_info, APP_DIR,
 )
-from worker_common import WorkerMqtt, announce_setup_mode, SETUP_STATUS
+from worker_common import (
+    WorkerMqtt, announce_setup_mode, SETUP_STATUS,
+    install_stop_handler, stop_signal_name,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -543,10 +545,10 @@ def run_preview_sentry(cam: SentryCamera, instance_name: str):
 
     stop = threading.Event()
 
-    def _sigint(sig, frame):
-        console_ui.log("Stopping preview…")
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping preview…")
         stop.set()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     import shutil
     frames = 0
@@ -668,10 +670,10 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
             setup_mode=setup_mode,
         )
 
-        def _sigint(sig, frame):
-            console_ui.log("Ctrl+C — stopping…")
+        def _stop(sig, frame):
+            console_ui.log(f"{stop_signal_name(sig)} — stopping…")
             worker.request_stop()
-        signal.signal(signal.SIGINT, _sigint)
+        install_stop_handler(_stop)
 
         console_ui.log("Starting. Press Ctrl+C to stop.")
         worker.start()

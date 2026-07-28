@@ -39,7 +39,6 @@ Frames are filed as ``<output_dir>/YYYY/MM/DD/`` in UTC, under imagerd_rt's own
 file name — see ``cameras/asi/paths.py``.
 """
 import os
-import signal
 import sys
 import threading
 import time
@@ -56,10 +55,12 @@ from utils import (
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
     run_focus_iteration, announce_setup_mode, SETUP_STATUS,
+    install_stop_handler, stop_signal_name,
 )
 
 from cameras.asi import config as asi_config
 from cameras.asi import devices, paths as asi_paths, picam, schedule as asi_schedule
+from cameras.asi import exposure as asi_exposure
 from cameras.asi.fits import write_fits
 from cameras.asi.seqno import next_seqno
 # Safe to import here: the wheel module pulls in pyserial only when it opens a
@@ -249,10 +250,17 @@ class AsiCamera:
     def capture(self):
         return self.cam.capture()
 
-    def prepare(self, entry):
-        """Apply one schedule entry's exposure, binning, gain and filter."""
-        if entry.exposure is not None and self.current_exposure != entry.exposure:
-            self.set_exposure(entry.exposure)
+    def prepare(self, entry, exposure=None):
+        """Apply one schedule entry's exposure, binning, gain and filter.
+
+        ``exposure`` overrides the entry's own. The preflight stage and the
+        overexposure guard both choose the exposure themselves, and the camera
+        has to hold exactly what the file name and ``EXPTIME`` will claim — so
+        there is one value, applied here, rather than two that could drift apart.
+        """
+        wanted = entry.exposure if exposure is None else float(exposure)
+        if wanted is not None and self.current_exposure != wanted:
+            self.set_exposure(wanted)
         if entry.binning and self.current_binning != entry.binning:
             self.set_binning(entry.binning)
         if entry.gain and self.current_gain != entry.gain:
@@ -303,6 +311,15 @@ class AsiWorkerConsole(threading.Thread):
         self._last_shot = None
         self._last_file = None
         self._last_frame = None
+        # Intensity control: what the last frame measured, which stage the
+        # sun_cycle is in, and what the two loops currently ask of a slot.
+        self._last_mean = None
+        self._last_saturation = 0.0
+        self._stage = "main"
+        self._auto_exposure = None
+        self._split_frames = 1
+        self._dark_means = {}
+        self._warned_slots = set()
         self._phase = "starting"
         self._next_slot = None
         self._pending_capture = None
@@ -340,7 +357,7 @@ class AsiWorkerConsole(threading.Thread):
             temp_text += f"   setpoint {cooling['setpoint']:.1f} °C ({state})"
         binning = self.cam.current_binning or 1
         exposure = self.cam.current_exposure
-        return [
+        rows = [
             ("Exposure / binning:",
              f"{exposure:g} s  ·  {binning}x{binning}" if exposure
              else f"-  ·  {binning}x{binning}"),
@@ -349,6 +366,25 @@ class AsiWorkerConsole(threading.Thread):
             ("Shutter:", _shutter_text(self.cam.shutter_open)),
             ("Sensor temperature:", temp_text),
         ]
+        # Only shown while something is actually driving the intensity, so the
+        # block keeps its usual five rows on an ordinary run.
+        control = self._intensity_row()
+        if control:
+            rows.append(("Intensity control:", control))
+        return rows
+
+    def _intensity_row(self):
+        mean = ("" if self._last_mean is None
+                else f"  ·  last mean {self._last_mean:.0f} ADU")
+        if self._stage == "preflight":
+            if self._auto_exposure is None:
+                return f"preflight{mean}"
+            return (f"preflight, auto {self._auto_exposure:g} s"
+                    f"  ·  target {self.cfg.preflight.target_mean:.0f} ADU{mean}")
+        if self._split_frames > 1:
+            return (f"split ×{self._split_frames}"
+                    f"  ·  limit {self.cfg.overexposure.threshold:.0f} ADU{mean}")
+        return ""
 
     def _refresh_camera_section(self, cooling=None):
         if self._dash is None:
@@ -383,6 +419,14 @@ class AsiWorkerConsole(threading.Thread):
             "shutter": self.cam.shutter_open,
             "next_slot": self._next_slot.isoformat() if self._next_slot else None,
             "setup_mode": self.setup_mode,
+            # Intensity control, for the monitor: which sun_cycle stage is
+            # running, what the automatic exposure settled on, how far the
+            # current slot is divided, and what the last frame measured.
+            "stage": self._stage,
+            "auto_exposure": self._auto_exposure,
+            "split_frames": self._split_frames,
+            "last_mean": (round(self._last_mean, 2)
+                          if self._last_mean is not None else None),
             "last_update": dt.now().isoformat(),
         }
         if cooling.get("ccd_temp") is not None:
@@ -557,7 +601,8 @@ class AsiWorkerConsole(threading.Thread):
     # Capture
     # ------------------------------------------------------------------
     def _write_frame(self, path, image, timestamp, exposure, image_type, obs_mode,
-                     cooling=None, seqno=None):
+                     cooling=None, seqno=None, sky_mean=None, split_count=1,
+                     split_index=1):
         cooling = cooling or {}
         station = self.cfg.station
         filt = self.cfg.filter_info(self.cam.filter_number)
@@ -591,10 +636,34 @@ class AsiWorkerConsole(threading.Thread):
             filter_description=filt.description,
             fw_temp=station.fw_temp,
             legacy_version=station.legacy_version,
+            sky_mean=sky_mean,
+            split_count=split_count,
+            split_index=split_index,
         )
 
+    def _unique_frame_path(self, now, **kwargs):
+        """A free path for this frame, or None when the second is hopelessly full.
+
+        The archive name resolves to one second (``paths.frame_name``) and
+        ``write_fits`` refuses to overwrite, so two frames taken inside the same
+        second at the same exposure collide. The overexposure guard's
+        ``min_frame_gap`` keeps sub-frames a second apart precisely so this
+        cannot happen; this is the backstop for the case that predates it — two
+        schedule slots landing in one second.
+
+        The name's second is nudged forward until it is free. ``DATE-OBS`` keeps
+        the true start of the exposure, so in that rare case a name and a header
+        disagree by a second or two; the header is the one to believe.
+        """
+        for offset in range(5):
+            path = asi_paths.frame_path(self.output_dir,
+                                        now + timedelta(seconds=offset), **kwargs)
+            if not path.exists():
+                return path
+        return None
+
     def _capture_one(self, now, exposure, image_type="LIGHT", obs_mode=None,
-                     label=None):
+                     label=None, split_count=1, split_index=1):
         """Take, save and publish one frame. Returns True on success."""
         obs_mode = obs_mode or self.cfg.schedule.mode
         cooling = self._refresh_camera_section()
@@ -617,22 +686,34 @@ class AsiWorkerConsole(threading.Thread):
                                     ts_iso=now.isoformat())
             return False
 
+        self._last_mean, self._last_saturation = asi_exposure.frame_stats(image)
+
         station = self.cfg.station
-        path = asi_paths.frame_path(
-            self.output_dir, now,
+        path = self._unique_frame_path(
+            now,
             site_id=station.site_id,
             device_id=station.device_id,
             wavelength=self.cfg.filter_info(self.cam.filter_number).wavelength,
             exposure_sec=exposure,
             dark=(image_type == "DARK"),
         )
+        if path is None:
+            self._errors += 1
+            self._dash_update(errors=self._errors)
+            console_ui.error(f"Five frames already share the second "
+                             f"{now:%H:%M:%S} — dropping this one")
+            self._bus.publish_error("error", "frame name collision",
+                                    ts_iso=now.isoformat())
+            return False
         # Shown on the dashboard and in the log: the full path is mostly the
         # date tree the operator already knows.
         name = str(path.relative_to(self.output_dir))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._write_frame(path, image, now, exposure, image_type, obs_mode,
-                              cooling, seqno=next_seqno(self.output_dir))
+                              cooling, seqno=next_seqno(self.output_dir),
+                              sky_mean=self._last_mean,
+                              split_count=split_count, split_index=split_index)
         except Exception as exc:
             self._errors += 1
             self._dash_update(errors=self._errors)
@@ -646,6 +727,10 @@ class AsiWorkerConsole(threading.Thread):
         self._last_file = name
         if image_type == "DARK":
             self._darks += 1
+            # The pedestal the intensity loops extrapolate against: bias plus
+            # whatever dark current this exposure collects.
+            if self._last_mean is not None:
+                self._dark_means.setdefault(exposure, []).append(self._last_mean)
         else:
             self._shots += 1
         if self._service is not None:
@@ -654,7 +739,10 @@ class AsiWorkerConsole(threading.Thread):
                                                      "exposure": exposure})
         self._dash_update(frames=self._shots, darks=self._darks,
                           last_file=name, errors=self._errors)
-        console_ui.log(f"Saved {name}")
+        detail = "" if self._last_mean is None else f"  mean {self._last_mean:.0f} ADU"
+        if split_count > 1:
+            detail += f"  ({split_index}/{split_count})"
+        console_ui.log(f"Saved {name}{detail}")
         if self._bus.enabled:
             try:
                 self._bus.publish_frame_array(image, now.isoformat(),
@@ -663,6 +751,54 @@ class AsiWorkerConsole(threading.Thread):
                 console_ui.warn(f"MQTT frame publish: {exc}")
         self._save_status("running", force=True, cooling=cooling)
         return True
+
+    # ------------------------------------------------------------------
+    # Intensity control
+    # ------------------------------------------------------------------
+    def _bias_for(self, exposure, fallback=0.0):
+        """The pedestal to extrapolate an intensity against, in ADU.
+
+        Taken from the pre-darks, which are already shot per unique exposure, so
+        this costs nothing extra: the nearest exposure's darks are what a frame
+        of this length would sit on. Falls back to the configured value when the
+        run has no darks — a late start, or ``dark_frames`` set to zero.
+        """
+        if not self._dark_means:
+            return float(fallback)
+        nearest = min(self._dark_means,
+                      key=lambda e: abs(float(e) - float(exposure)))
+        means = self._dark_means[nearest]
+        return sum(means) / len(means) if means else float(fallback)
+
+    def _capture_slot(self, entry, exposure, frames, obs_mode):
+        """Shoot one cycle slot: ``frames`` back-to-back sub-frames.
+
+        Returns ``(ok, mean)``. ``ok`` is False only when *every* sub-frame
+        failed, so one bad read inside a split does not cost the whole slot and
+        does not push the run towards its consecutive-failure limit.
+        """
+        # The camera is the authority on what was actually applied: if
+        # ``prepare`` threw halfway through, filing the frame under the exposure
+        # we merely intended would put a lie in the name and in EXPTIME.
+        applied = self.cam.current_exposure
+        if applied and abs(float(applied) - float(exposure)) > 1e-6:
+            console_ui.warn(f"Camera holds {applied:g} s but {exposure:g} s was "
+                            f"planned — filing the frame as {applied:g} s")
+            exposure = applied
+
+        means, ok_any = [], False
+        for index in range(frames):
+            if self._stop_event.is_set():
+                break
+            label = f"LIGHT filter={_filter_text(self.cam.current_filter)}"
+            if frames > 1:
+                label += f"  {index + 1}/{frames}"
+            if self._capture_one(dt.now(), exposure, "LIGHT", obs_mode,
+                                 label=label, split_count=frames,
+                                 split_index=index + 1):
+                ok_any = True
+                means.append(self._last_mean)
+        return ok_any, asi_exposure.combine_means(means)
 
     # ------------------------------------------------------------------
     # Dark frames
@@ -674,6 +810,10 @@ class AsiWorkerConsole(threading.Thread):
         if not combos or self._force_quit:
             return
         total = self.cfg.schedule.dark_frames * len(combos)
+        # Neither loop drives a dark, so the dashboard must not go on claiming
+        # an automatic exposure or a split while the closing darks run.
+        self._auto_exposure = None
+        self._split_frames = 1
         self._set_phase(f"dark frames ({phase})", detail=f"0/{total}")
         console_ui.log(f"Dark frames ({phase}): {self.cfg.schedule.dark_frames} × "
                        f"{len(combos)} exposure(s)")
@@ -878,20 +1018,27 @@ class AsiWorkerConsole(threading.Thread):
         except Exception as exc:
             console_ui.warn(f"Could not open the shutter: {exc}")
 
+        # The overexposure guard applies to the general cycle, which is what this
+        # mode runs; the preflight stage does not, there being no sun in it.
+        auto = asi_exposure.AutoExposure(self.cfg.preflight)
+        guard = asi_exposure.SplitGuard(self.cfg.overexposure)
+
         consecutive_errors = 0
         while not self._stop_event.is_set():
             now = dt.now()
             slot, entry, iteration = asi_schedule.next_cycle_slot(
                 t_start, period, sched.entries, now)
+            exposure, frames = self._plan_slot(entry, auto, guard)
             self._dash_update(
-                detail=f"cycle {iteration}, Δ{entry.delta:g} s",
+                detail=f"cycle {iteration}, Δ{entry.delta:g} s"
+                       f"{self._intensity_text(exposure, frames)}",
                 schedule=f"cycle {period:.0f} s from {t_start.strftime('%H:%M:%S')}"
                          f"  ·  iteration {iteration}")
 
             # Prepared on this thread, in the gap before the slot: a filter move
             # takes about a second and there is normally far more room than that.
             try:
-                self.cam.prepare(entry)
+                self.cam.prepare(entry, exposure=exposure)
             except Exception as exc:
                 console_ui.error(f"Could not prepare the cycle: {exc}")
                 self._errors += 1
@@ -899,7 +1046,9 @@ class AsiWorkerConsole(threading.Thread):
 
             if not self._wait_until(slot, phase="measuring"):
                 break
-            if self._capture_one(dt.now(), entry.exposure, "LIGHT", "time"):
+            ok, mean = self._capture_slot(entry, exposure, frames, "time")
+            self._feed_controllers(entry, exposure, mean, auto, guard)
+            if ok:
                 consecutive_errors = 0
             else:
                 consecutive_errors += 1
@@ -919,18 +1068,40 @@ class AsiWorkerConsole(threading.Thread):
         happens before then is the pre-darks, timed to finish exactly as the
         window opens; the cycle is then anchored to the first whole minute of
         the window and free-runs until sunrise.
+
+        With ``preflight`` enabled the session opens one setpoint earlier. The
+        same slots, the same anchor and the same cycle phase run through the
+        bright twilight, but with the exposure chosen to hold a mean intensity
+        rather than read from the schedule; at ``sun_max_angle`` the automation
+        stops and the programme above resumes exactly as written. Sunrise still
+        ends the run at ``sun_max_angle``, so the automatic stage is an evening
+        prelude and never a morning encore.
         """
         sched = self.cfg.schedule
+        pre = self.cfg.preflight
+        guard_cfg = self.cfg.overexposure
         angle_fn = self._sun_angle_fn()
         period = sched.period
 
-        activation = asi_schedule.sun_crossing_time(angle_fn, sched.sun_max_angle)
+        # The angle that opens the session. With the preflight stage off this is
+        # sun_max_angle, and everything below is what it always was.
+        open_angle = pre.sun_start_angle if pre.enabled else sched.sun_max_angle
+        activation = asi_schedule.sun_crossing_time(angle_fn, open_angle)
         dark_seconds = asi_schedule.estimate_cycle_dark_duration(
             sched.entries, sched.dark_frames, sched.dead_time)
         dark_start = activation - timedelta(seconds=dark_seconds)
-        self._dash_update(
-            schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle {period:.0f} s, "
-                     f"window ~{activation.strftime('%H:%M')}")
+        if pre.enabled:
+            self._dash_update(
+                schedule=f"preflight ≤ {pre.sun_start_angle:g}° → main ≤ "
+                         f"{sched.sun_max_angle:g}°, cycle {period:.0f} s, "
+                         f"window ~{activation.strftime('%H:%M')}")
+            console_ui.log(f"Preflight stage from {pre.sun_start_angle:g}° to "
+                           f"{sched.sun_max_angle:g}°, holding "
+                           f"{pre.target_mean:.0f} ADU")
+        else:
+            self._dash_update(
+                schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle {period:.0f} s, "
+                         f"window ~{activation.strftime('%H:%M')}")
 
         if dark_start > dt.now():
             console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
@@ -956,34 +1127,69 @@ class AsiWorkerConsole(threading.Thread):
         if not self._wait_until(anchor, phase="waiting for the cycle anchor"):
             return
 
+        auto = asi_exposure.AutoExposure(pre)
+        guard = asi_exposure.SplitGuard(guard_cfg)
+        # A run started mid-night has already missed the twilight; it goes
+        # straight to the main programme rather than automating a dark sky.
+        self._stage = ("preflight"
+                       if pre.enabled and angle_fn(dt.now()) > sched.sun_max_angle
+                       else "main")
+
         consecutive_errors = 0
         while not self._stop_event.is_set():
             now = dt.now()
             angle = angle_fn(now)
-            if angle > sched.sun_max_angle:
+            if self._stage == "preflight" and angle <= sched.sun_max_angle:
+                self._enter_main_stage(auto, sched)
+            elif self._stage == "main" and angle > sched.sun_max_angle:
                 console_ui.log("Sun above the threshold — measurements done.")
+                break
+            elif self._stage == "preflight" and angle > pre.sun_start_angle:
+                console_ui.log("Sun above the preflight angle — measurements done.")
                 break
 
             slot, entry, iteration = asi_schedule.next_cycle_slot(
                 anchor, period, sched.entries, now)
+            exposure, frames = self._plan_slot(entry, auto, guard)
             self._dash_update(
-                detail=f"cycle {iteration}, Δ{entry.delta:g} s",
+                detail=f"cycle {iteration}, Δ{entry.delta:g} s"
+                       f"{self._intensity_text(exposure, frames)}",
                 schedule=f"sun {angle:+.1f}° (threshold {sched.sun_max_angle:g}°)"
-                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}")
+                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}"
+                         f"{'  ·  preflight' if self._stage == 'preflight' else ''}")
 
             try:
-                self.cam.prepare(entry)
+                self.cam.prepare(entry, exposure=exposure)
             except Exception as exc:
                 console_ui.error(f"Could not prepare the cycle: {exc}")
                 self._errors += 1
             self._refresh_camera_section()
 
-            if not self._wait_until(slot, phase="measuring"):
+            phase = "measuring" if self._stage == "main" else "measuring (preflight)"
+            if not self._wait_until(slot, phase=phase):
                 break
-            if angle_fn(dt.now()) > sched.sun_max_angle:
+
+            # The sun moved while we waited. In the main stage that can only
+            # close the window; in the preflight stage it can also hand over to
+            # the main programme, and this same slot then shoots the scheduled
+            # exposure instead of the automatic one.
+            angle = angle_fn(dt.now())
+            if self._stage == "preflight" and angle <= sched.sun_max_angle:
+                self._enter_main_stage(auto, sched)
+                exposure, frames = self._plan_slot(entry, auto, guard)
+                try:
+                    self.cam.prepare(entry, exposure=exposure)
+                except Exception as exc:
+                    console_ui.error(f"Could not prepare the cycle: {exc}")
+                    self._errors += 1
+            elif self._stage == "main" and angle > sched.sun_max_angle:
                 console_ui.log("Window closed while waiting — skipping frame.")
                 continue
-            if self._capture_one(dt.now(), entry.exposure, "LIGHT", "sun_cycle"):
+
+            obs_mode = "sun_cycle_auto" if self._stage == "preflight" else "sun_cycle"
+            ok, mean = self._capture_slot(entry, exposure, frames, obs_mode)
+            self._feed_controllers(entry, exposure, mean, auto, guard)
+            if ok:
                 consecutive_errors = 0
             else:
                 consecutive_errors += 1
@@ -991,6 +1197,99 @@ class AsiWorkerConsole(threading.Thread):
                     console_ui.error(f"{consecutive_errors} consecutive capture "
                                      f"failures — stopping.")
                     break
+
+    def _enter_main_stage(self, auto, sched):
+        """Hand over from the automatic twilight stage to the programme proper."""
+        self._stage = "main"
+        self._auto_exposure = None
+        auto.reset()
+        console_ui.log(f"Sun at {sched.sun_max_angle:g}° — main cycle, "
+                       f"scheduled exposures.")
+
+    def _plan_slot(self, entry, auto, guard):
+        """``(exposure, frames)`` for this visit to ``entry``.
+
+        With both features off this is ``(entry.exposure, 1)``, so the camera
+        gets exactly the calls it always got.
+        """
+        sched = self.cfg.schedule
+        if self._stage == "preflight":
+            budget = asi_schedule.slot_budget(sched.entries, sched.period, entry,
+                                              sched.dead_time)
+            exposure = auto.exposure_for(entry, budget)
+            self._auto_exposure = exposure
+            self._split_frames = 1
+            return exposure, 1
+        # The split guard owns the exposure in the main stage; a slot it has not
+        # divided keeps the scheduled one untouched.
+        frames, exposure = guard.plan(entry, self._slot_dead_time(entry))
+        self._auto_exposure = None
+        self._split_frames = frames
+        return exposure, frames
+
+    def _feed_controllers(self, entry, exposure, mean, auto, guard):
+        """Give the slot's measured intensity to whichever loop is driving it."""
+        if mean is None:
+            return
+        if self._stage == "preflight":
+            bias = self._bias_for(exposure, self.cfg.preflight.bias)
+            budget = asi_schedule.slot_budget(
+                self.cfg.schedule.entries, self.cfg.schedule.period, entry,
+                self.cfg.schedule.dead_time)
+            old, new = auto.update(entry, exposure, mean, budget, bias=bias,
+                                   saturated_fraction=self._last_saturation)
+            if abs(new - old) > 1e-6:
+                console_ui.log(f"Preflight {asi_exposure.slot_label(entry)}: "
+                               f"mean {mean:.0f} ADU → exposure {new:g} s")
+            return
+        if not self.cfg.overexposure.enabled:
+            return
+        dead = self._slot_dead_time(entry)
+        bias = self._bias_for(exposure, self.cfg.overexposure.bias)
+        old, new = guard.update(entry, dead, mean, bias=bias)
+        if new == old:
+            # A slot whose dead time swallows the whole budget cannot be divided
+            # at all. Saying so once matters: otherwise it over-exposes all night
+            # with nothing in the log to explain why the guard did nothing.
+            if guard.impossible(entry) and mean >= self.cfg.overexposure.threshold:
+                key = asi_exposure.slot_key(entry)
+                if key not in self._warned_slots:
+                    self._warned_slots.add(key)
+                    console_ui.warn(
+                        f"{asi_exposure.slot_label(entry)}: mean {mean:.0f} ADU "
+                        f"over {self.cfg.overexposure.threshold:.0f}, but "
+                        f"{entry.exposure:g} s against {dead:g} s of dead time "
+                        f"leaves no room to divide it")
+            return
+        if new > old:
+            sub = asi_exposure.sub_exposure(entry.exposure, dead, new,
+                                            self.cfg.overexposure.margin)
+            console_ui.warn(
+                f"{asi_exposure.slot_label(entry)}: mean {mean:.0f} ADU over "
+                f"{self.cfg.overexposure.threshold:.0f} — next visit takes "
+                f"{new} frames of {sub:g} s")
+        elif new == 1:
+            console_ui.log(f"{asi_exposure.slot_label(entry)}: back to one "
+                           f"{entry.exposure:g} s frame")
+        else:
+            sub = asi_exposure.sub_exposure(entry.exposure, dead, new,
+                                            self.cfg.overexposure.margin)
+            console_ui.log(f"{asi_exposure.slot_label(entry)}: down to {new} "
+                           f"frames of {sub:g} s")
+
+    def _slot_dead_time(self, entry):
+        """The save/readout time this slot budgets for, in seconds."""
+        if entry.readout is not None:
+            return float(entry.readout)
+        return float(self.cfg.schedule.dead_time)
+
+    def _intensity_text(self, exposure, frames):
+        """The bit of the dashboard detail line the two loops own."""
+        if self._stage == "preflight":
+            return f"  ·  auto {exposure:g} s (target {self.cfg.preflight.target_mean:.0f} ADU)"
+        if frames > 1:
+            return f"  ·  split ×{frames} of {exposure:g} s"
+        return ""
 
     # ------------------------------------------------------------------
     # MQTT commands
@@ -1126,9 +1425,10 @@ def run_preview_asi(cam: AsiCamera, instance_name, dashboard=None):
 
     stop = threading.Event()
 
-    def _sigint(sig, frame):
+    def _stop(sig, frame):
+        console_ui.log(f"{stop_signal_name(sig)} — stopping preview…")
         stop.set()
-    signal.signal(signal.SIGINT, _sigint)
+    install_stop_handler(_stop)
 
     frames = 0
     t0 = dt.now()
@@ -1384,15 +1684,21 @@ def run_console_asi(config_path=None, preview=False, verbose=False,
             setup_mode=setup_mode,
         )
 
-        def _sigint(sig, frame):
+        def _stop(sig, frame):
+            name = stop_signal_name(sig)
             if worker.stopping:
-                console_ui.warn("Second Ctrl+C — quitting without closing darks.")
+                console_ui.warn(f"Second {name} — quitting without closing darks.")
                 worker.request_stop(force=True)
                 return
-            console_ui.log("Ctrl+C — finishing the current frame, then closing darks. "
-                           "Press again to quit at once.")
+            # The second signal is the operator's escape hatch, so it must stay
+            # available under a service manager too: systemd sends SIGTERM again
+            # only when TimeoutStopSec runs out, and by then this is exactly the
+            # behaviour wanted — give up the darks rather than be SIGKILLed
+            # mid-exposure.
+            console_ui.log(f"{name} — finishing the current frame, then closing "
+                           f"darks. Send it again to quit at once.")
             worker.request_stop()
-        signal.signal(signal.SIGINT, _sigint)
+        install_stop_handler(_stop)
 
         worker.start()
         while worker.is_alive():
