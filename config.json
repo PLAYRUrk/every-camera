@@ -1,54 +1,42 @@
 {
   "cannon": {
     "instance_name": "",
-    "output_dir": "",
-    "schedule_file": "",
-    "capture_seconds": [
-      0,
-      30
-    ],
+    "output_dir": "/path/to/output",
+    "schedule_file": "/path/to/schedule.txt",
+    "capture_seconds": [0, 30],
     "camcfg_file": ""
   },
   "sptt": {
     "instance_name": "",
-    "output_dir": "",
+    "output_dir": "/path/to/output",
     "exposure": 0.88,
     "gain": 100,
     "binning": 0,
     "encoding": 1,
     "target_temp": null,
     "firmware_dir": "",
-    "capture_seconds": [
-      0,
-      30
-    ]
+    "capture_seconds": [0, 30]
   },
   "infra": {
     "instance_name": "",
-    "output_dir": "/home/alex/data/New Folder/woglass",
-    "schedule_file": "/home/alex/data/schedule.txt",
-    "capture_seconds": [
-      0,
-      30
-    ],
-    "exposure_us": 20000000.0,
-    "gain": 120,
+    "output_dir": "/path/to/output",
+    "schedule_file": "/path/to/schedule.txt",
+    "capture_seconds": [0, 30],
+    "exposure_us": 1000.0,
+    "gain": 0,
     "roi": "1280x1024",
-    "save_format": "png"
+    "save_format": "tiff"
   },
   "sentry": {
     "instance_name": "",
     "imagerd_rt_dir": "/usr/local/imagerd_rt",
-    "output_dir": "",
+    "output_dir": "/path/to/fits/archive",
     "device_id": "ASI1",
     "site_id": "SITE",
     "zenith_angle_start": -10,
     "schedule_len_ms": 1440000,
     "imaging_mode": "schedule",
-    "capture_seconds": [
-      0,
-      30
-    ],
+    "capture_seconds": [0, 30],
     "slots": [
       {
         "filter_num": 1,
@@ -60,14 +48,72 @@
       }
     ]
   },
+  "asi": {
+    "instance_name": "",
+    "output_dir": "/data/asi",
+    "mode": "sun",
+    "sun_max_angle": -10.0,
+    "t_start": "20:00",
+    "dark_frames": 3,
+    "dead_time": 5.0,
+    "wait_for_enter": true,
+    "schedule_file": "",
+    "schedule": [
+      { "filter": 1, "exposure": 55, "seconds": [0] },
+      { "filter": 2, "exposure": 55, "seconds": [30] }
+    ],
+    "camera": {
+      "backend": "picam",
+      "readout_speed": 2.0,
+      "binning": 4,
+      "gain": 1,
+      "frame_timeout_ms": 30000,
+      "readout_control_mode": 1,
+      "shutter_timing_mode": 1,
+      "output_signal": 4,
+      "demo": false,
+      "demo_model": "Pixis1024F"
+    },
+    "cooling": {
+      "enabled": true,
+      "target_temp": -60.0,
+      "tolerance": 3.0,
+      "wait_on_start": true,
+      "wait_timeout": 1800.0,
+      "warm_on_exit": true,
+      "warm_temp": 13.0,
+      "warm_timeout": 900.0
+    },
+    "filter_wheel": {
+      "port": "/dev/ttyUSB0",
+      "baudrate": 9600,
+      "move_timeout": 8.0
+    },
+    "location": {
+      "lat": 51.810646,
+      "lon": 103.075555,
+      "elevation": 658
+    }
+  },
   "mqtt": {
     "enabled": false,
     "host": "broker.hivemq.com",
-    "port": "1883",
+    "port": 1883,
     "user": "",
     "password": "",
     "prefix": "every_camera",
     "tls": false
   },
+  "server": {
+    "enabled": true,
+    "bind": "0.0.0.0",
+    "port": 8765,
+    "port_search": 20,
+    "discovery": true,
+    "discovery_port": 45455,
+    "max_list": 2000,
+    "focus_ttl": 60
+  },
+  "node_name": "Tory-1",
   "status_dir": ""
 }
