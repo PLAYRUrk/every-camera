@@ -52,7 +52,7 @@ from worker_common import (
 )
 
 from cameras.asi import config as asi_config
-from cameras.asi import devices, schedule as asi_schedule
+from cameras.asi import devices, picam, schedule as asi_schedule
 from cameras.asi.fits import write_fits
 
 # How much slack a focus frame needs before the next scheduled capture: the
@@ -141,6 +141,13 @@ class AsiCamera:
     def target_temperature(self):
         return self.cam.target_temperature
 
+    def temperature_limits(self):
+        """Setpoints the camera accepts, or None when it will not say."""
+        try:
+            return self.cam.temperature_limits()
+        except Exception:
+            return None
+
     def temperature(self):
         return self.cam.temperature()
 
@@ -164,7 +171,8 @@ class AsiCamera:
         self.cam.set_gain(int(gain))
 
     def set_target_temperature(self, celsius):
-        self.cam.set_target_temperature(float(celsius))
+        """Returns the setpoint actually applied, which may have been clamped."""
+        return self.cam.set_target_temperature(float(celsius))
 
     def select_filter(self, number):
         return self.wheel.select(int(number))
@@ -360,8 +368,8 @@ class AsiWorkerConsole(threading.Thread):
                     else:
                         errors.append(f"filter: wheel did not reach position {number}")
                 elif name == "target_temp":
-                    self.cam.set_target_temperature(float(value))
-                    applied[name] = float(value)
+                    # Report what the camera took, not what was asked for.
+                    applied[name] = self.cam.set_target_temperature(float(value))
                 else:
                     errors.append(f"{name}: unknown parameter")
             except Exception as exc:
@@ -949,6 +957,126 @@ def _write_preview_fits(path, image):
     fits.writeto(path, image, overwrite=True)
 
 
+def publish_setpoint_limits(service, cam):
+    """Replace the guessed setpoint range in the focus_app schema with the real one.
+
+    The defaults in ``camera_service.PARAM_SCHEMAS`` have to exist before any
+    camera is connected, so they are a guess; an open camera knows better and
+    the slider should not offer temperatures it will refuse.
+    """
+    from camera_service import PARAM_SCHEMAS
+
+    limits = cam.temperature_limits()
+    if limits is None:
+        return
+    if isinstance(limits, list):
+        if not limits:
+            return
+        low, high, step = min(limits), max(limits), 0.0
+    else:
+        low, high, step = limits.minimum, limits.maximum, limits.increment
+    schema = []
+    for field in PARAM_SCHEMAS.get("asi", []):
+        field = dict(field)
+        if field.get("name") == "target_temp":
+            field["min"], field["max"] = float(low), float(high)
+            if step:
+                field["step"] = float(step)
+        schema.append(field)
+    service.set_param_schema(schema)
+
+
+def run_probe_asi(config_path=None):
+    """Print what this camera accepts for the parameters the driver sets.
+
+    Nothing is written to the camera, so this still works when a value in
+    config.json is exactly the one the camera refuses — which is the situation
+    it exists for: PICAM answers a bad value with "Invalid Parameter Value" and
+    no hint of what would have been accepted.
+    """
+    from utils import load_config
+    from cameras.asi.picam import PicamParameter as P, PicamEnumeratedType as E
+
+    conf = asi_config.from_dict(load_config(config_path).get("asi", {}))
+    if conf.camera.backend != "picam":
+        from cameras.asi.camera_sim import SETPOINT_LIMITS
+        print(f"Backend is {conf.camera.backend!r}, so there is no camera to ask.")
+        print(f"The simulator accepts setpoints: "
+              f"{picam.describe_constraint(SETPOINT_LIMITS)}")
+        return
+
+    # Enumerated parameters read back as numbers; show the names too.
+    enums = {
+        P.ShutterTimingMode: E.ShutterTimingMode,
+        P.AdcAnalogGain: E.AdcAnalogGain,
+        P.OutputSignal: E.OutputSignal,
+        P.ReadoutControlMode: E.ReadoutControlMode,
+        P.PixelFormat: E.PixelFormat,
+    }
+    parameters = [
+        P.SensorTemperatureSetPoint, P.SensorTemperatureReading, P.AdcSpeed,
+        P.AdcAnalogGain, P.AdcQuality, P.ReadoutControlMode, P.ShutterTimingMode,
+        P.OutputSignal, P.KineticsWindowHeight, P.ExposureTime, P.PixelFormat,
+        P.PixelBitDepth,
+    ]
+
+    print("Opening the first camera PICAM reports…")
+    picam.initialize_library()
+    handle = None
+    try:
+        handle = picam.open_first_camera()
+        cid = picam.get_camera_id(handle)
+        width, height = picam.sensor_size(handle)
+        print(f"Model:   {picam.enum_string(E.Model, cid.model)}")
+        print(f"Serial:  {cid.serial_number.decode(errors='replace')}")
+        print(f"Bus:     {picam.enum_string(E.ComputerInterface, cid.computer_interface)}")
+        print(f"Sensor:  {cid.sensor_name.decode(errors='replace')}  ({width}x{height})")
+        print(f"PICAM:   {picam.library_version()}")
+        print()
+        print(f"{'Parameter':<28}{'Current':>14}   Accepted")
+        print("-" * 100)
+        for parameter in parameters:
+            name = picam.enum_string(E.Parameter, int(parameter))
+            print(f"{name:<28}{_probe_current(handle, parameter, enums):>14}"
+                  f"   {_probe_allowed(handle, parameter, enums)}")
+        print()
+        print("asi.cooling.target_temp in config.json has to be a value the "
+              "SensorTemperatureSetPoint row allows.")
+    finally:
+        if handle is not None:
+            picam.close_camera(handle)
+        picam.uninitialize_library()
+
+
+def _probe_current(handle, parameter, enums):
+    """The value the camera currently holds for one parameter, as text."""
+    try:
+        if picam.value_type(parameter) is picam.PicamValueType.FloatingPoint:
+            try:
+                return f"{picam.get_float(handle, parameter):g}"
+            except picam.PicamError:
+                # Live-only values (the temperature reading) have no cached one.
+                return f"{picam.read_float(handle, parameter):g}"
+        value = picam.get_int(handle, parameter)
+    except picam.PicamError:
+        return "n/a"
+    enum_type = enums.get(parameter)
+    if enum_type is None:
+        return str(value)
+    return f"{value} ({picam.enum_string(enum_type, value)})"
+
+
+def _probe_allowed(handle, parameter, enums):
+    """What the camera would accept for one parameter, as text."""
+    limits = picam.constraint(handle, parameter)
+    enum_type = enums.get(parameter)
+    if enum_type is not None and isinstance(limits, list):
+        return ", ".join(
+            f"{int(v)} ({picam.enum_string(enum_type, int(v))})" for v in limits
+        )
+    return picam.describe_constraint(limits)
+
+
 # ---------------------------------------------------------------------------
 # Console entry point
 # ---------------------------------------------------------------------------
@@ -1023,6 +1151,7 @@ def run_console_asi(config_path=None, preview=False, verbose=False,
 
         service = CameraService("asi", instance_name, conf.output_dir,
                                 node_name=node_name, setup_mode=setup_mode)
+        publish_setpoint_limits(service, cam)
         server = start_frame_server(cfg.get("server", {}), service)
         if server:
             dash.update(server_url=server.url, focus="idle")

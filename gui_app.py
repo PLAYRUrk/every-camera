@@ -3018,7 +3018,9 @@ class AsiTab(QWidget):
     def _on_start(self):
         import console_ui
         from cameras.asi import config as asi_config
-        from cameras.asi_driver import AsiCamera, AsiWorkerConsole
+        from cameras.asi_driver import (
+            AsiCamera, AsiWorkerConsole, publish_setpoint_limits,
+        )
         from camera_service import CameraService
         from frame_server import start_frame_server
         from utils import get_instance_name, claim_instance_name, get_node_name
@@ -3066,6 +3068,7 @@ class AsiTab(QWidget):
         self._service = CameraService("asi", instance, conf.output_dir,
                                       node_name=node_name,
                                       setup_mode=setup_mode)
+        publish_setpoint_limits(self._service, self.cam)
         self._server = start_frame_server(self._cfg.get("server", {}),
                                           self._service)
 

@@ -35,6 +35,7 @@ class PixisCamera:
         self._demo_id: picam.PicamCameraID | None = None
         self._id: picam.PicamCameraID | None = None
         self._sensor: tuple[int, int] = (0, 0)  # full sensor (width, height)
+        self._setpoint_limits = None  # cooling setpoints this camera accepts
 
         self.current_exposure: float | None = None
         self.current_binning: int = cfg.binning
@@ -83,6 +84,9 @@ class PixisCamera:
             self._handle = picam.open_first_camera()
         self._id = picam.get_camera_id(self._handle)
         self._sensor = picam.sensor_size(self._handle)
+        self._setpoint_limits = picam.constraint(
+            self._handle, P.SensorTemperatureSetPoint
+        )
 
     def _shutdown(self) -> None:
         if self._handle is not None:
@@ -106,24 +110,77 @@ class PixisCamera:
             )
             raise RuntimeError(f"PICAM rejected these parameters: {names}")
 
+    def _set_checked(self, parameter, value, label: str, *, clamp: bool = True):
+        """Write one parameter after asking the camera what it accepts.
+
+        Every model has its own limits — a setpoint one PIXIS cools to is out of
+        range on the next — and PICAM answers a bad value with a bare "Invalid
+        Parameter Value" naming neither the parameter nor what would have
+        worked. So the constraint is read first. A measured quantity outside it
+        (setpoint, ADC speed) is nudged to the nearest value the camera allows,
+        with a warning: losing the night over one number in config.json is worse
+        than cooling three degrees less deeply. A mode is not nudged — the
+        numerically nearest shutter mode is a *different* mode, and quietly
+        swapping one for another would spoil the data far more thoroughly than
+        stopping does. Returns the value actually written.
+        """
+        limits = picam.constraint(self._handle, parameter)
+        kind = picam.value_type(parameter)
+        is_mode = kind in (picam.PicamValueType.Enumeration,
+                           picam.PicamValueType.Boolean)
+        effective, changed = picam.clamp_to_constraint(limits, float(value))
+        if changed:
+            if is_mode or not clamp:
+                raise RuntimeError(self._rejected(parameter, label, value, limits))
+            console_ui.warn(
+                f"{label}: this camera does not accept {float(value):g} "
+                f"(allowed: {picam.describe_constraint(limits)}) — "
+                f"using {effective:g} instead"
+            )
+        if kind is not picam.PicamValueType.FloatingPoint:
+            effective = int(round(effective))
+        try:
+            if kind is picam.PicamValueType.FloatingPoint:
+                picam.set_float(self._handle, parameter, effective)
+            else:
+                picam.set_int(self._handle, parameter, effective)
+        except picam.PicamError as exc:
+            raise RuntimeError(
+                self._rejected(parameter, label, effective, limits, exc)
+            ) from exc
+        return effective
+
+    @staticmethod
+    def _rejected(parameter, label: str, value, limits, exc=None) -> str:
+        """Why a value did not go in, in terms of what to put in config.json."""
+        name = picam.enum_string(picam.PicamEnumeratedType.Parameter, int(parameter))
+        text = (f"{label}: this camera does not accept {float(value):g} — allowed: "
+                f"{picam.describe_constraint(limits)} ({name})")
+        return f"{text} — {exc}" if exc is not None else text
+
     def _configure_static(self) -> None:
         """Parameters that stay put for the whole session (pixis.c:Configure_Static)."""
         cfg = self._cfg
-        h = self._handle
         if self._cooling and self._cooling.enabled:
-            picam.set_float(h, P.SensorTemperatureSetPoint, self._cooling.target_temp)
-        picam.set_float(h, P.AdcSpeed, cfg.readout_speed)
-        picam.set_int(h, P.ReadoutControlMode, cfg.readout_control_mode)
-        picam.set_int(h, P.OutputSignal, cfg.output_signal)
-        picam.set_int(h, P.ShutterTimingMode, cfg.shutter_timing_mode)
-        if cfg.readout_control_mode == 3:  # Kinetics
-            picam.set_int(h, P.KineticsWindowHeight, cfg.kinetics_window_height)
-        picam.set_int(h, P.AdcAnalogGain, cfg.gain)
-        self.current_gain = cfg.gain
+            self._cooling.target_temp = self._set_checked(
+                P.SensorTemperatureSetPoint, self._cooling.target_temp,
+                "Sensor setpoint (°C)")
+        self.current_readout_speed = self._set_checked(
+            P.AdcSpeed, cfg.readout_speed, "ADC speed (MHz)")
+        readout_mode = self._set_checked(
+            P.ReadoutControlMode, cfg.readout_control_mode, "Readout control mode")
+        self._set_checked(P.OutputSignal, cfg.output_signal, "Output signal")
+        self._set_checked(
+            P.ShutterTimingMode, cfg.shutter_timing_mode, "Shutter timing mode")
+        if readout_mode == 3:  # Kinetics
+            self._set_checked(
+                P.KineticsWindowHeight, cfg.kinetics_window_height,
+                "Kinetics window height")
+        self.current_gain = self._set_checked(P.AdcAnalogGain, cfg.gain, "Analog gain")
         self._set_full_frame_roi(cfg.binning)
         self._commit()
 
-        bit_depth = picam.get_int(h, P.PixelBitDepth)
+        bit_depth = picam.get_int(self._handle, P.PixelBitDepth)
         if bit_depth > 16:
             raise RuntimeError(
                 f"This camera reports {bit_depth}-bit pixels; the FITS writer here "
@@ -163,7 +220,10 @@ class PixisCamera:
 
     def set_exposure(self, sec: float) -> None:
         # PICAM takes the exposure in milliseconds; the schedule speaks seconds.
-        picam.set_float(self._handle, P.ExposureTime, sec * 1000.0)
+        # Never clamped: a silently shortened exposure would quietly corrupt the
+        # measurement, so an unsupported one has to be an error.
+        self._set_checked(
+            P.ExposureTime, sec * 1000.0, "Exposure (ms)", clamp=False)
         self._commit()
         self.current_exposure = sec
 
@@ -172,9 +232,8 @@ class PixisCamera:
         self._commit()
 
     def set_gain(self, gain: int) -> None:
-        picam.set_int(self._handle, P.AdcAnalogGain, gain)
+        self.current_gain = self._set_checked(P.AdcAnalogGain, gain, "Analog gain")
         self._commit()
-        self.current_gain = gain
 
     # --- cooling ------------------------------------------------------------
     @property
@@ -183,9 +242,18 @@ class PixisCamera:
             return None
         return self._cooling.target_temp
 
-    def set_target_temperature(self, celsius: float) -> None:
-        picam.set_float(self._handle, P.SensorTemperatureSetPoint, celsius)
+    def temperature_limits(self) -> picam.FloatRange | list[float] | None:
+        """Setpoints this camera accepts, as read from it (None if unknown)."""
+        return self._setpoint_limits
+
+    def set_target_temperature(self, celsius: float) -> float:
+        """Move the cooling setpoint; returns the value the camera took."""
+        effective = self._set_checked(
+            P.SensorTemperatureSetPoint, celsius, "Sensor setpoint (°C)")
         self._commit()
+        if self._cooling:
+            self._cooling.target_temp = effective
+        return effective
 
     def temperature_locked(self) -> bool:
         """True when the sensor reports its temperature is locked to the setpoint."""
@@ -224,9 +292,9 @@ class PixisCamera:
         if not (self._cooling and self._cooling.enabled):
             return True
         console_ui.log(f"Warming sensor to {self._cooling.warm_temp:.1f} C before shutdown...")
-        self.set_target_temperature(self._cooling.warm_temp)
+        warm_temp = self.set_target_temperature(self._cooling.warm_temp)
         return self._wait_temperature(
-            self._cooling.warm_temp, self._cooling.warm_timeout, "Warm-up"
+            warm_temp, self._cooling.warm_timeout, "Warm-up"
         )
 
     # --- readings -----------------------------------------------------------
@@ -305,4 +373,7 @@ class PixisCamera:
         ]
         if self.target_temperature is not None:
             rows.append(("Temp setpoint:", f"{self.target_temperature:.1f} °C"))
+        if self._setpoint_limits is not None:
+            rows.append(("Setpoint range:",
+                         picam.describe_constraint(self._setpoint_limits)))
         return rows

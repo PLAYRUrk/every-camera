@@ -23,6 +23,7 @@ from ctypes import (
     c_longlong,
     c_void_p,
 )
+from dataclasses import dataclass
 from enum import IntEnum
 
 # --- native types (pil_platform.h, PIL_LIN64) -------------------------------
@@ -244,6 +245,15 @@ class PicamRangeConstraint(Structure):
     ]
 
 
+class PicamCollectionConstraint(Structure):
+    _fields_ = [
+        ("scope", piint),
+        ("severity", piint),
+        ("values_array", POINTER(piflt)),
+        ("values_count", piint),
+    ]
+
+
 class PicamRoisConstraint(Structure):
     _fields_ = [
         ("scope", piint),
@@ -306,6 +316,16 @@ def _load() -> ctypes.CDLL:
     )
 
 
+OPTIONAL_FUNCTIONS = frozenset({
+    "Picam_GetParameterRangeConstraint",
+    "Picam_DestroyRangeConstraints",
+    "Picam_GetParameterCollectionConstraint",
+    "Picam_DestroyCollectionConstraints",
+})
+"""Constraint queries. A runtime without them still runs the camera — values are
+then written unchecked, as they were before, instead of refusing to start."""
+
+
 def _declare(lib: ctypes.CDLL) -> None:
     """Attach argtypes/restype to every function this module calls."""
     sigs = {
@@ -341,6 +361,18 @@ def _declare(lib: ctypes.CDLL) -> None:
             piint,
         ),
         "Picam_DestroyRoisConstraints": ([POINTER(PicamRoisConstraint)], piint),
+        "Picam_GetParameterRangeConstraint": (
+            [PicamHandle, piint, piint, POINTER(POINTER(PicamRangeConstraint))],
+            piint,
+        ),
+        "Picam_DestroyRangeConstraints": ([POINTER(PicamRangeConstraint)], piint),
+        "Picam_GetParameterCollectionConstraint": (
+            [PicamHandle, piint, piint, POINTER(POINTER(PicamCollectionConstraint))],
+            piint,
+        ),
+        "Picam_DestroyCollectionConstraints": (
+            [POINTER(PicamCollectionConstraint)], piint
+        ),
         "Picam_AreParametersCommitted": ([PicamHandle, POINTER(pibln)], piint),
         "Picam_CommitParameters": (
             [PicamHandle, POINTER(POINTER(piint)), POINTER(piint)],
@@ -358,6 +390,10 @@ def _declare(lib: ctypes.CDLL) -> None:
         try:
             fn = getattr(lib, name)
         except AttributeError as exc:
+            if name in OPTIONAL_FUNCTIONS:
+                # Only used to explain what a camera accepts; without it the
+                # values go through unchecked, exactly as they did before.
+                continue
             raise OSError(
                 f"The PICAM library at {lib._name} does not export {name}; "
                 "it is probably too old for this program."
@@ -519,21 +555,178 @@ def destroy_rois(rois) -> None:
 
 def sensor_size(handle: PicamHandle) -> tuple[int, int]:
     """Full sensor (width, height) from the required ROI constraint."""
-    constraint = POINTER(PicamRoisConstraint)()
+    rois = POINTER(PicamRoisConstraint)()
     _call(
         "Picam_GetParameterRoisConstraint",
         handle,
         int(PicamParameter.Rois),
         int(PicamConstraintCategory.Required),
-        byref(constraint),
+        byref(rois),
     )
     try:
         return (
-            int(constraint.contents.width_constraint.maximum),
-            int(constraint.contents.height_constraint.maximum),
+            int(rois.contents.width_constraint.maximum),
+            int(rois.contents.height_constraint.maximum),
         )
     finally:
-        _load().Picam_DestroyRoisConstraints(constraint)
+        _load().Picam_DestroyRoisConstraints(rois)
+
+
+# --- constraints ------------------------------------------------------------
+# A camera only accepts a limited set of values per parameter, and which values
+# those are differs between models (a setpoint one PIXIS cools to is out of
+# range on the next). PICAM answers "Invalid Parameter Value" with no hint of
+# what it would have accepted, so ask it first and say so in the message.
+@dataclass(frozen=True)
+class FloatRange:
+    """A PicamRangeConstraint, without the ctypes memory behind it."""
+
+    minimum: float
+    maximum: float
+    increment: float = 0.0
+    excluded: tuple[float, ...] = ()
+
+
+def value_type(parameter: PicamParameter) -> PicamValueType:
+    """The value type PI_V encoded into the parameter constant (picam.h:634)."""
+    return PicamValueType((int(parameter) >> 16) & 0xFF)
+
+
+def constraint_type(parameter: PicamParameter) -> PicamConstraintType:
+    """The constraint type PI_V encoded into the parameter constant."""
+    return PicamConstraintType((int(parameter) >> 24) & 0xFF)
+
+
+def _range_constraint(
+    handle: PicamHandle, parameter: PicamParameter, category: PicamConstraintCategory
+) -> FloatRange:
+    ptr = POINTER(PicamRangeConstraint)()
+    _call(
+        "Picam_GetParameterRangeConstraint",
+        handle, int(parameter), int(category), byref(ptr),
+    )
+    try:
+        c = ptr.contents
+        return FloatRange(
+            minimum=float(c.minimum),
+            maximum=float(c.maximum),
+            increment=float(c.increment),
+            excluded=tuple(
+                float(c.excluded_values_array[i]) for i in range(c.excluded_values_count)
+            ),
+        )
+    finally:
+        _load().Picam_DestroyRangeConstraints(ptr)
+
+
+def _collection_constraint(
+    handle: PicamHandle, parameter: PicamParameter, category: PicamConstraintCategory
+) -> list[float]:
+    ptr = POINTER(PicamCollectionConstraint)()
+    _call(
+        "Picam_GetParameterCollectionConstraint",
+        handle, int(parameter), int(category), byref(ptr),
+    )
+    try:
+        c = ptr.contents
+        return [float(c.values_array[i]) for i in range(c.values_count)]
+    finally:
+        _load().Picam_DestroyCollectionConstraints(ptr)
+
+
+def constraint(
+    handle: PicamHandle, parameter: PicamParameter
+) -> FloatRange | list[float] | None:
+    """What this camera accepts for ``parameter``.
+
+    ``Required`` is what is valid given everything else currently set, so it is
+    asked for first; ``Capable`` (what the hardware can ever do) is the
+    fall-back. ``None`` means the parameter is unconstrained, irrelevant for
+    this model, or the SDK would not describe it — in which case the value is
+    passed through untouched and the camera has the last word.
+    """
+    kind = constraint_type(parameter)
+    if kind == PicamConstraintType.Range:
+        read = _range_constraint
+    elif kind == PicamConstraintType.Collection:
+        read = _collection_constraint
+    else:
+        return None
+    for category in (PicamConstraintCategory.Required, PicamConstraintCategory.Capable):
+        try:
+            return read(handle, parameter, category)
+        except PicamError:
+            continue
+        except AttributeError:
+            break  # this PICAM runtime does not export the constraint queries
+    return None
+
+
+def _nearly(a: float, b: float, scale: float = 1.0) -> bool:
+    return abs(a - b) <= max(1e-9, abs(scale) * 1e-6)
+
+
+def clamp_to_constraint(
+    limits: FloatRange | list[float] | None, value: float
+) -> tuple[float, bool]:
+    """Nearest value ``limits`` allows, and whether that differs from ``value``.
+
+    Pure arithmetic on the description read from the camera — no SDK calls — so
+    it is testable without hardware.
+    """
+    value = float(value)
+    if limits is None:
+        return value, False
+    if isinstance(limits, list):
+        if not limits:
+            return value, False
+        best = min(limits, key=lambda v: (abs(v - value), v))
+        return best, not _nearly(best, value, value)
+
+    result = min(max(value, limits.minimum), limits.maximum)
+    step = limits.increment
+    if step > 0:
+        steps = round((result - limits.minimum) / step)
+        result = limits.minimum + steps * step
+        # Rounding up can overshoot the top of the range by one step.
+        while result > limits.maximum and steps > 0:
+            steps -= 1
+            result = limits.minimum + steps * step
+    if any(_nearly(result, bad, step or result) for bad in limits.excluded):
+        result = _first_allowed(limits, result)
+    return result, not _nearly(result, value, value)
+
+
+def _first_allowed(limits: FloatRange, value: float) -> float:
+    """Walk away from an excluded value, one increment at a time."""
+    step = limits.increment
+    if step <= 0:
+        return value  # nothing to step by; let the camera reject it if it must
+    span = int((limits.maximum - limits.minimum) / step) + 1
+    for n in range(1, span + 1):
+        for candidate in (value - n * step, value + n * step):
+            if not limits.minimum - 1e-9 <= candidate <= limits.maximum + 1e-9:
+                continue
+            if not any(_nearly(candidate, bad, step) for bad in limits.excluded):
+                return candidate
+    return value
+
+
+def describe_constraint(limits: FloatRange | list[float] | None) -> str:
+    """One line naming what is allowed, for warnings and for --probe."""
+    if limits is None:
+        return "unconstrained"
+    if isinstance(limits, list):
+        if not limits:
+            return "no values available"
+        shown = ", ".join(f"{v:g}" for v in limits[:12])
+        return shown if len(limits) <= 12 else f"{shown}, … ({len(limits)} values)"
+    text = f"{limits.minimum:g} … {limits.maximum:g}"
+    if limits.increment > 0:
+        text += f", step {limits.increment:g}"
+    if limits.excluded:
+        text += ", except " + ", ".join(f"{v:g}" for v in limits.excluded[:6])
+    return text
 
 
 def commit(handle: PicamHandle) -> list[int]:

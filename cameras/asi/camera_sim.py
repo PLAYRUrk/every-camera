@@ -14,6 +14,8 @@ import numpy as np
 
 import console_ui
 
+from .picam import FloatRange, clamp_to_constraint, describe_constraint
+
 if TYPE_CHECKING:
     from .config import CameraCfg, CoolingCfg
 
@@ -21,6 +23,9 @@ SENSOR_WIDTH = 2048
 SENSOR_HEIGHT = 2048
 AMBIENT_C = 22.0
 COOLING_RATE_C_PER_S = 4.0  # fast enough to keep dry runs short
+# A plausible PIXIS cooling range, so dry runs exercise the same clamping and
+# warnings a real camera would produce for an impossible setpoint.
+SETPOINT_LIMITS = FloatRange(minimum=-70.0, maximum=25.0, increment=0.1)
 
 
 class SimCamera:
@@ -41,6 +46,8 @@ class SimCamera:
     # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> SimCamera:
         console_ui.log("Camera backend: SIMULATOR (no hardware in use)")
+        if self._cooling and self._cooling.enabled:
+            self.set_target_temperature(self._cooling.target_temp)
         if self._cooling and self._cooling.enabled and self._cooling.wait_on_start:
             self.wait_for_temperature(self._cooling.wait_timeout)
         return self
@@ -66,9 +73,22 @@ class SimCamera:
             return None
         return self._setpoint
 
-    def set_target_temperature(self, celsius: float) -> None:
+    def temperature_limits(self) -> FloatRange:
+        return SETPOINT_LIMITS
+
+    def set_target_temperature(self, celsius: float) -> float:
         self._advance_temperature()
-        self._setpoint = celsius
+        effective, changed = clamp_to_constraint(SETPOINT_LIMITS, celsius)
+        if changed:
+            console_ui.warn(
+                f"Sensor setpoint (°C): this camera does not accept {float(celsius):g} "
+                f"(allowed: {describe_constraint(SETPOINT_LIMITS)}) — "
+                f"using {effective:g} instead"
+            )
+        self._setpoint = effective
+        if self._cooling:
+            self._cooling.target_temp = effective
+        return effective
 
     def _advance_temperature(self) -> None:
         now = monotonic()
@@ -105,9 +125,9 @@ class SimCamera:
         if not (self._cooling and self._cooling.enabled):
             return True
         console_ui.log(f"Warming sensor to {self._cooling.warm_temp:.1f} C before shutdown...")
-        self.set_target_temperature(self._cooling.warm_temp)
+        warm_temp = self.set_target_temperature(self._cooling.warm_temp)
         return self._wait_temperature(
-            self._cooling.warm_temp, self._cooling.warm_timeout, "Warm-up"
+            warm_temp, self._cooling.warm_timeout, "Warm-up"
         )
 
     # --- readings -----------------------------------------------------------
@@ -151,4 +171,5 @@ class SimCamera:
         ]
         if self.target_temperature is not None:
             rows.append(("Temp setpoint:", f"{self.target_temperature:.1f} °C"))
+            rows.append(("Setpoint range:", describe_constraint(SETPOINT_LIMITS)))
         return rows

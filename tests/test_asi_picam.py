@@ -61,6 +61,7 @@ C_STRUCT_SIZES = {
     "PicamAvailableData": 16,
     "PicamFirmwareDetail": 320,
     "PicamRangeConstraint": 72,
+    "PicamCollectionConstraint": 24,
     "PicamRoisConstraint": 344,
     "PicamAcquisitionStatus": 16,
 }
@@ -75,6 +76,8 @@ def test_struct_field_offsets_match_the_c_layout():
     """Offsets of the fields the binding actually dereferences."""
     assert picam.PicamCameraID.serial_number.offset == 72
     assert picam.PicamAvailableData.readout_count.offset == 8
+    assert picam.PicamCollectionConstraint.values_array.offset == 8
+    assert picam.PicamRangeConstraint.excluded_values_array.offset == 40
     assert picam.PicamRoisConstraint.width_constraint.offset == 96
     assert picam.PicamRoisConstraint.y_constraint.offset == 184
     assert picam.PicamRoisConstraint.height_constraint.offset == 256
@@ -101,6 +104,85 @@ def test_demo_models_are_pixis_model_ids():
     assert picam.DEMO_MODELS["Pixis1024F"] == 10
     assert picam.DEMO_MODELS["Pixis1024B"] == 11
     assert picam.DEMO_MODELS["Pixis2048B"] == 22
+
+
+def test_parameter_constants_decode_back_to_their_types():
+    """value_type/constraint_type undo PI_V, and the driver dispatches on them."""
+    assert picam.value_type(P.SensorTemperatureSetPoint) is picam.PicamValueType.FloatingPoint
+    assert picam.constraint_type(P.SensorTemperatureSetPoint) is picam.PicamConstraintType.Range
+    assert picam.value_type(P.AdcAnalogGain) is picam.PicamValueType.Enumeration
+    assert picam.constraint_type(P.AdcSpeed) is picam.PicamConstraintType.Collection
+    assert picam.constraint_type(P.PixelBitDepth) is picam.PicamConstraintType.NoneType
+
+
+# Clamping is pure arithmetic on what the camera reported, so it is checked here
+# rather than at the observatory. The range mirrors a PIXIS cooling constraint.
+SETPOINT = picam.FloatRange(minimum=-55.0, maximum=25.0, increment=0.1)
+
+
+@pytest.mark.parametrize("value,expected", [
+    (-20.0, -20.0),    # inside the range: untouched
+    (-55.0, -55.0),    # exactly at the bottom
+    (25.0, 25.0),      # exactly at the top
+])
+def test_allowed_setpoints_are_left_alone(value, expected):
+    result, changed = picam.clamp_to_constraint(SETPOINT, value)
+    assert result == pytest.approx(expected)
+    assert changed is False
+
+
+def test_setpoint_below_the_range_is_pulled_up_to_the_minimum():
+    """The failure this whole path exists for: -60 C on a camera that stops at -55."""
+    result, changed = picam.clamp_to_constraint(SETPOINT, -60.0)
+    assert result == pytest.approx(-55.0)
+    assert changed is True
+
+
+def test_setpoint_above_the_range_is_pulled_down_to_the_maximum():
+    result, changed = picam.clamp_to_constraint(SETPOINT, 40.0)
+    assert result == pytest.approx(25.0)
+    assert changed is True
+
+
+def test_values_snap_to_the_increment():
+    result, changed = picam.clamp_to_constraint(SETPOINT, -20.04)
+    assert result == pytest.approx(-20.0)
+    assert changed is True
+
+
+def test_rounding_up_never_overshoots_the_maximum():
+    limits = picam.FloatRange(minimum=0.0, maximum=9.5, increment=1.0)
+    result, _ = picam.clamp_to_constraint(limits, 9.4)
+    assert result == pytest.approx(9.0)
+
+
+def test_excluded_values_are_stepped_over():
+    limits = picam.FloatRange(minimum=0.0, maximum=10.0, increment=1.0,
+                              excluded=(5.0,))
+    result, changed = picam.clamp_to_constraint(limits, 5.0)
+    assert result == pytest.approx(4.0)
+    assert changed is True
+
+
+def test_a_collection_picks_the_nearest_member():
+    speeds = [0.1, 2.0]
+    assert picam.clamp_to_constraint(speeds, 2.0) == (2.0, False)
+    result, changed = picam.clamp_to_constraint(speeds, 1.6)
+    assert result == pytest.approx(2.0)
+    assert changed is True
+
+
+def test_an_unconstrained_parameter_passes_the_value_through():
+    assert picam.clamp_to_constraint(None, -273.0) == (-273.0, False)
+    assert picam.clamp_to_constraint([], 7.0) == (7.0, False)
+
+
+def test_describe_constraint_names_what_is_allowed():
+    assert picam.describe_constraint(SETPOINT) == "-55 … 25, step 0.1"
+    assert picam.describe_constraint([0.1, 2.0]) == "0.1, 2"
+    assert picam.describe_constraint(None) == "unconstrained"
+    long = picam.describe_constraint([float(i) for i in range(20)])
+    assert long.endswith("(20 values)")
 
 
 def test_missing_library_reports_a_useful_error(monkeypatch):

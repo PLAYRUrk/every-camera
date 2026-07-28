@@ -10,6 +10,7 @@ Usage:
     python main.py --type sentry           # Console mode, Princeton/imagerd_rt camera
     python main.py --type asi              # Console mode, ASI all-sky imager (PICAM)
     python main.py --type asi --verbose    # Plain log lines instead of the dashboard
+    python main.py --type asi --probe      # Print what the camera accepts, then exit
     python main.py --gui                   # GUI mode (all camera types)
     python main.py --gui --type cannon     # GUI mode, Canon only
     python main.py --config path.json      # Use custom config file
@@ -72,12 +73,20 @@ that mode explicitly, even when a schedule is configured.
                         help="Setup mode: bring the camera up for focusing only "
                              "— no scheduled captures, nothing archived. Entered "
                              "automatically when no schedule is configured")
+    parser.add_argument("--probe", action="store_true",
+                        help="ASI only: open the camera, print what it accepts "
+                             "for every parameter the driver sets, and exit. "
+                             "Nothing is written to the camera")
     parser.add_argument("--verbose", action="store_true",
                         help="Console mode: plain timestamped log lines instead of "
                              "the live dashboard (also the default when the output "
                              "is not a terminal)")
 
     args = parser.parse_args()
+
+    if args.probe and args.type != "asi":
+        print("Error: --probe is only available for --type asi.")
+        sys.exit(1)
 
     # Determine mode
     if args.type and not args.gui:
@@ -103,6 +112,10 @@ that mode explicitly, even when a schedule is configured.
                                verbose=args.verbose,
                                setup_mode=args.setup)
         elif args.type == "asi":
+            if args.probe:
+                from cameras.asi_driver import run_probe_asi
+                run_probe_asi(args.config)
+                return
             from cameras.asi_driver import run_console_asi
             run_console_asi(args.config, preview=args.preview,
                             verbose=args.verbose,
