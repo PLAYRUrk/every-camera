@@ -8,13 +8,9 @@ original formatted a naive local time straight into ``Time(...)``, which astropy
 reads as UTC — correct only on a station whose clock is already UTC, and hours
 wrong anywhere else.
 """
-from datetime import datetime, timezone
+from datetime import datetime
 
-
-def _to_utc(t: datetime) -> datetime:
-    if t.tzinfo is None:
-        t = t.astimezone()
-    return t.astimezone(timezone.utc)
+from .timeutil import to_utc as _to_utc
 
 
 def sun_angle(t: datetime, lat: float, lon: float, elevation: float) -> float:

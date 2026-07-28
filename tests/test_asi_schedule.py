@@ -298,3 +298,198 @@ def test_slot_binning_defaults_to_the_camera_binning():
         "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
     })
     assert conf.schedule.entries[0].binning == 4
+
+
+# ---------------------------------------------------------------------------
+# sun_cycle: the cycle imagerd_rt started by the sun rather than by the clock
+# ---------------------------------------------------------------------------
+def test_sun_cycle_slots_parse_like_time_slots():
+    entries, errors = sched.entries_from_config(
+        [{"delta": 0, "filter": 1, "exposure": 55, "binning": 4},
+         {"delta": 60, "filter": 2, "exposure": 55, "binning": 4}], "sun_cycle")
+    assert errors == []
+    assert [e.delta for e in entries] == [0.0, 60.0]
+
+
+def test_sun_cycle_needs_no_t_start():
+    conf = asi_config.from_dict({
+        "mode": "sun_cycle", "sun_max_angle": -12.0,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
+    })
+    assert conf.errors == []
+    assert conf.schedule.t_start is None
+    assert conf.schedule.sun_max_angle == -12.0
+
+
+def test_per_slot_gain_and_readout_are_read():
+    entries, errors = sched.entries_from_config(
+        [{"delta": 0, "filter": 1, "exposure": 55, "gain": 3, "readout": 5}],
+        "sun_cycle")
+    assert errors == []
+    assert entries[0].gain == 3
+    assert entries[0].readout == 5.0
+
+
+def test_legacy_slot_key_names_still_work():
+    """A hand-converted schedule may keep imagerd_rt's own key spellings."""
+    entries, errors = sched.entries_from_config(
+        [{"delta": 0, "filter_num": 2, "exposure_sec": 7,
+          "ccd_gain": 1, "prep_time": 2}], "sun_cycle")
+    assert errors == []
+    assert (entries[0].filter, entries[0].gain, entries[0].readout) == (2, 1, 2.0)
+
+
+@pytest.mark.parametrize("bad", [{"gain": 0}, {"gain": 7}, {"readout": -1}])
+def test_out_of_range_gain_or_readout_is_reported_and_dropped(bad):
+    slot = {"delta": 0, "filter": 1, "exposure": 5}
+    slot.update(bad)
+    entries, errors = sched.entries_from_config([slot], "sun_cycle")
+    assert errors                       # reported…
+    assert len(entries) == 1            # …but the slot itself survives
+    assert entries[0].gain is None or entries[0].readout is None
+
+
+def test_period_prefers_the_slots_own_readout_over_the_dead_time():
+    entries = [sched.Entry(filter=3, exposure=7.0, delta=1428.0, readout=5.0)]
+    assert sched.cycle_period(entries, dead_time=999.0) == 1440.0
+
+
+def test_explicit_schedule_len_wins_over_the_derived_period():
+    conf = asi_config.from_dict({
+        "mode": "sun_cycle", "schedule_len": 1440,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
+    })
+    assert conf.errors == []
+    assert conf.schedule.period == 1440.0
+
+
+def test_a_useless_schedule_len_falls_back_to_the_slots():
+    conf = asi_config.from_dict({
+        "mode": "sun_cycle", "schedule_len": -3,
+        "dead_time": 5.0,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 10}],
+    })
+    assert any("schedule_len" in e for e in conf.errors)
+    assert conf.schedule.period == 15.0
+
+
+@pytest.mark.parametrize("t,expected", [
+    (datetime(2026, 7, 27, 20, 0, 0), datetime(2026, 7, 27, 20, 0, 0)),
+    (datetime(2026, 7, 27, 20, 0, 1), datetime(2026, 7, 27, 20, 1, 0)),
+    (datetime(2026, 7, 27, 20, 59, 30), datetime(2026, 7, 27, 21, 0, 0)),
+])
+def test_next_minute_boundary(t, expected):
+    assert sched.next_minute_boundary(t) == expected
+
+
+def test_unique_dark_settings_carries_the_gain_of_the_first_matching_slot():
+    entries = [sched.Entry(filter=1, exposure=55.0, delta=0, binning=4, gain=3,
+                           readout=5.0),
+               sched.Entry(filter=2, exposure=55.0, delta=60, binning=4, gain=1),
+               sched.Entry(filter=3, exposure=7.0, delta=900, binning=4, gain=2,
+                           readout=5.0)]
+    assert sched.unique_dark_settings(entries) == [
+        (55.0, 4, 3, 5.0), (7.0, 4, 2, 5.0)]
+
+
+def test_cycle_dark_duration_covers_every_frame_plus_a_margin():
+    entries = [sched.Entry(filter=1, exposure=55.0, delta=0, readout=5.0),
+               sched.Entry(filter=3, exposure=7.0, delta=900, readout=5.0)]
+    # 3 x (55+5) + 3 x (7+5) = 216 s of exposing and reading out.
+    assert sched.estimate_cycle_dark_duration(entries, 3, 5.0) > 216.0
+
+
+def test_cycle_dark_duration_falls_back_to_the_dead_time():
+    entries = [sched.Entry(filter=1, exposure=10.0, delta=0)]
+    with_gap = sched.estimate_cycle_dark_duration(entries, 1, 20.0)
+    without = sched.estimate_cycle_dark_duration(entries, 1, 0.0)
+    assert with_gap > without
+
+
+# ---------------------------------------------------------------------------
+# Converted imagerd_rt schedules (JSON)
+# ---------------------------------------------------------------------------
+def test_json_schedule_carries_its_globals_into_the_config(tmp_path):
+    path = tmp_path / "converted.json"
+    path.write_text(
+        '{"mode": "sun_cycle", "sun_max_angle": -12.0, "schedule_len": 300,'
+        ' "site_id": "TORY", "device_id": "ASI0",'
+        ' "slots": [{"delta": 0, "filter": 1, "exposure": 55, "gain": 3,'
+        '            "readout": 5, "binning": 4}]}')
+    conf = asi_config.from_dict({
+        "mode": "sun", "sun_max_angle": -6.0,
+        "schedule_file": str(path),
+    })
+    assert conf.errors == []
+    assert conf.schedule.mode == "sun_cycle"
+    assert conf.schedule.sun_max_angle == -12.0
+    assert conf.schedule.period == 300.0
+    assert conf.station.site_id == "TORY"
+    assert conf.station.device_id == "ASI0"
+    assert conf.schedule.entries[0].gain == 3
+
+
+def test_a_json_schedule_may_be_a_bare_list(tmp_path):
+    path = tmp_path / "slots.json"
+    path.write_text('[{"delta": 0, "filter": 1, "exposure": 5}]')
+    conf = asi_config.from_dict({"mode": "sun_cycle", "schedule_file": str(path)})
+    assert conf.errors == []
+    assert len(conf.schedule.entries) == 1
+
+
+def test_broken_json_is_reported_not_raised(tmp_path):
+    path = tmp_path / "broken.json"
+    path.write_text("{not json at all")
+    conf = asi_config.from_dict({"mode": "sun_cycle", "schedule_file": str(path)})
+    assert conf.schedule.entries == []
+    assert any("JSON" in e for e in conf.errors)
+
+
+def test_a_json_schedule_cannot_redefine_the_output_directory(tmp_path):
+    path = tmp_path / "sneaky.json"
+    path.write_text('{"output_dir": "/somewhere/else", "slots": []}')
+    conf = asi_config.from_dict({"output_dir": "/data/asi", "mode": "sun_cycle",
+                                 "schedule_file": str(path)})
+    assert conf.output_dir == "/data/asi"
+
+
+def test_the_converted_tory_schedule_reproduces_the_original_cycle():
+    """The station's own schedule.conf, converted: 36 slots closing at 1440 s."""
+    repo = Path(__file__).resolve().parent.parent
+    conf = asi_config.from_dict({
+        "mode": "sun",
+        "schedule_file": str(repo / "schedules" / "asi_tory_1440.json"),
+        "camera": {"binning": 4},
+    })
+    assert conf.errors == []
+    assert conf.schedule.mode == "sun_cycle"
+    assert len(conf.schedule.entries) == 36
+    assert conf.schedule.period == 1440.0
+    last = max(conf.schedule.entries, key=lambda e: e.delta)
+    assert (last.delta, last.exposure, last.readout) == (1428.0, 7.0, 5.0)
+    # Every slot carries the gain and binning the original had.
+    assert {e.gain for e in conf.schedule.entries} == {3}
+    assert {e.binning for e in conf.schedule.entries} == {4}
+
+
+# ---------------------------------------------------------------------------
+# Filter table
+# ---------------------------------------------------------------------------
+def test_filters_default_to_the_tory_wheel():
+    conf = asi_config.from_dict({})
+    assert conf.filter_info(1).wavelength == "5577"
+    assert conf.filter_info(3).wavelength == "OH__"
+
+
+def test_an_unknown_wheel_position_yields_blank_filter_details():
+    conf = asi_config.from_dict({})
+    info = conf.filter_info(0)
+    assert (info.wavelength, info.description) == ("", "")
+
+
+def test_a_station_may_replace_the_filter_table():
+    conf = asi_config.from_dict({
+        "filters": [{"slot": 1, "wavelength": "4278", "description": "427.8nm"}],
+    })
+    assert conf.filter_info(1).wavelength == "4278"
+    assert conf.filter_info(2).wavelength == ""

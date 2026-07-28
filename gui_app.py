@@ -2997,6 +2997,9 @@ class AsiTab(QWidget):
             text = (f"time · {len(sched.entries)} slot(s) · period "
                     f"{sched.period:.0f} s from "
                     f"{sched.t_start.strftime('%H:%M') if sched.t_start else '?'}")
+        elif sched.mode == "sun_cycle":
+            text = (f"sun_cycle ≤ {sched.sun_max_angle:g}° · "
+                    f"{len(sched.entries)} slot(s) · period {sched.period:.0f} s")
         else:
             text = (f"sun ≤ {sched.sun_max_angle:g}° · "
                     f"{len(sched.entries)} slot(s)")

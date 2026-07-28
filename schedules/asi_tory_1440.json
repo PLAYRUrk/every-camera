@@ -1,0 +1,305 @@
+{
+  "_comment": [
+    "Converted from imagerd_rt asi-camera/schedule.conf_22-11-2022_04-48-36.",
+    "Every duration is in SECONDS here; the original file used milliseconds.",
+    "start_time -> delta, filter_num -> filter, exposure_len -> exposure,",
+    "ccd_gain -> gain, prep_time -> readout, schedule_len -> schedule_len,",
+    "zenith_angle_start -> sun_max_angle.",
+    "Cycle closes exactly: last delta 1428 + exposure 7 + readout 5 = 1440 s."
+  ],
+  "mode": "sun_cycle",
+  "sun_max_angle": -10.0,
+  "schedule_len": 1440,
+  "site_id": "TORY",
+  "device_id": "ASI0",
+  "slots": [
+    {
+      "delta": 0,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 60,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 120,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 180,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 240,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 300,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 360,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 420,
+      "filter": 4,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 480,
+      "filter": 5,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 540,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 600,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 660,
+      "filter": 6,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 720,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 780,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 840,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 900,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 912,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 924,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 936,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 948,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 960,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1020,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1080,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1140,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1152,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1164,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1176,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1188,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1200,
+      "filter": 1,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1260,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1320,
+      "filter": 2,
+      "exposure": 55,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1380,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1392,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1404,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1416,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    },
+    {
+      "delta": 1428,
+      "filter": 3,
+      "exposure": 7,
+      "binning": 4,
+      "gain": 3,
+      "readout": 5
+    }
+  ]
+}

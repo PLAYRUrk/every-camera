@@ -25,11 +25,18 @@ both are load-bearing:
 
 Schedule modes (``asi.mode`` in config.json):
 
-    sun   Entries fire on given seconds of every minute while the solar altitude
-          stays at or below ``sun_max_angle``. Pre-darks are timed to finish just
-          as that window opens.
-    time  One general cycle repeats, phase-locked to ``t_start``; each entry has
-          its offset (``delta``), filter, exposure and binning.
+    sun        Entries fire on given seconds of every minute while the solar
+               altitude stays at or below ``sun_max_angle``. Pre-darks are timed
+               to finish just as that window opens.
+    time       One general cycle repeats, phase-locked to ``t_start``; each entry
+               has its offset (``delta``), filter, exposure, binning and gain.
+    sun_cycle  The same general cycle, but anchored to the sun instead of the
+               clock: nothing is exposed until the altitude reaches
+               ``sun_max_angle``, the pre-darks finish as that happens, and the
+               cycle runs until sunrise. This is what imagerd_rt did.
+
+Frames are filed as ``<output_dir>/YYYY/MM/DD/`` in UTC, under imagerd_rt's own
+file name — see ``cameras/asi/paths.py``.
 """
 import os
 import signal
@@ -52,8 +59,9 @@ from worker_common import (
 )
 
 from cameras.asi import config as asi_config
-from cameras.asi import devices, picam, schedule as asi_schedule
+from cameras.asi import devices, paths as asi_paths, picam, schedule as asi_schedule
 from cameras.asi.fits import write_fits
+from cameras.asi.seqno import next_seqno
 # Safe to import here: the wheel module pulls in pyserial only when it opens a
 # port, so a machine with no hardware still imports this driver.
 from cameras.asi.filterwheel import HOME as FILTER_HOME
@@ -242,11 +250,13 @@ class AsiCamera:
         return self.cam.capture()
 
     def prepare(self, entry):
-        """Apply one schedule entry's exposure, binning and filter."""
+        """Apply one schedule entry's exposure, binning, gain and filter."""
         if entry.exposure is not None and self.current_exposure != entry.exposure:
             self.set_exposure(entry.exposure)
         if entry.binning and self.current_binning != entry.binning:
             self.set_binning(entry.binning)
+        if entry.gain and self.current_gain != entry.gain:
+            self.set_gain(entry.gain)
         if entry.filter and self.current_filter != entry.filter:
             self.select_filter(entry.filter)
 
@@ -547,8 +557,10 @@ class AsiWorkerConsole(threading.Thread):
     # Capture
     # ------------------------------------------------------------------
     def _write_frame(self, path, image, timestamp, exposure, image_type, obs_mode,
-                     cooling=None):
+                     cooling=None, seqno=None):
         cooling = cooling or {}
+        station = self.cfg.station
+        filt = self.cfg.filter_info(self.cam.filter_number)
         write_fits(
             Path(path), image,
             timestamp=timestamp,
@@ -570,6 +582,15 @@ class AsiWorkerConsole(threading.Thread):
             elevation=self.cfg.location.elevation,
             gain=self.cam.current_gain,
             set_temp=self.cam.target_temperature,
+            # The legacy header block imagerd_rt wrote on every frame.
+            bit_depth=self.cam.info.get("bit_depth"),
+            seqno=seqno,
+            site_id=station.site_id,
+            device_id=station.device_id,
+            filter_wavelength=filt.wavelength,
+            filter_description=filt.description,
+            fw_temp=station.fw_temp,
+            legacy_version=station.legacy_version,
         )
 
     def _capture_one(self, now, exposure, image_type="LIGHT", obs_mode=None,
@@ -596,12 +617,22 @@ class AsiWorkerConsole(threading.Thread):
                                     ts_iso=now.isoformat())
             return False
 
-        suffix = "_bg" if image_type == "DARK" else ""
-        name = f"{now.strftime('%Y%m%dT%H%M%S')}_{self.cam.filter_number}{suffix}.fits"
-        path = os.path.join(self.output_dir, name)
+        station = self.cfg.station
+        path = asi_paths.frame_path(
+            self.output_dir, now,
+            site_id=station.site_id,
+            device_id=station.device_id,
+            wavelength=self.cfg.filter_info(self.cam.filter_number).wavelength,
+            exposure_sec=exposure,
+            dark=(image_type == "DARK"),
+        )
+        # Shown on the dashboard and in the log: the full path is mostly the
+        # date tree the operator already knows.
+        name = str(path.relative_to(self.output_dir))
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             self._write_frame(path, image, now, exposure, image_type, obs_mode,
-                              cooling)
+                              cooling, seqno=next_seqno(self.output_dir))
         except Exception as exc:
             self._errors += 1
             self._dash_update(errors=self._errors)
@@ -639,7 +670,7 @@ class AsiWorkerConsole(threading.Thread):
     def _capture_darks(self, phase, sync_to_seconds=False):
         """Shoot ``dark_frames`` frames per unique exposure with the shutter shut."""
         entries = self.cfg.schedule.entries
-        combos = asi_schedule.unique_exposures(entries)
+        combos = asi_schedule.unique_dark_settings(entries)
         if not combos or self._force_quit:
             return
         total = self.cfg.schedule.dark_frames * len(combos)
@@ -652,13 +683,17 @@ class AsiWorkerConsole(threading.Thread):
             console_ui.warn(f"Could not close the shutter: {exc}")
 
         done = 0
-        for exposure, binning in combos:
+        for exposure, binning, gain, _readout in combos:
             if self._force_quit:
                 break
             try:
                 self.cam.set_exposure(exposure)
                 if binning:
                     self.cam.set_binning(binning)
+                # A dark is only subtractable from lights taken at the same
+                # gain, so the schedule's gain applies here too.
+                if gain:
+                    self.cam.set_gain(gain)
             except Exception as exc:
                 console_ui.error(f"Could not set up darks ({exposure} s): {exc}")
                 continue
@@ -874,6 +909,90 @@ class AsiWorkerConsole(threading.Thread):
                     break
 
     # ------------------------------------------------------------------
+    # Sun-triggered cycle mode
+    # ------------------------------------------------------------------
+    def _run_sun_cycle_mode(self):
+        """The general cycle of ``time`` mode, started by the sun rather than the clock.
+
+        This is imagerd_rt's night (``imagerd_rt.c:531-738``): nothing is exposed
+        until the solar altitude reaches ``sun_max_angle``; the only thing that
+        happens before then is the pre-darks, timed to finish exactly as the
+        window opens; the cycle is then anchored to the first whole minute of
+        the window and free-runs until sunrise.
+        """
+        sched = self.cfg.schedule
+        angle_fn = self._sun_angle_fn()
+        period = sched.period
+
+        activation = asi_schedule.sun_crossing_time(angle_fn, sched.sun_max_angle)
+        dark_seconds = asi_schedule.estimate_cycle_dark_duration(
+            sched.entries, sched.dark_frames, sched.dead_time)
+        dark_start = activation - timedelta(seconds=dark_seconds)
+        self._dash_update(
+            schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle {period:.0f} s, "
+                     f"window ~{activation.strftime('%H:%M')}")
+
+        if dark_start > dt.now():
+            console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
+                           f"measurements ~{activation.strftime('%H:%M:%S')}")
+            if not self._wait_until(dark_start, phase="waiting for pre-darks"):
+                return
+        self._capture_darks("initial")
+        if self._stop_event.is_set():
+            return
+
+        try:
+            self.cam.set_shutter(True)
+        except Exception as exc:
+            console_ui.warn(f"Could not open the shutter: {exc}")
+
+        # The anchor is waited out *before* the loop rather than handed straight
+        # to next_cycle_slot: asked for a slot while ``now`` is still ahead of
+        # the anchor, that function answers with the previous (negative)
+        # iteration, whose late entries fall before the window opens.
+        anchor = asi_schedule.next_minute_boundary(max(activation, dt.now()))
+        console_ui.log(f"Cycle anchored at {anchor.strftime('%H:%M:%S')}, "
+                       f"period {period:.0f} s")
+        if not self._wait_until(anchor, phase="waiting for the cycle anchor"):
+            return
+
+        consecutive_errors = 0
+        while not self._stop_event.is_set():
+            now = dt.now()
+            angle = angle_fn(now)
+            if angle > sched.sun_max_angle:
+                console_ui.log("Sun above the threshold — measurements done.")
+                break
+
+            slot, entry, iteration = asi_schedule.next_cycle_slot(
+                anchor, period, sched.entries, now)
+            self._dash_update(
+                detail=f"cycle {iteration}, Δ{entry.delta:g} s",
+                schedule=f"sun {angle:+.1f}° (threshold {sched.sun_max_angle:g}°)"
+                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}")
+
+            try:
+                self.cam.prepare(entry)
+            except Exception as exc:
+                console_ui.error(f"Could not prepare the cycle: {exc}")
+                self._errors += 1
+            self._refresh_camera_section()
+
+            if not self._wait_until(slot, phase="measuring"):
+                break
+            if angle_fn(dt.now()) > sched.sun_max_angle:
+                console_ui.log("Window closed while waiting — skipping frame.")
+                continue
+            if self._capture_one(dt.now(), entry.exposure, "LIGHT", "sun_cycle"):
+                consecutive_errors = 0
+            else:
+                consecutive_errors += 1
+                if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                    console_ui.error(f"{consecutive_errors} consecutive capture "
+                                     f"failures — stopping.")
+                    break
+
+    # ------------------------------------------------------------------
     # MQTT commands
     # ------------------------------------------------------------------
     def _on_mqtt_command(self, topic, payload):
@@ -968,6 +1087,8 @@ class AsiWorkerConsole(threading.Thread):
             elif self._wait_for_start():
                 if self.cfg.schedule.mode == "time":
                     self._run_time_mode()
+                elif self.cfg.schedule.mode == "sun_cycle":
+                    self._run_sun_cycle_mode()
                 else:
                     self._run_sun_mode()
         except Exception as exc:

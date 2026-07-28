@@ -157,6 +157,7 @@ class SimCamera:
             "camera_version": "sim",
             "driver_version": "sim",
             "module_version": "simulated sensor",
+            "bit_depth": 16,        # the simulator hands out 16-bit frames
         }
 
     def info_rows(self) -> list:

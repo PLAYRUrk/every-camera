@@ -228,16 +228,32 @@ DEFAULT_CONFIG = {
     "asi": {
         "instance_name": "",
         "output_dir": "",
-        "mode": "sun",                  # "sun" or "time"
-        "sun_max_angle": -10.0,         # sun mode: start below this solar altitude
+        "mode": "sun",                  # "sun", "time" or "sun_cycle"
+        "sun_max_angle": -10.0,         # sun/sun_cycle: start below this altitude
         "t_start": "20:00",             # time mode: phase reference of the cycle
+        "schedule_len": None,           # cycle length, s (None = derive from slots)
         "dark_frames": 3,
         "dead_time": 5.0,
         "wait_for_enter": True,         # time mode: wait for the operator to start
-        "schedule_file": "",            # optional legacy schedule.txt
-        "schedule": [],                 # sun:  {"filter":1,"exposure":55,"seconds":[0]}
-                                        # time: {"delta":100,"filter":3,
-                                        #        "exposure":25,"binning":1}
+        "schedule_file": "",            # legacy schedule.txt or converted .json
+        "schedule": [],                 # sun:   {"filter":1,"exposure":55,"seconds":[0]}
+                                        # cycle: {"delta":100,"filter":3,"exposure":25,
+                                        #         "binning":1,"gain":3,"readout":5}
+        # Written into every frame's name and its legacy FITS headers, exactly
+        # as imagerd_rt wrote them.
+        "site_id": "",
+        "device_id": "",
+        "legacy_version": "3.0",        # the "Version" header the archive carries
+        "fw_temp": None,                # no sensor on this wheel; None -> -999.0
+        "filters": [                    # wavelength tags used in names and headers
+            {"slot": 1, "wavelength": "5577", "description": "557.7nm x 2.0nm"},
+            {"slot": 2, "wavelength": "6300", "description": "630.0nm x 2.0nm"},
+            {"slot": 3, "wavelength": "OH__",
+             "description": "Broadband OH with 18 nm notch at 865.0nm"},
+            {"slot": 4, "wavelength": "8400", "description": "840.0nm x 1.8nm"},
+            {"slot": 5, "wavelength": "8465", "description": "846.5nm x 1.8nm"},
+            {"slot": 6, "wavelength": "8570", "description": "857.0nm x 1.8nm"},
+        ],
         "camera": {
             "backend": "picam",         # "picam" (real SDK) or "sim"
             "readout_speed": 2.0,
@@ -777,21 +793,31 @@ def configure_console_asi(cfg, config_path=None):
     location["elevation"] = _ask_float("Site elevation (m)",
                                        location.get("elevation", 0.0))
 
-    mode = _ask("Schedule mode (sun / time)", asi.get("mode", "sun"))
-    asi["mode"] = mode if mode in ("sun", "time") else "sun"
-    if asi["mode"] == "sun":
+    # Both end up in the file name and in the legacy FITS headers, so the
+    # processing program keys off them.
+    asi["site_id"] = _ask("Site ID (4 characters, e.g. TORY)", asi.get("site_id", ""))
+    asi["device_id"] = _ask("Device ID (e.g. ASI0)", asi.get("device_id", ""))
+
+    mode = _ask("Schedule mode (sun / time / sun_cycle)", asi.get("mode", "sun"))
+    asi["mode"] = mode if mode in ("sun", "time", "sun_cycle") else "sun"
+    if asi["mode"] in ("sun", "sun_cycle"):
         asi["sun_max_angle"] = _ask_float(
             "Start when the solar altitude drops below (degrees)",
             asi.get("sun_max_angle", -10.0))
-    else:
+    if asi["mode"] == "time":
         asi["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
                               asi.get("t_start", "20:00"))
+    if asi["mode"] in ("time", "sun_cycle"):
+        asi["schedule_len"] = _ask_float(
+            "Cycle length (s, 0 = derive from the slots)",
+            asi.get("schedule_len") or 0.0) or None
     asi["dark_frames"] = _ask_int("Dark frames per exposure",
                                   asi.get("dark_frames", 3))
     asi["dead_time"] = _ask_float("Dead time between cycles (s)",
                                   asi.get("dead_time", 5.0))
 
-    schedule_file = _ask("Legacy schedule.txt path (empty = use the slots below)",
+    schedule_file = _ask("Schedule file path, .txt or .json "
+                         "(empty = use the slots below)",
                          asi.get("schedule_file", ""))
     asi["schedule_file"] = schedule_file
     if not schedule_file and _ask_bool("Enter the schedule now?",
@@ -803,9 +829,14 @@ def configure_console_asi(cfg, config_path=None):
                 "filter": _ask_int("    Filter (1-6)", 1),
                 "exposure": _ask_float("    Exposure (s)", 55.0),
             }
-            if asi["mode"] == "time":
+            if asi["mode"] in ("time", "sun_cycle"):
                 slot["delta"] = _ask_float("    Offset from the cycle start (s)", 0.0)
                 slot["binning"] = _ask_int("    Binning", camera.get("binning", 4))
+                slot["gain"] = _ask_int("    Analog gain (1=Low, 2=Medium, 3=High)",
+                                        camera.get("gain", 1))
+                slot["readout"] = _ask_float(
+                    "    Readout/filter-move time after the frame (s)",
+                    asi.get("dead_time", 5.0))
             else:
                 secs = _ask("    Capture seconds within the minute (comma-separated)",
                             "0")

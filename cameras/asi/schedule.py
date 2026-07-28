@@ -1,25 +1,33 @@
 """
 Schedule entries and cycle timing for the ASI imager.
 
-Two schedule shapes exist, and both are kept because they describe genuinely
+Three schedule shapes exist, and all are kept because they describe genuinely
 different observing programmes:
 
 * **sun** — entries fire on given seconds of every minute for as long as the sun
   stays below ``sun_max_angle``. Each entry is ``filter, exposure, seconds``.
 * **time** — one "general cycle" of fixed period repeats, phase-locked to a
-  single ``t_start``. Each entry is ``delta, filter, exposure, binning``, where
-  ``delta`` is seconds from the start of the cycle. The period is derived, not
-  configured: last delta + that exposure + dead time.
+  single ``t_start``. Each entry is ``delta, filter, exposure, binning, gain,
+  readout``, where ``delta`` is seconds from the start of the cycle. The period
+  is ``schedule_len`` when configured, otherwise derived: last delta + that
+  exposure + that entry's readout.
+* **sun_cycle** — the same cycle as *time*, but anchored to the evening the sun
+  drops to ``sun_max_angle`` instead of to a wall-clock time. This is what
+  imagerd_rt did (``imagerd_rt.c:531-738``): nothing is exposed until the sun is
+  low enough, the pre-darks are timed to finish just as that happens, and the
+  cycle then free-runs from the first whole minute of the window.
 
-Entries come either from ``config.json`` (a list of objects, the normal case) or
-from a legacy asi-camera ``schedule.txt``; :func:`parse_schedule_text` reads the
-old format so an existing station file keeps working.
+Entries come from ``config.json`` (a list of objects, the normal case), from a
+converted imagerd_rt schedule in JSON, or from a legacy asi-camera
+``schedule.txt``; :func:`parse_schedule_text` reads the oldest format so an
+existing station file keeps working.
 
 Everything here is pure: no camera, no clock beyond what is passed in. That is
 what makes the cycle arithmetic — the subtlest part of the driver — testable.
 """
 from __future__ import annotations
 
+import json
 import math
 
 from dataclasses import dataclass, field
@@ -31,7 +39,20 @@ from datetime import datetime, timedelta
 FILTER_MIN = 1
 FILTER_MAX = 6
 
-MODES = ("sun", "time")
+MODES = ("sun", "time", "sun_cycle")
+
+# Modes built from a repeating general cycle, where entries carry ``delta``
+# rather than seconds-within-a-minute.
+CYCLE_MODES = ("time", "sun_cycle")
+
+GAIN_MIN = 1        # 1 Low, 2 Medium, 3 High — PICAM AdcAnalogGain
+GAIN_MAX = 3
+
+# The globals a converted imagerd_rt schedule may carry with it. Keeping this an
+# explicit list means a stray key in a schedule file cannot silently redefine,
+# say, the output directory.
+FILE_OVERRIDE_KEYS = ("mode", "sun_max_angle", "schedule_len", "t_start",
+                      "dark_frames", "dead_time", "site_id", "device_id")
 
 
 @dataclass
@@ -41,8 +62,10 @@ class Entry:
     filter: int
     exposure: float
     seconds: list = field(default_factory=list)   # sun mode: seconds within a minute
-    delta: float = None                           # time mode: offset in the cycle
-    binning: int = None                           # time mode: binning for this cycle
+    delta: float = None                           # cycle modes: offset in the cycle
+    binning: int = None                           # binning for this cycle
+    gain: int = None                              # analog gain for this cycle
+    readout: float = None                         # legacy prep_time, in seconds
 
     def as_dict(self):
         out = {"filter": self.filter, "exposure": self.exposure}
@@ -52,6 +75,10 @@ class Entry:
             out["delta"] = self.delta
         if self.binning is not None:
             out["binning"] = self.binning
+        if self.gain is not None:
+            out["gain"] = self.gain
+        if self.readout is not None:
+            out["readout"] = self.readout
         return out
 
 
@@ -100,12 +127,30 @@ def entries_from_config(slots, mode, default_binning=1):
         binning = _as_int(slot.get("binning", default_binning), what, errors) \
             or default_binning
 
-        if mode == "time":
+        # Both are optional: a slot that does not name them falls back to the
+        # camera-wide gain and the schedule-wide dead time.
+        gain = None
+        if slot.get("gain", slot.get("ccd_gain")) is not None:
+            gain = _as_int(slot.get("gain", slot.get("ccd_gain")), what, errors)
+            if gain is not None and not GAIN_MIN <= gain <= GAIN_MAX:
+                errors.append(f"{what}: gain must be {GAIN_MIN}..{GAIN_MAX}, "
+                              f"got {gain}")
+                gain = None
+        readout = None
+        if slot.get("readout", slot.get("prep_time")) is not None:
+            readout = _as_float(slot.get("readout", slot.get("prep_time")),
+                                what, errors)
+            if readout is not None and readout < 0:
+                errors.append(f"{what}: readout must not be negative, got {readout}")
+                readout = None
+
+        if mode in CYCLE_MODES:
             delta = _as_float(slot.get("delta"), what, errors)
             if delta is None:
                 continue
             entries.append(Entry(filter=filter_num, exposure=exposure,
-                                 delta=delta, binning=binning))
+                                 delta=delta, binning=binning, gain=gain,
+                                 readout=readout))
         else:
             raw = slot.get("seconds", [0])
             if isinstance(raw, (int, float)):
@@ -124,15 +169,16 @@ def entries_from_config(slots, mode, default_binning=1):
                 errors.append(f"{what}: no valid capture seconds")
                 continue
             entries.append(Entry(filter=filter_num, exposure=exposure,
-                                 seconds=sorted(seconds), binning=binning))
+                                 seconds=sorted(seconds), binning=binning,
+                                 gain=gain, readout=readout))
     return entries, errors
 
 
 def parse_schedule_text(text, mode, default_binning=1):
     """Parse a legacy asi-camera ``schedule.txt``. Returns ``(entries, errors)``.
 
-    ``sun``  mode: ``filter,exposure,seconds``       e.g. ``1,55,0:30``
-    ``time`` mode: ``delta;filter;exposure;binning`` e.g. ``100;3;25;1``
+    ``sun``   mode: ``filter,exposure,seconds``       e.g. ``1,55,0:30``
+    cycle modes: ``delta;filter;exposure;binning``    e.g. ``100;3;25;1``
     """
     slots, errors = [], []
     for lineno, raw in enumerate(text.splitlines(), 1):
@@ -140,7 +186,7 @@ def parse_schedule_text(text, mode, default_binning=1):
         if not line or line.startswith("#"):
             continue
         try:
-            if mode == "time":
+            if mode in CYCLE_MODES:
                 parts = [p.strip() for p in line.split(";")]
                 if len(parts) < 3:
                     errors.append(f"Line {lineno}: expected "
@@ -174,15 +220,54 @@ def parse_schedule_text(text, mode, default_binning=1):
     return entries, errors + slot_errors
 
 
+def parse_schedule_json(text, mode, default_binning=1):
+    """Parse a converted imagerd_rt schedule. Returns ``(entries, errors, overrides)``.
+
+    The file is either a bare list of slots or an object whose ``slots`` (or
+    ``schedule``) key holds them. In the object form its other keys are the
+    globals the imagerd_rt schedule.conf carried — ``mode``, ``sun_max_angle``,
+    ``schedule_len`` and friends — and they are handed back so the caller can
+    let the file speak for the whole programme, as it did in the old station.
+    """
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        return [], [f"schedule file: not valid JSON ({exc})"], {}
+
+    overrides = {}
+    if isinstance(payload, dict):
+        slots = payload.get("slots", payload.get("schedule", []))
+        overrides = {k: payload[k] for k in FILE_OVERRIDE_KEYS if k in payload}
+        mode = str(overrides.get("mode", mode)).strip().lower()
+    elif isinstance(payload, list):
+        slots = payload
+    else:
+        return [], [f"schedule file: expected an object or a list, got "
+                    f"{type(payload).__name__}"], {}
+
+    entries, errors = entries_from_config(slots, mode, default_binning)
+    return entries, errors, overrides
+
+
 def load_schedule_file(path, mode, default_binning=1):
+    """Load a schedule file. Returns ``(entries, errors, overrides)``.
+
+    JSON is detected by extension or by the first non-blank character, so a
+    converted schedule can be dropped in beside a legacy ``schedule.txt``
+    without a second config key to say which is which.
+    """
     with open(path, "r") as fh:
-        return parse_schedule_text(fh.read(), mode, default_binning)
+        text = fh.read()
+    if str(path).lower().endswith(".json") or text.lstrip()[:1] in ("{", "["):
+        return parse_schedule_json(text, mode, default_binning)
+    entries, errors = parse_schedule_text(text, mode, default_binning)
+    return entries, errors, {}
 
 
 def schedule_to_text(entries, mode):
     """Render entries back into the legacy file format (used by the setup tools)."""
     lines = []
-    if mode == "time":
+    if mode in CYCLE_MODES:
         lines.append("# delta(s);filter;exposure(s);binning")
         for entry in sorted(entries, key=lambda e: e.delta or 0):
             lines.append(f"{entry.delta:g};{entry.filter};{entry.exposure:g};"
@@ -198,26 +283,43 @@ def schedule_to_text(entries, mode):
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
-def unique_exposures(entries):
-    """One ``(exposure, binning)`` pair per unique exposure, in schedule order.
+def unique_dark_settings(entries):
+    """One ``(exposure, binning, gain, readout)`` tuple per unique exposure.
 
-    Dark frames are keyed by exposure only; the binning comes from the first
-    cycle that uses that exposure.
+    Dark frames are keyed by exposure only, in schedule order; the remaining
+    settings come from the first cycle that uses that exposure. A dark must
+    match the light frames it will be subtracted from, so the gain travels with
+    the exposure rather than being left at whatever the last slot happened to
+    set.
     """
     combos, seen = [], set()
     for entry in entries:
         if entry.exposure not in seen:
             seen.add(entry.exposure)
-            combos.append((entry.exposure, entry.binning or 1))
+            combos.append((entry.exposure, entry.binning or 1, entry.gain,
+                           entry.readout))
     return combos
 
 
+def unique_exposures(entries):
+    """``(exposure, binning)`` per unique exposure — the settings darks reuse."""
+    return [(exposure, binning)
+            for exposure, binning, _gain, _readout in unique_dark_settings(entries)]
+
+
 def cycle_period(entries, dead_time):
-    """General-cycle length = last cycle's delta + its exposure + dead time."""
+    """General-cycle length = last cycle's delta + its exposure + its readout.
+
+    The readout is the entry's own when the schedule gives one (imagerd_rt's
+    per-slot ``prep_time``), otherwise the schedule-wide dead time. For the Tory
+    programme this reproduces the original ``schedule_len`` exactly:
+    1428 + 7 + 5 = 1440 s.
+    """
     if not entries:
         return float(dead_time)
     last = max(entries, key=lambda e: e.delta or 0.0)
-    return (last.delta or 0.0) + last.exposure + dead_time
+    readout = last.readout if last.readout is not None else dead_time
+    return (last.delta or 0.0) + last.exposure + readout
 
 
 def next_cycle_slot(t_start, period, entries, now):
@@ -252,6 +354,31 @@ def next_second_slot(seconds, now=None):
         return now.replace(second=future[0], microsecond=0)
     nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     return nxt.replace(second=ordered[0])
+
+
+def next_minute_boundary(t):
+    """The first whole minute at or after ``t``.
+
+    imagerd_rt armed its cycle timer only on a whole UTC minute
+    (``imagerd_rt.c:725-736``); the cycle modes anchor themselves the same way so
+    that slot times stay readable and comparable between nights.
+    """
+    truncated = t.replace(second=0, microsecond=0)
+    return truncated if truncated == t else truncated + timedelta(minutes=1)
+
+
+def estimate_cycle_dark_duration(entries, dark_frames, dead_time):
+    """Worst-case seconds to shoot the cycle-mode darks, +10 % and a 30 s buffer.
+
+    Cycle-mode darks run back to back — there is no second-of-the-minute to wait
+    for — so this is simply the exposures plus their readouts, unlike
+    :func:`estimate_dark_duration`, which has to allow for that wait.
+    """
+    total = 0.0
+    for exposure, _binning, _gain, readout in unique_dark_settings(entries):
+        gap = readout if readout is not None else dead_time
+        total += dark_frames * (exposure + gap)
+    return total * 1.1 + 30.0
 
 
 def estimate_dark_duration(entries, dark_frames):

@@ -36,6 +36,7 @@ class PixisCamera:
         self._id: picam.PicamCameraID | None = None
         self._sensor: tuple[int, int] = (0, 0)  # full sensor (width, height)
         self._setpoint_limits = None  # cooling setpoints this camera accepts
+        self._bit_depth: int | None = None  # known once the camera is configured
 
         self.current_exposure: float | None = None
         self.current_binning: int = cfg.binning
@@ -180,7 +181,8 @@ class PixisCamera:
         self._set_full_frame_roi(cfg.binning)
         self._commit()
 
-        bit_depth = picam.get_int(self._handle, P.PixelBitDepth)
+        # Kept: the legacy ``BitDepth`` header records it on every frame.
+        self._bit_depth = bit_depth = picam.get_int(self._handle, P.PixelBitDepth)
         if bit_depth > 16:
             raise RuntimeError(
                 f"This camera reports {bit_depth}-bit pixels; the FITS writer here "
@@ -357,6 +359,7 @@ class PixisCamera:
             "camera_version": firmware or "n/a",
             "driver_version": version,
             "module_version": cid.sensor_name.decode(errors="replace"),
+            "bit_depth": self._bit_depth,
         }
 
     def info_rows(self) -> list:

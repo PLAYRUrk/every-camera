@@ -15,6 +15,7 @@ Console mode:
     python setup_app.py --console --type sptt # configure SPTT only
 """
 import argparse
+import copy
 import os
 import sys
 
@@ -587,14 +588,17 @@ class SentryConfigTab:
 class AsiConfigTab:
     """Builds and reads the ASI all-sky imager configuration form.
 
-    The slot table serves both schedule modes: ``delta`` and ``binning`` matter
-    in *time* mode, ``seconds`` in *sun* mode. Both columns are always shown —
-    switching mode should not silently discard the other programme.
+    The slot table serves every schedule mode: ``delta``, ``gain`` and
+    ``readout`` matter in the cycle modes (*time*, *sun_cycle*), ``seconds`` in
+    *sun* mode. All columns are always shown — switching mode should not
+    silently discard the other programme.
     """
 
-    SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
-    SLOT_KEYS = ["filter", "exposure", "delta", "binning", "seconds"]
-    SLOT_DEFAULTS = [1, 55.0, 0.0, 4, "0"]
+    SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Gain",
+                    "Readout (s)", "Seconds"]
+    SLOT_KEYS = ["filter", "exposure", "delta", "binning", "gain", "readout",
+                 "seconds"]
+    SLOT_DEFAULTS = [1, 55.0, 0.0, 4, 3, 5.0, "0"]
 
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
@@ -603,6 +607,7 @@ class AsiConfigTab:
             QTableWidget, QHeaderView, QAbstractItemView,
         )
         c = cfg.get("asi", {})
+        self._orig = c if isinstance(c, dict) else {}
         cam = c.get("camera", {})
         cool = c.get("cooling", {})
         wheel = c.get("filter_wheel", {})
@@ -748,16 +753,34 @@ class AsiConfigTab:
         self.sb_elev.setValue(float(loc.get("elevation", 0.0)))
         _add_label_row(hgrid, row, "Elevation:", self.sb_elev); row += 1
 
+        # Both go into the frame's file name and its legacy FITS headers, which
+        # is how the processing program tells stations and imagers apart.
+        self.le_site_id = QLineEdit(c.get("site_id", ""))
+        self.le_site_id.setPlaceholderText("e.g. TORY")
+        self.le_site_id.setToolTip("Station identifier, in the file name and the "
+                                   "SiteID header")
+        _add_label_row(hgrid, row, "Site ID:", self.le_site_id); row += 1
+
+        self.le_device_id = QLineEdit(c.get("device_id", ""))
+        self.le_device_id.setPlaceholderText("e.g. ASI0")
+        self.le_device_id.setToolTip("Imager identifier, in the file name and the "
+                                     "DeviceID header")
+        _add_label_row(hgrid, row, "Device ID:", self.le_device_id); row += 1
+
         root.addWidget(hw_box)
 
         # ── Schedule ───────────────────────────────────────────────────────
         sched_box, sgrid = _group_grid("Schedule")
         row = 0
         self.cb_mode = QComboBox()
-        self.cb_mode.addItems(["sun", "time"])
+        self.cb_mode.addItems(["sun", "time", "sun_cycle"])
         self.cb_mode.setCurrentText(c.get("mode", "sun"))
-        self.cb_mode.setToolTip("'sun': shoot while the sun is below the angle "
-                                "below.\n'time': repeat a fixed cycle from T_start.")
+        self.cb_mode.setToolTip(
+            "'sun': shoot on given seconds while the sun is below the angle "
+            "below.\n'time': repeat a fixed cycle from T_start.\n"
+            "'sun_cycle': repeat that cycle, but start it when the sun reaches "
+            "the angle below — nothing is exposed before that except the "
+            "pre-darks.")
         _add_label_row(sgrid, row, "Mode:", self.cb_mode); row += 1
 
         self.sb_sun_angle = QDoubleSpinBox()
@@ -769,8 +792,20 @@ class AsiConfigTab:
                        self.sb_sun_angle); row += 1
 
         self.le_t_start = QLineEdit(str(c.get("t_start", "20:00")))
-        self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM")
+        self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM. "
+                                   "Unused in sun_cycle mode, where the sun sets "
+                                   "the phase.")
         _add_label_row(sgrid, row, "T_start (time mode):", self.le_t_start); row += 1
+
+        self.sb_sched_len = QDoubleSpinBox()
+        self.sb_sched_len.setRange(0.0, 86400.0)
+        self.sb_sched_len.setDecimals(1)
+        self.sb_sched_len.setSuffix(" s")
+        self.sb_sched_len.setToolTip("Cycle length for the cycle modes "
+                                     "(imagerd_rt's schedule_len, in seconds).\n"
+                                     "0 derives it from the last slot.")
+        self.sb_sched_len.setValue(float(c.get("schedule_len") or 0.0))
+        _add_label_row(sgrid, row, "Cycle length:", self.sb_sched_len); row += 1
 
         self.sb_darks = QSpinBox()
         self.sb_darks.setRange(0, 100)
@@ -863,7 +898,7 @@ class AsiConfigTab:
                                      if s.strip()]
                     except ValueError:
                         slot[key] = [0]
-                elif key in ("filter", "binning"):
+                elif key in ("filter", "binning", "gain"):
                     try:
                         slot[key] = int(float(raw))
                     except ValueError:
@@ -877,12 +912,31 @@ class AsiConfigTab:
         return slots
 
     def get_config(self) -> dict:
+        """The edited section, layered over whatever was already in the file.
+
+        The caller replaces ``asi`` wholesale with what comes back, so anything
+        this form does not put on screen — the filter wavelength table, the
+        legacy version string, the demo-camera settings — has to be carried
+        through rather than dropped on the first save.
+        """
+        merged = copy.deepcopy(self._orig)
+        merged.update(self._edited())
+        for section in ("camera", "cooling", "filter_wheel", "location"):
+            base = self._orig.get(section)
+            if isinstance(base, dict):
+                merged[section] = {**base, **merged[section]}
+        return merged
+
+    def _edited(self) -> dict:
         return {
             "instance_name": self.le_instance.text().strip(),
             "output_dir": self.le_output.text().strip(),
             "mode": self.cb_mode.currentText(),
             "sun_max_angle": self.sb_sun_angle.value(),
             "t_start": self.le_t_start.text().strip(),
+            "schedule_len": self.sb_sched_len.value() or None,
+            "site_id": self.le_site_id.text().strip(),
+            "device_id": self.le_device_id.text().strip(),
             "dark_frames": self.sb_darks.value(),
             "dead_time": self.sb_dead.value(),
             "wait_for_enter": self.cb_wait_enter.isChecked(),
