@@ -192,5 +192,5 @@ class HamamatsuCamera:
             ("Camera firmware:", info["camera_version"]),
             ("Driver:", info["driver_version"]),
             ("Module:", info["module_version"]),
-            ("Readout speed:", _readout_text(self.current_readout_speed)),
+            ("Readout speed:", readout_text(self.current_readout_speed)),
         ]
