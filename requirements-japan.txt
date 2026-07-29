@@ -1,0 +1,14 @@
+# Узел с камерой Japan (Hamamatsu через DCAM-API + колесо фильтров).
+# Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
+-r requirements.txt
+
+pyserial>=3.5,<4       # колесо фильтров SmartMotor на /dev/ttyUSB*
+astropy>=5.3,<6.2      # обязателен: запись FITS; 7.x требует numpy 2.x
+
+# Системные зависимости:
+#   DCAM-API SDK — libdcamapi.so (export DCAM_LIB=... или установка в /usr/local/lib).
+#     Обёртки Hamamatsu (dcam.py, dcamapi4.py) уже лежат в
+#     cameras/japan/dcamsdk/vendor/ — отдельно ставить их не нужно, нужна
+#     только сама библиотека из установщика SDK.
+#   sudo usermod -aG dialout $USER   # и перелогиниться
+# Без SDK драйвер работает с japan.camera.backend = "sim" и filter_wheel.port = "sim".

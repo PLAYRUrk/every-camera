@@ -2,8 +2,8 @@
 #
 #   systemctl enable --now every-camera@asi
 #
-# The instance name after the "@" is the camera type — asi, sentry, cannon,
-# sptt or infra — and is passed straight to main.py --type.
+# The instance name after the "@" is the camera type — asi, japan, sentry,
+# cannon, sptt or infra — and is passed straight to main.py --type.
 #
 # Unlike the legacy imagerd_rt unit, this is Type=simple: every-camera does not
 # daemonise, so there is no PID file and no start/stop wrapper script. systemd

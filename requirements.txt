@@ -18,6 +18,7 @@
 #     pip install -r requirements-sptt.txt       # узел с камерой SPTT
 #     pip install -r requirements-infra.txt      # узел с камерой Infra
 #     pip install -r requirements-asi.txt        # узел с камерой ASI
+#     pip install -r requirements-japan.txt      # узел с камерой Japan
 #     pip install -r requirements-sentry.txt     # узел с камерой Sentry
 #     pip install -r requirements-gui.txt        # плюс GUI (gui_app/setup_app)
 #     pip install -r requirements-observer.txt   # машина наблюдателя

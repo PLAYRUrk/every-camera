@@ -35,6 +35,7 @@ def run_console_wizard(config_path=None, camera_type=None):
         configure_console_infra,
         configure_console_sentry,
         configure_console_asi,
+        configure_console_japan,
         _configure_mqtt,
         _ask_bool,
     )
@@ -47,6 +48,7 @@ def run_console_wizard(config_path=None, camera_type=None):
         "infra":  configure_console_infra,
         "sentry": configure_console_sentry,
         "asi":    configure_console_asi,
+        "japan":  configure_console_japan,
     }
 
     print("\n" + "=" * 52)
@@ -1072,6 +1074,302 @@ class AsiConfigTab:
         }
 
 
+class JapanConfigTab:
+    """Builds and reads the Japan (Hamamatsu) all-sky imager configuration form.
+
+    Deliberately smaller than :class:`AsiConfigTab`: this camera has no cooling to
+    configure, no automatic exposure and no overexposure guard, and its schedule
+    has two modes rather than three. The slot table has no gain or readout column
+    for the same reason — nothing here would read them.
+    """
+
+    SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
+    SLOT_KEYS = ["filter", "exposure", "delta", "binning", "seconds"]
+    SLOT_DEFAULTS = [1, 30.0, 0.0, 1, "0"]
+
+    def __init__(self, cfg: dict):
+        from PyQt5.QtWidgets import (
+            QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QGroupBox,
+            QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox, QPushButton,
+            QTableWidget, QHeaderView, QAbstractItemView,
+        )
+        c = cfg.get("japan", {})
+        self._orig = c if isinstance(c, dict) else {}
+        cam = c.get("camera", {})
+        wheel = c.get("filter_wheel", {})
+        loc = c.get("location", {})
+
+        self.widget = QWidget()
+        root = QVBoxLayout(self.widget)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # ── Main settings ──────────────────────────────────────────────────
+        box, grid = _group_grid("Japan all-sky imager (Hamamatsu via DCAM-API)")
+        row = 0
+
+        self.le_output = QLineEdit(c.get("output_dir", ""))
+        self.le_output.setToolTip("Frames are written flat into this directory, "
+                                  "so one directory per night is usual")
+        _add_dir_row(grid, row, "Output directory:", self.le_output); row += 1
+
+        self.le_instance = QLineEdit(c.get("instance_name", ""))
+        self.le_instance.setPlaceholderText("auto")
+        _add_label_row(grid, row, "Instance name:", self.le_instance); row += 1
+
+        self.cb_backend = QComboBox()
+        self.cb_backend.addItems(["dcam", "sim"])
+        self.cb_backend.setCurrentText(cam.get("backend", "dcam"))
+        self.cb_backend.setToolTip("'dcam' talks to the real SDK; 'sim' runs "
+                                   "the whole programme without hardware")
+        _add_label_row(grid, row, "Camera backend:", self.cb_backend); row += 1
+
+        self.cb_binning = QComboBox()
+        self.cb_binning.addItems(["1", "2", "4", "8"])
+        self.cb_binning.setCurrentText(str(cam.get("binning", 1)))
+        _add_label_row(grid, row, "Binning:", self.cb_binning); row += 1
+
+        self.cb_readout = QComboBox()
+        self.cb_readout.addItems(["1 — slow (min noise)", "2 — fast"])
+        self.cb_readout.setCurrentIndex(0 if int(cam.get("readout_speed", 2)) == 1
+                                        else 1)
+        self.cb_readout.setToolTip("DCAM READOUTSPEED. The slow readout is the "
+                                   "quieter of the two.")
+        _add_label_row(grid, row, "Readout speed:", self.cb_readout); row += 1
+
+        self.sb_timeout = QSpinBox()
+        self.sb_timeout.setRange(100, 600_000)
+        self.sb_timeout.setSuffix(" ms")
+        self.sb_timeout.setToolTip("One DCAM frame-ready wait. The driver waits "
+                                   "several of these on top of the exposure "
+                                   "before giving up on a frame.")
+        self.sb_timeout.setValue(int(cam.get("frame_timeout_ms", 1000)))
+        _add_label_row(grid, row, "Frame timeout:", self.sb_timeout); row += 1
+
+        root.addWidget(box)
+
+        # There is no cooling group: the camera reports a sensor temperature and
+        # offers no setpoint to command.
+
+        # ── Filter wheel + site ────────────────────────────────────────────
+        hw_box, hgrid = _group_grid("Filter wheel and site")
+        row = 0
+        self.le_port = QLineEdit(wheel.get("port", "/dev/ttyUSB0"))
+        self.le_port.setToolTip("Serial port of the SmartMotor controller, "
+                                "or 'sim' for the simulator")
+        _add_label_row(hgrid, row, "Serial port:", self.le_port); row += 1
+
+        self.sb_baud = QSpinBox()
+        self.sb_baud.setRange(300, 921_600)
+        self.sb_baud.setValue(int(wheel.get("baudrate", 9600)))
+        _add_label_row(hgrid, row, "Baud rate:", self.sb_baud); row += 1
+
+        self.sb_move_timeout = QDoubleSpinBox()
+        self.sb_move_timeout.setRange(0.5, 120.0)
+        self.sb_move_timeout.setDecimals(1)
+        self.sb_move_timeout.setSuffix(" s")
+        self.sb_move_timeout.setToolTip("Safety ceiling for a stuck wheel; a "
+                                        "normal move takes about a second")
+        self.sb_move_timeout.setValue(float(wheel.get("move_timeout", 8.0)))
+        _add_label_row(hgrid, row, "Move timeout:", self.sb_move_timeout); row += 1
+
+        self.sb_lat = QDoubleSpinBox()
+        self.sb_lat.setRange(-90.0, 90.0)
+        self.sb_lat.setDecimals(6)
+        self.sb_lat.setValue(float(loc.get("lat", 0.0)))
+        _add_label_row(hgrid, row, "Latitude:", self.sb_lat); row += 1
+
+        self.sb_lon = QDoubleSpinBox()
+        self.sb_lon.setRange(-180.0, 180.0)
+        self.sb_lon.setDecimals(6)
+        self.sb_lon.setValue(float(loc.get("lon", 0.0)))
+        _add_label_row(hgrid, row, "Longitude:", self.sb_lon); row += 1
+
+        self.sb_elev = QDoubleSpinBox()
+        self.sb_elev.setRange(-500.0, 9000.0)
+        self.sb_elev.setDecimals(1)
+        self.sb_elev.setSuffix(" m")
+        self.sb_elev.setValue(float(loc.get("elevation", 0.0)))
+        _add_label_row(hgrid, row, "Elevation:", self.sb_elev); row += 1
+
+        root.addWidget(hw_box)
+
+        # ── Schedule ───────────────────────────────────────────────────────
+        sched_box, sgrid = _group_grid("Schedule")
+        row = 0
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItems(["sun", "time"])
+        self.cb_mode.setCurrentText(c.get("mode", "sun")
+                                    if c.get("mode") in ("sun", "time") else "sun")
+        self.cb_mode.setToolTip(
+            "'sun': shoot on given seconds while the sun is below the angle "
+            "below.\n'time': repeat a fixed cycle from T_start.\n"
+            "('sun_cycle' belongs to the asi camera and is not offered here.)")
+        _add_label_row(sgrid, row, "Mode:", self.cb_mode); row += 1
+
+        self.sb_sun_angle = QDoubleSpinBox()
+        self.sb_sun_angle.setRange(-90.0, 90.0)
+        self.sb_sun_angle.setDecimals(1)
+        self.sb_sun_angle.setSuffix("°")
+        self.sb_sun_angle.setValue(float(c.get("sun_max_angle", -10.0)))
+        _add_label_row(sgrid, row, "Start below solar altitude:",
+                       self.sb_sun_angle); row += 1
+
+        self.le_t_start = QLineEdit(str(c.get("t_start", "20:00")))
+        self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM")
+        _add_label_row(sgrid, row, "T_start (time mode):", self.le_t_start); row += 1
+
+        self.sb_darks = QSpinBox()
+        self.sb_darks.setRange(0, 100)
+        self.sb_darks.setToolTip("Dark frames per unique exposure, shot before "
+                                 "and after the measurements")
+        self.sb_darks.setValue(int(c.get("dark_frames", 3)))
+        _add_label_row(sgrid, row, "Dark frames:", self.sb_darks); row += 1
+
+        self.sb_dead = QDoubleSpinBox()
+        self.sb_dead.setRange(0.0, 3600.0)
+        self.sb_dead.setDecimals(1)
+        self.sb_dead.setSuffix(" s")
+        self.sb_dead.setToolTip("Time reserved between cycles for the filter and "
+                                "binning change; added to the last slot when "
+                                "deriving the cycle period")
+        self.sb_dead.setValue(float(c.get("dead_time", 5.0)))
+        _add_label_row(sgrid, row, "Dead time:", self.sb_dead); row += 1
+
+        self.cb_wait_enter = QCheckBox("Time mode: wait for Enter before starting")
+        self.cb_wait_enter.setChecked(c.get("wait_for_enter", True))
+        self.cb_wait_enter.setToolTip("Ignored when there is no terminal "
+                                      "(systemd, nohup): the run starts at once")
+        sgrid.addWidget(self.cb_wait_enter, row, 0, 1, 2); row += 1
+
+        self.le_schedule_file = QLineEdit(c.get("schedule_file", ""))
+        self.le_schedule_file.setPlaceholderText("(empty: use the slot table below)")
+        self.le_schedule_file.setToolTip(
+            "Optional legacy japan-camera schedule.txt. When set, it replaces the "
+            "slot table below.")
+        _add_dir_row(sgrid, row, "Legacy schedule file:", self.le_schedule_file)
+        row += 1
+
+        root.addWidget(sched_box)
+
+        # ── Slot table ─────────────────────────────────────────────────────
+        slot_box = QGroupBox("Schedule slots  (delta+binning: time mode · "
+                             "seconds: sun mode)")
+        slot_root = QVBoxLayout(slot_box)
+        self._slot_table = QTableWidget(0, len(self.SLOT_HEADERS))
+        self._slot_table.setHorizontalHeaderLabels(self.SLOT_HEADERS)
+        self._slot_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._slot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._slot_table.setMinimumHeight(140)
+        for slot in c.get("schedule", []):
+            self._append_slot_row(slot)
+        slot_root.addWidget(self._slot_table)
+
+        btn_bar = QHBoxLayout()
+        btn_add = QPushButton("+ Add slot")
+        btn_add.clicked.connect(lambda: self._append_slot_row())
+        btn_del = QPushButton("− Remove selected")
+        btn_del.clicked.connect(self._remove_slot)
+        for b in (btn_add, btn_del):
+            btn_bar.addWidget(b)
+        btn_bar.addStretch()
+        slot_root.addLayout(btn_bar)
+        root.addWidget(slot_box)
+        root.addStretch()
+
+    # ── Slot table helpers ─────────────────────────────────────────────────
+    def _append_slot_row(self, slot=None):
+        from PyQt5.QtWidgets import QTableWidgetItem
+        row = self._slot_table.rowCount()
+        self._slot_table.insertRow(row)
+        vals = slot or {}
+        for col, (key, default) in enumerate(zip(self.SLOT_KEYS, self.SLOT_DEFAULTS)):
+            if key == "seconds":
+                seconds = vals.get("seconds", [])
+                if isinstance(seconds, (int, float)):
+                    seconds = [seconds]
+                value = ",".join(str(int(s)) for s in seconds) or str(default)
+            else:
+                value = vals.get(key, default)
+            self._slot_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def _remove_slot(self):
+        row = self._slot_table.currentRow()
+        if row >= 0:
+            self._slot_table.removeRow(row)
+
+    def _read_slots(self) -> list:
+        slots = []
+        for row in range(self._slot_table.rowCount()):
+            slot = {}
+            for col, (key, default) in enumerate(zip(self.SLOT_KEYS,
+                                                     self.SLOT_DEFAULTS)):
+                item = self._slot_table.item(row, col)
+                raw = item.text().strip() if item else str(default)
+                if key == "seconds":
+                    try:
+                        slot[key] = [int(s.strip()) for s in raw.split(",")
+                                     if s.strip()]
+                    except ValueError:
+                        slot[key] = [0]
+                elif key in ("filter", "binning"):
+                    try:
+                        slot[key] = int(float(raw))
+                    except ValueError:
+                        slot[key] = default
+                else:
+                    try:
+                        slot[key] = float(raw)
+                    except ValueError:
+                        slot[key] = default
+            slots.append(slot)
+        return slots
+
+    def get_config(self) -> dict:
+        """The edited section, layered over whatever was already in the file.
+
+        The caller replaces ``japan`` wholesale with what comes back, so anything
+        this form does not put on screen has to be carried through rather than
+        dropped on the first save.
+        """
+        merged = copy.deepcopy(self._orig)
+        merged.update(self._edited())
+        for section in ("camera", "filter_wheel", "location"):
+            base = self._orig.get(section)
+            if isinstance(base, dict):
+                merged[section] = {**base, **merged[section]}
+        return merged
+
+    def _edited(self) -> dict:
+        return {
+            "instance_name": self.le_instance.text().strip(),
+            "output_dir": self.le_output.text().strip(),
+            "mode": self.cb_mode.currentText(),
+            "sun_max_angle": self.sb_sun_angle.value(),
+            "t_start": self.le_t_start.text().strip(),
+            "dark_frames": self.sb_darks.value(),
+            "dead_time": self.sb_dead.value(),
+            "wait_for_enter": self.cb_wait_enter.isChecked(),
+            "schedule_file": self.le_schedule_file.text().strip(),
+            "schedule": self._read_slots(),
+            "camera": {
+                "backend": self.cb_backend.currentText(),
+                "readout_speed": self.cb_readout.currentIndex() + 1,
+                "binning": int(self.cb_binning.currentText()),
+                "frame_timeout_ms": self.sb_timeout.value(),
+            },
+            "filter_wheel": {
+                "port": self.le_port.text().strip(),
+                "baudrate": self.sb_baud.value(),
+                "move_timeout": self.sb_move_timeout.value(),
+            },
+            "location": {
+                "lat": self.sb_lat.value(),
+                "lon": self.sb_lon.value(),
+                "elevation": self.sb_elev.value(),
+            },
+        }
+
+
 # ---------------------------------------------------------------------------
 # MQTT config tab
 # ---------------------------------------------------------------------------
@@ -1293,8 +1591,8 @@ class GeneralConfigTab:
 class ConfigWizardWindow:
     """PyQt5 configuration wizard window."""
 
-    TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "mqtt", "server",
-               "general"]
+    TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "japan", "mqtt",
+               "server", "general"]
 
     def __init__(self, cfg: dict, camera_type=None, config_path: str = LOCAL_CONFIG_FILE):
         from PyQt5.QtWidgets import (
@@ -1327,6 +1625,7 @@ class ConfigWizardWindow:
             "infra":   (InfraConfigTab,   "Infra"),
             "sentry":  (SentryConfigTab,  "Sentry"),
             "asi":     (AsiConfigTab,     "ASI"),
+            "japan":   (JapanConfigTab,   "Japan"),
             "mqtt":    (MqttConfigTab,    "MQTT"),
             "server":  (ServerConfigTab,  "LAN Server"),
             "general": (GeneralConfigTab, "General"),
@@ -1386,6 +1685,7 @@ class ConfigWizardWindow:
             "infra":   "infra",
             "sentry":  "sentry",
             "asi":     "asi",
+            "japan":   "japan",
             "mqtt":    "mqtt",
             "server":  "server",
         }
@@ -1487,7 +1787,7 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--type", choices=["cannon", "sptt", "infra", "sentry", "asi"],
+        "--type", choices=["cannon", "sptt", "infra", "sentry", "asi", "japan"],
         help="Show/configure only this camera type",
     )
     parser.add_argument(

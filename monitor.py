@@ -173,6 +173,17 @@ class CaptureParamsDialog(QDialog):
                 le.setPlaceholderText(placeholder)
                 form.addRow(key, le)
                 self._fields[key] = le
+        elif self.camera_type == "japan":
+            for key, placeholder in [
+                ("exposure", "seconds, e.g. 30"),
+                ("binning", "1..8, e.g. 1"),
+                ("readout_speed", "1 (slow) or 2 (fast)"),
+                ("filter", "1..6"),
+            ]:
+                le = QLineEdit()
+                le.setPlaceholderText(placeholder)
+                form.addRow(key, le)
+                self._fields[key] = le
         else:
             form.addRow(QLabel("Unknown camera type — no fields available."))
 
@@ -308,6 +319,21 @@ def _extra_info(rec):
         if rec.get("ccd_temp") is not None:
             parts.append(f"T:{rec['ccd_temp']}°"
                          + ("" if rec.get("temp_locked", True) else "!"))
+        if rec.get("darks_taken"):
+            parts.append(f"darks:{rec['darks_taken']}")
+    elif cam_type == "japan":
+        # The same fields as asi, minus the "!" marker: this camera has no
+        # setpoint, so its temperature can never be reported as unlocked.
+        if rec.get("phase"):
+            parts.append(str(rec["phase"]))
+        if rec.get("filter") is not None:
+            parts.append(f"F:{rec['filter']}")
+        if rec.get("exposure") is not None:
+            parts.append(f"Exp:{rec['exposure']}s")
+        if rec.get("binning") is not None:
+            parts.append(f"B:{rec['binning']}x{rec['binning']}")
+        if rec.get("ccd_temp") is not None:
+            parts.append(f"T:{rec['ccd_temp']}°")
         if rec.get("darks_taken"):
             parts.append(f"darks:{rec['darks_taken']}")
     # System info

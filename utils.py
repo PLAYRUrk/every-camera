@@ -314,6 +314,40 @@ DEFAULT_CONFIG = {
             "elevation": 0.0,
         },
     },
+    # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor
+    # filter wheel the ASI camera uses. This is the older of the two observing
+    # programmes — two schedule modes, no cooling control, no automatic exposure —
+    # so its block is much smaller than the asi one above.
+    "japan": {
+        "instance_name": "",
+        "output_dir": "",               # frames land here flat, one dir per night
+        "mode": "sun",                  # "sun" or "time" ("sun_cycle" is asi-only)
+        "sun_max_angle": -10.0,         # sun mode: start below this altitude
+        "t_start": "20:00",             # time mode: phase reference of the cycle
+        "dark_frames": 3,
+        "dead_time": 5.0,
+        "wait_for_enter": True,         # time mode: wait for the operator to start
+        "schedule_file": "",            # legacy japan-camera schedule.txt, or .json
+        "schedule": [],                 # sun:  {"filter":3,"exposure":30,"seconds":[0,30]}
+                                        # time: {"delta":100,"filter":3,"exposure":25,
+                                        #        "binning":1}
+        "camera": {
+            "backend": "dcam",          # "dcam" (real SDK) or "sim"
+            "readout_speed": 2,         # 1 slow / low noise, 2 fast
+            "binning": 1,
+            "frame_timeout_ms": 1000,   # one DCAM frame-ready wait, not the exposure
+        },
+        "filter_wheel": {
+            "port": "/dev/ttyUSB0",     # "sim" selects the simulator
+            "baudrate": 9600,
+            "move_timeout": 8.0,
+        },
+        "location": {
+            "lat": 0.0,
+            "lon": 0.0,
+            "elevation": 0.0,
+        },
+    },
     "sentry": {
         "instance_name": "",
         "imagerd_rt_dir": "/usr/local/imagerd_rt",
@@ -918,6 +952,98 @@ def configure_console_asi(cfg, config_path=None):
     asi["filter_wheel"] = wheel
     asi["location"] = location
     cfg["asi"] = asi
+    _configure_mqtt(cfg)
+
+    save_config(cfg, config_path)
+    print("\nConfiguration saved.\n")
+
+
+def configure_console_japan(cfg, config_path=None):
+    """Interactive configuration for the Japan (Hamamatsu) imager console mode."""
+    japan = cfg.get("japan", _deep_copy(DEFAULT_CONFIG["japan"]))
+    camera = japan.get("camera", _deep_copy(DEFAULT_CONFIG["japan"]["camera"]))
+    wheel = japan.get("filter_wheel",
+                      _deep_copy(DEFAULT_CONFIG["japan"]["filter_wheel"]))
+    location = japan.get("location", _deep_copy(DEFAULT_CONFIG["japan"]["location"]))
+    print("\n--- Japan (Hamamatsu DCAM) Camera Configuration ---\n")
+
+    print("Frames are written flat into this directory, so a directory per night "
+          "is the usual arrangement.")
+    japan["output_dir"] = _ask("Output directory for FITS files",
+                               japan.get("output_dir", ""))
+    japan["instance_name"] = _ask("Instance name (auto if empty)",
+                                  japan.get("instance_name", ""))
+
+    backend = _ask("Camera backend (dcam / sim)", camera.get("backend", "dcam"))
+    camera["backend"] = backend if backend in ("dcam", "sim") else "dcam"
+    camera["binning"] = _ask_int("Binning (1-8)", camera.get("binning", 1))
+    camera["readout_speed"] = _ask_int("Readout speed (1=slow/min noise, 2=fast)",
+                                       camera.get("readout_speed", 2))
+    # There is no cooling section: this camera reports a sensor temperature and
+    # offers no setpoint to command.
+
+    wheel["port"] = _ask("Filter wheel serial port ('sim' for the simulator)",
+                         wheel.get("port", "/dev/ttyUSB0"))
+    if wheel["port"].strip().lower() != "sim":
+        wheel["baudrate"] = _ask_int("Filter wheel baudrate",
+                                     wheel.get("baudrate", 9600))
+
+    location["lat"] = _ask_float("Site latitude (degrees)", location.get("lat", 0.0))
+    location["lon"] = _ask_float("Site longitude (degrees)", location.get("lon", 0.0))
+    location["elevation"] = _ask_float("Site elevation (m)",
+                                       location.get("elevation", 0.0))
+
+    mode = _ask("Schedule mode (sun / time)", japan.get("mode", "sun"))
+    japan["mode"] = mode if mode in ("sun", "time") else "sun"
+    if japan["mode"] == "sun":
+        japan["sun_max_angle"] = _ask_float(
+            "Start when the solar altitude drops below (degrees)",
+            japan.get("sun_max_angle", -10.0))
+    else:
+        japan["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
+                                japan.get("t_start", "20:00"))
+        japan["wait_for_enter"] = _ask_bool(
+            "Wait for Enter before starting? (no = start unattended)",
+            japan.get("wait_for_enter", True))
+    japan["dark_frames"] = _ask_int("Dark frames per exposure",
+                                    japan.get("dark_frames", 3))
+    japan["dead_time"] = _ask_float(
+        "Dead time reserved between cycles for filter/binning changes (s)",
+        japan.get("dead_time", 5.0))
+
+    schedule_file = _ask("Schedule file path, .txt or .json "
+                         "(empty = use the slots below)",
+                         japan.get("schedule_file", ""))
+    japan["schedule_file"] = schedule_file
+    if not schedule_file and _ask_bool("Enter the schedule now?",
+                                       not japan.get("schedule")):
+        slots = []
+        while True:
+            print(f"\n  Slot {len(slots) + 1}:")
+            slot = {
+                "filter": _ask_int("    Filter (1-6)", 1),
+                "exposure": _ask_float("    Exposure (s)", 30.0),
+            }
+            if japan["mode"] == "time":
+                slot["delta"] = _ask_float("    Offset from the cycle start (s)", 0.0)
+                slot["binning"] = _ask_int("    Binning", camera.get("binning", 1))
+            else:
+                secs = _ask("    Capture seconds within the minute (comma-separated)",
+                            "0")
+                try:
+                    slot["seconds"] = [int(s.strip()) for s in secs.split(",")
+                                       if s.strip()]
+                except ValueError:
+                    slot["seconds"] = [0]
+            slots.append(slot)
+            if not _ask_bool("  Add another slot?", False):
+                break
+        japan["schedule"] = slots
+
+    japan["camera"] = camera
+    japan["filter_wheel"] = wheel
+    japan["location"] = location
+    cfg["japan"] = japan
     _configure_mqtt(cfg)
 
     save_config(cfg, config_path)

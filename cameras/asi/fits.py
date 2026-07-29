@@ -1,13 +1,11 @@
 """FITS output for the ASI imager, with the instrument's established header set.
 
-``DATE-OBS`` is the *start* of the exposure, written in UTC as the FITS standard
-requires. The asi-camera original passed a naive local timestamp under a header
-comment claiming UTC; converting here is a deliberate behaviour change, so that
-frames from this station can be compared with any other instrument's.
+Three header sets are written, on purpose:
 
-Two header sets are written, on purpose:
-
-* the every-camera set (``EXPTIME``, ``BINNING``, ``CCD-TEMP``, …), and
+* the eighteen cards both imagers share, from ``cameras/common/fits.py`` — that
+  module also explains why ``DATE-OBS`` is UTC and ``DATE-LOC`` exists;
+* what only the PIXIS has (``GAIN``, ``SETTEMP``) plus what this driver's
+  intensity-control loops decided (``SKYMEAN``, ``SPLITNUM``/``SPLITIDX``);
 * the sixteen keys imagerd_rt attached to every frame, spelled exactly as it
   spelled them.
 
@@ -30,27 +28,20 @@ import numpy as np
 from astropy.io import fits
 from astropy.io.fits.verify import VerifyWarning
 
-from .timeutil import to_utc
+from ..common.fits import (
+    UNKNOWN_TEMP, utc_string as _utc_string, write_core_header, write_image,
+)
 
 # The long legacy names deliberately become HIERARCH cards. astropy warns once
 # per card, which would be five lines of noise for every frame of every night;
 # the choice is made knowingly, so the warning is silenced here rather than
-# left to whoever reads the console.
+# left to whoever reads the console. Only this writer produces such cards.
 warnings.filterwarnings("ignore", category=VerifyWarning,
                         message=r"Keyword name .* is greater than 8 characters")
 
 # imagerd_rt's own version string (``SOFTWARE_VERSION``, imagerd_rt.h:95). The
 # processing program has always seen "3.0" here.
 LEGACY_VERSION = "3.0"
-
-# Written where the original had a reading it could not take. The filter wheel
-# controller used here has no temperature sensor at all.
-UNKNOWN_TEMP = -999.0
-
-
-def _utc_string(timestamp: datetime) -> str:
-    """Format a timestamp as a FITS UTC string, assuming local time if naive."""
-    return to_utc(timestamp).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 def _readout_speed_text(readout_speed: float) -> str:
@@ -97,32 +88,32 @@ def write_fits(
     split_count: int = 1,
     split_index: int = 1,
 ) -> None:
-    if data is None:
-        raise ValueError(f"Cannot write FITS '{path}': image data is None (capture failed)")
     hdu = fits.PrimaryHDU(data)
     h = hdu.header
-    h["DATE-OBS"] = (_utc_string(timestamp), "UTC observation start time")
-    h["DATE-LOC"] = (timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
-                     "local observation start time")
-    h["EXPTIME"] = (exposure_sec, "[s] exposure duration")
-    h["BINNING"] = (binning, "pixel binning NxN")
-    h["READSPD"] = (readout_speed, "[MHz] ADC readout speed")
-    h["FILTER"] = (filter_num, "filter wheel position")
-    h["CCD-TEMP"] = (ccd_temp if ccd_temp is not None else UNKNOWN_TEMP,
-                     "[C] CCD sensor temperature")
-    h["IMAGETYP"] = (image_type, "frame type: LIGHT or DARK")
-    # ``sun_cycle_auto`` is the preflight stage: the sun_cycle schedule shot with
-    # automatically chosen exposures, before the programme proper starts.
-    h["OBSMODE"] = (obs_mode, "observation mode; see also SPLITNUM")
-    h["INSTRUME"] = (camera_model, "camera model")
-    h["VENDOR"] = (camera_vendor, "camera manufacturer")
-    h["CAMSN"] = (camera_sn, "camera serial number")
-    h["CAMVER"] = (camera_version, "camera firmware version")
-    h["DRVVER"] = (driver_version, "camera driver version")
-    h["DCAMVER"] = (dcam_version, "camera SDK (PICAM) version")
-    h["SITELAT"] = (lat, "[deg] observatory latitude")
-    h["SITELON"] = (lon, "[deg] observatory longitude")
-    h["SITEELEV"] = (elevation, "[m] observatory elevation")
+    # ``OBSMODE`` may read ``sun_cycle_auto``: the preflight stage, the sun_cycle
+    # schedule shot with automatically chosen exposures, before the programme
+    # proper starts.
+    write_core_header(
+        h,
+        timestamp=timestamp,
+        exposure_sec=exposure_sec,
+        binning=binning,
+        readout_speed=readout_speed,
+        filter_num=filter_num,
+        ccd_temp=ccd_temp,
+        image_type=image_type,
+        obs_mode=obs_mode,
+        camera_vendor=camera_vendor,
+        camera_model=camera_model,
+        camera_sn=camera_sn,
+        camera_version=camera_version,
+        driver_version=driver_version,
+        dcam_version=dcam_version,
+        lat=lat,
+        lon=lon,
+        elevation=elevation,
+        date_loc=True,
+    )
     # PIXIS-specific additions the Hamamatsu camera had no equivalent for.
     if gain is not None:
         h["GAIN"] = (gain, "ADC analog gain: 1 Low, 2 Medium, 3 High")
@@ -157,7 +148,7 @@ def write_fits(
         fw_temp=fw_temp,
         legacy_version=legacy_version,
     )
-    fits.writeto(str(path), data, header=h, overwrite=False)
+    write_image(path, data, h)
 
 
 def _write_legacy_keys(h, *, binning, bit_depth, gain, ccd_temp, exposure_sec,

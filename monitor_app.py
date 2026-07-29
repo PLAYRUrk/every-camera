@@ -135,7 +135,10 @@ def camera_rows(rec):
     if rec.get("mode") and not rec.get("setup_mode"):
         rows.append(("Schedule", str(rec["mode"])))
 
-    if kind == "asi":
+    # Both imagers report the same fields; the Japan camera simply has no
+    # setpoint, and ``fmt_sensor`` already shows a bare reading when there is
+    # none, so one branch serves both.
+    if kind in ("asi", "japan"):
         exposure, binning = rec.get("exposure"), rec.get("binning")
         if exposure is not None:
             rows.append(("Exposure", f"{exposure:g} s"

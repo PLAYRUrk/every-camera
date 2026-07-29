@@ -52,9 +52,16 @@ def test_the_signal_is_named_for_the_log():
 # ---------------------------------------------------------------------------
 # Every driver wires it up
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("driver", ["asi", "sentry", "cannon", "sptt", "infra"])
+@pytest.mark.parametrize("driver", ["asi", "japan", "sentry", "cannon", "sptt",
+                                    "infra"])
 def test_no_driver_listens_for_sigint_alone(driver):
-    """The regression guard, by inspection: one bare SIGINT is the whole bug."""
+    """The regression guard, by inspection: one bare SIGINT is the whole bug.
+
+    ``japan`` is on the list because the program it was ported from does exactly
+    the forbidden thing (``japan-camera/runner.py`` installs a SIGINT-only
+    handler), so this is a live porting rule rather than a formality: under
+    systemd that camera would be SIGKILLed without its closing darks.
+    """
     source = (ROOT / "cameras" / f"{driver}_driver.py").read_text()
     assert "signal.signal(signal.SIGINT" not in source, \
         f"{driver}_driver.py installs a SIGINT-only handler"

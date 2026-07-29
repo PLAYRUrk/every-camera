@@ -1,17 +1,6 @@
-"""One definition of "what UTC means here".
+"""Compatibility shim — the module now lives in ``cameras/common/timeutil.py``.
 
-Three places need the same conversion — the FITS timestamp, the solar altitude
-and the archive path — and they must agree, otherwise a frame can land in one
-day's directory carrying another day's ``DATE-OBS``. A naive timestamp is taken
-to be local time, because that is what ``datetime.now()`` hands the driver.
+Shared with the ``japan`` driver, which needs the same one definition of UTC.
 """
-from __future__ import annotations
-
-from datetime import datetime, timezone
-
-
-def to_utc(t: datetime) -> datetime:
-    """Return ``t`` as an aware UTC datetime, assuming local time if naive."""
-    if t.tzinfo is None:
-        t = t.astimezone()
-    return t.astimezone(timezone.utc)
+from ..common.timeutil import *        # noqa: F401, F403
+from ..common.timeutil import to_utc   # noqa: F401

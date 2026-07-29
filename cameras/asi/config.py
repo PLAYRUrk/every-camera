@@ -15,9 +15,10 @@ with an unknown serial port is worse than not starting.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import time
 
 from . import schedule as schedule_mod
+from ..common import cfgparse
 
 DEFAULT_MODE = "sun"
 
@@ -203,45 +204,14 @@ class AsiConfig:
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
-def parse_time(value, default=None):
-    """Parse ``HH:MM`` / ``HH:MM:SS`` into a ``time``; ``None`` when unusable."""
-    if value in (None, ""):
-        return default
-    if isinstance(value, time):
-        return value
-    text = str(value).strip()
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            return datetime.strptime(text, fmt).time()
-        except ValueError:
-            continue
-    return default
-
-
-def _sub(cfg, key):
-    value = cfg.get(key)
-    return value if isinstance(value, dict) else {}
-
-
-def _float(cfg, key, default):
-    try:
-        return float(cfg.get(key, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _int(cfg, key, default):
-    try:
-        return int(cfg.get(key, default))
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _bool(cfg, key, default):
-    value = cfg.get(key, default)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "y", "on", "да")
-    return bool(value)
+# Shared with cameras/japan/config.py, which reads the same kind of hand-edited
+# JSON. Kept under the local names so the rest of this module — and anything that
+# calls ``asi_config.parse_time`` — is unaffected by where they live.
+parse_time = cfgparse.parse_time
+_sub = cfgparse.sub
+_float = cfgparse.as_float
+_int = cfgparse.as_int
+_bool = cfgparse.as_bool
 
 
 # ---------------------------------------------------------------------------

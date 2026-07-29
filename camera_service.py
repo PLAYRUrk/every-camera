@@ -102,6 +102,31 @@ PARAM_SCHEMAS = {
         {"name": "target_temp", "label": "Sensor setpoint (°C)", "type": "float",
          "min": -80.0, "max": 25.0, "step": 1.0},
     ],
+    # The Japan driver applies these between exposures, like the ASI one. There
+    # is no gain and no temperature setpoint: this camera has no analog gain, and
+    # its sensor temperature is a reading with nothing to set it to.
+    "japan": [
+        {"name": "exposure", "label": "Exposure (s)", "type": "float",
+         "min": 0.001, "max": 3600.0, "step": 0.5},
+        {"name": "binning", "label": "Binning", "type": "choice",
+         "choices": [{"value": 1, "label": "1x1"},
+                     {"value": 2, "label": "2x2"},
+                     {"value": 4, "label": "4x4"},
+                     {"value": 8, "label": "8x8"}]},
+        {"name": "readout_speed", "label": "Readout speed", "type": "choice",
+         "choices": [{"value": 1, "label": "1 — slow (min noise)"},
+                     {"value": 2, "label": "2 — fast"}]},
+        {"name": "filter", "label": "Filter", "type": "choice",
+         # Home is shown but not offered, for the same reason as on the ASI
+         # camera — see that schema. The positions are bare numbers here: this is
+         # a different wheel and the driver has no filter table to name them from.
+         "states": [{"value": 0, "label": "home (after startup)"}],
+         "choices": [{"value": n, "label": str(n)} for n in range(1, 7)]},
+        {"name": "shutter", "label": "Shutter", "type": "bool", "hint": "open",
+         "true_label": "open", "false_label": "closed",
+         "tooltip": "The wheel controller's shutter. Closed means the sensor "
+                    "sees nothing — dark frames are taken this way."},
+    ],
     # imagerd_rt owns the sentry schedule; parameters live in schedule.conf and
     # only take effect on a daemon restart, so live editing is not offered.
     "sentry": [],

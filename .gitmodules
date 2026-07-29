@@ -10,3 +10,6 @@
 [submodule "asi-camera"]
 	path = asi-camera
 	url = https://github.com/PLAYRUrk/asi-camera.git
+[submodule "japan-camera"]
+	path = japan-camera
+	url = https://github.com/PLAYRUrk/japan-camera.git

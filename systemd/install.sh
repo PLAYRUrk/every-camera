@@ -37,7 +37,7 @@ usage() {
     cat <<EOF
 Usage: sudo $0 <camera-type> [--user NAME] [--python PATH] [--config-dir DIR]
 
-  camera-type    asi | sentry | cannon | sptt | infra
+  camera-type    asi | japan | sentry | cannon | sptt | infra
   --user NAME    whose home receives the logs and status files
                  (default: the user invoking sudo)
   --python PATH  interpreter to run (default: the first python3 on PATH)
@@ -63,7 +63,7 @@ done
 
 [[ -n "$CAMERA" ]] || { usage; exit 1; }
 case "$CAMERA" in
-    asi|sentry|cannon|sptt|infra) ;;
+    asi|japan|sentry|cannon|sptt|infra) ;;
     *) die "unknown camera type '$CAMERA'" ;;
 esac
 [[ $DRY_RUN -eq 1 || $EUID -eq 0 ]] || die "run me with sudo — this writes to $UNIT_DIR"

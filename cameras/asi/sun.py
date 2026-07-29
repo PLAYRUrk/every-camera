@@ -1,33 +1,6 @@
-"""Solar altitude for the sun-driven schedule.
+"""Compatibility shim — the module now lives in ``cameras/common/sun.py``.
 
-astropy is imported lazily: it costs a couple of seconds to import and is only
-needed when the schedule actually runs in ``sun`` mode.
-
-Timestamps are converted to UTC before being handed to astropy. The asi-camera
-original formatted a naive local time straight into ``Time(...)``, which astropy
-reads as UTC — correct only on a station whose clock is already UTC, and hours
-wrong anywhere else.
+Shared with the ``japan`` driver, whose ``sun`` mode asks the same question.
 """
-from datetime import datetime
-
-from .timeutil import to_utc as _to_utc
-
-
-def sun_angle(t: datetime, lat: float, lon: float, elevation: float) -> float:
-    """Solar altitude in degrees at time ``t`` for the given site."""
-    from astropy import units as u
-    from astropy.coordinates import AltAz, EarthLocation, get_sun
-    from astropy.time import Time
-
-    location = EarthLocation.from_geodetic(lon * u.degree, lat * u.degree,
-                                           elevation * u.meter)
-    obs_time = Time(_to_utc(t).strftime("%Y-%m-%d %H:%M:%S"), scale="utc")
-    frame = AltAz(location=location, obstime=obs_time)
-    return get_sun(obs_time).transform_to(frame).alt.value
-
-
-def angle_fn(location):
-    """Return ``f(datetime) -> degrees`` bound to a :class:`config.LocationCfg`."""
-    def _angle(when):
-        return sun_angle(when, location.lat, location.lon, location.elevation)
-    return _angle
+from ..common.sun import *                       # noqa: F401, F403
+from ..common.sun import angle_fn, sun_angle     # noqa: F401

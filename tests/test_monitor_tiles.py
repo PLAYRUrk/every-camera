@@ -84,6 +84,24 @@ def test_a_settling_cooler_says_so():
     assert "settling" in rows["Sensor"]
 
 
+def test_a_japan_tile_shows_the_same_rows_without_inventing_a_setpoint():
+    """One branch serves both imagers, so the Japan camera must not gain a target.
+
+    It has no cooling setpoint at all; a tile reading "-9.8 °C → 0 °C" would be
+    reporting a control that does not exist.
+    """
+    rows = rows_of({"camera_type": "japan", "status": "running", "mode": "sun",
+                    "exposure": 30.0, "binning": 1, "filter": 3,
+                    "shutter": True, "ccd_temp": -9.8, "readout_speed": 2,
+                    "shots_taken": 7})
+    assert rows["Exposure"] == "30 s · 1×1"
+    assert rows["Filter"] == "3"
+    assert rows["Shutter"] == "open"
+    assert rows["Sensor"] == "-9.8 °C"
+    assert "→" not in rows["Sensor"]
+    assert rows["Schedule"] == "sun"
+
+
 def test_a_camera_in_setup_mode_is_not_credited_with_a_schedule():
     # It follows none: saying "sun" reads as though measurements were running.
     rows = rows_of({"camera_type": "asi", "mode": "sun", "setup_mode": True,
