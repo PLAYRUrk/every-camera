@@ -63,6 +63,37 @@ def test_no_driver_listens_for_sigint_alone(driver):
 
 
 # ---------------------------------------------------------------------------
+# The launcher must not stand between systemd and Python
+# ---------------------------------------------------------------------------
+def test_the_launcher_execs_into_python():
+    """``run.sh`` has to replace itself, not spawn a child.
+
+    A wrapper left running in front of Python is handed SIGTERM itself. Bash
+    would take it and die, and the shutdown path here — the closing darks, the
+    ASI sensor warm-up — would never run, which is exactly the failure this
+    whole file exists to prevent. ``exec`` collapses the two processes into one
+    so the signal lands where it is handled.
+    """
+    launcher = ROOT / "run.sh"
+    assert launcher.exists(), "run.sh is missing"
+    assert os.access(launcher, os.X_OK), "run.sh is not executable"
+    lines = [ln.strip() for ln in launcher.read_text().splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    assert lines[-1].startswith("exec "), \
+        f"run.sh must end by exec'ing python, not by calling it: {lines[-1]!r}"
+
+
+def test_the_unit_starts_the_same_launcher():
+    """One way of starting the program, so a service run matches a manual one."""
+    unit = (ROOT / "systemd" / "every-camera@.service").read_text()
+    exec_start = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+    assert len(exec_start) == 1, "expected exactly one ExecStart"
+    assert "run.sh" in exec_start[0], exec_start[0]
+    assert "TimeoutStopSec=" in unit, \
+        "the unit must budget for the closing darks and the warm-up"
+
+
+# ---------------------------------------------------------------------------
 # End to end: a real process, a real SIGTERM
 # ---------------------------------------------------------------------------
 SUBJECT = """

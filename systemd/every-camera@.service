@@ -19,7 +19,9 @@
 
 [Unit]
 Description=Every Camera — %i
-Documentation=file:@APP_DIR@/README.md
+# No Documentation= here on purpose: systemd only accepts URIs, and it rejects
+# any path with non-ASCII in it — which a checkout under, say, ~/Документы has.
+# The manual is @APP_DIR@/README.md.
 # The LAN frame server binds a port and the MQTT client dials out, so the
 # network wants to be genuinely up, not merely configured.
 After=network-online.target
@@ -29,7 +31,17 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=@APP_DIR@
-ExecStart=@PYTHON@ @APP_DIR@/main.py --type %i --config @CONFIG_DIR@/%i.json
+
+# Started through run.sh, the same launcher used by hand, so that a run under
+# systemd and a run from a terminal are the same run. In particular the machine's
+# environment — the PICAM SDK paths, the choice of interpreter — is described
+# once, in env.sh, instead of being duplicated here and drifting.
+#
+# run.sh ends in `exec`, so this stays one process: the shell is replaced by
+# Python rather than sitting in front of it. Without that, SIGTERM would stop at
+# the wrapper and the shutdown work below would never run.
+ExecStart=@APP_DIR@/run.sh --type %i --config @CONFIG_DIR@/%i.json
+Environment=PYTHON=@PYTHON@
 
 # Logs, status files and instance locks are written under $HOME. Running as
 # root would put them in /root, where the operator's monitor_app.py — which
@@ -39,9 +51,8 @@ Environment=HOME=@USER_HOME@
 Environment=PYTHONUNBUFFERED=1
 
 # The PICAM SDK is found through the environment a login shell sets up, and a
-# service gets none of it. Uncomment and correct for this machine's install.
-#Environment=LD_LIBRARY_PATH=/usr/local/lib/picam
-#Environment=PICAM_INSTALL_PATH=/usr/local/picam
+# service gets none of it. That belongs in @APP_DIR@/env.sh, which run.sh
+# sources — see env.sh.example — so it applies to both ways of starting.
 
 # The console dashboard turns itself into plain log lines when stdout is not a
 # terminal, so the journal gets readable text without --verbose.
@@ -59,6 +70,11 @@ RestartSec=30
 # (900 s by default). systemd's stock 90 s would SIGKILL the run in the middle
 # of it, so the budget here is deliberately generous.
 KillSignal=SIGTERM
+# Safe only because run.sh ends in `exec`, so the unit's main process *is*
+# Python and SIGTERM reaches the handler directly. Point ExecStart at a wrapper
+# that merely calls Python instead, and the signal stops at the shell while
+# Python runs on untouched until TimeoutStopSec expires and SIGKILL arrives —
+# no closing darks, no warm-up. Use KillMode=control-group with such a wrapper.
 KillMode=mixed
 TimeoutStopSec=1800
 

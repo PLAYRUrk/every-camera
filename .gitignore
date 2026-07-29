@@ -3,6 +3,11 @@ __pycache__/
 *.pyo
 camcfg_*.ini
 config.json
+# Machine-local environment for run.sh (PICAM paths, interpreter choice).
+# env.sh.example is tracked; the real one describes one machine.
+env.sh
+venv/
+.venv/
 .claude/
 infra_capture_cycle.pdf
 generate_capture_doc.py
