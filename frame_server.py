@@ -48,6 +48,7 @@ from urllib.parse import urlparse, parse_qs
 import console_ui
 
 import frame_archive
+import intensity
 
 SERVER_VERSION = "every-camera/1.0"
 
@@ -317,9 +318,10 @@ class _Handler(BaseHTTPRequestHandler):
         if stretch not in ("minmax", "percentile", "raw"):
             stretch = "minmax"
         try:
-            frame = frame_archive.read_frame_file(path)
+            frame, full_scale = frame_archive.read_frame_with_scale(path)
             jpeg = frame_archive.to_jpeg_bytes(frame, max_side=max_side,
-                                               stretch=stretch)
+                                               stretch=stretch,
+                                               full_scale=full_scale)
         except Exception as exc:
             self._error(415, f"Could not decode {os.path.basename(path)}: {exc}")
             return
@@ -379,7 +381,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not path:
                 return
             try:
-                frame = frame_archive.read_frame_file(path)
+                frame, full_scale = frame_archive.read_frame_with_scale(path)
             except Exception as exc:
                 self._error(415, f"Could not decode {name}: {exc}")
                 return
@@ -389,6 +391,7 @@ class _Handler(BaseHTTPRequestHandler):
             if frame is None:
                 self._error(404, "No live frame available yet")
                 return
+            full_scale = frame_archive.FULL_SCALE
             if isinstance(frame, (bytes, bytearray)):
                 try:
                     import io
@@ -398,12 +401,17 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self._error(415, f"Could not decode live frame: {exc}")
                     return
+                # Canon publishes an 8-bit JPEG. Its file stays as it is, but
+                # the numbers an observer reads are on the one scale the rest
+                # of the program uses.
+                frame = intensity.rescale_to_full(frame, 255)
             meta = dict(meta or {})
             meta["timestamp"] = ts.isoformat() if ts else None
-        counts, edges = frame_archive.histogram(frame)
+        counts, edges = frame_archive.histogram(frame, full_scale=full_scale)
         self._send_json({
             "name": name,
-            "stats": frame_archive.frame_stats(frame),
+            "full_scale": full_scale,
+            "stats": frame_archive.frame_stats(frame, full_scale=full_scale),
             "sharpness": frame_archive.sharpness(frame),
             "histogram": {"counts": counts, "edges": edges},
             "metadata": meta,
@@ -502,7 +510,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(self.service.stop_focus())
             return
         ttl = body.get("ttl", self.focus_ttl)
-        self._send_json(self.service.request_focus(ttl))
+        # Absent means "leave the hold alone" — see CameraService.request_focus.
+        hold = body.get("hold")
+        if hold is not None:
+            hold = bool(hold)
+        self._send_json(self.service.request_focus(ttl, hold=hold))
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +693,8 @@ async function show(i) {
   try {
     const s = await j('/api/stats?name=' + encodeURIComponent(f.name));
     const st = s.stats || {};
-    $('#stats').textContent = `${(st.shape||[]).join('×')} ${st.dtype||''} · min ${st.min} max ${st.max} · sat ${st.saturated_pct}%`;
+    const scale = st.full_scale || s.full_scale || 65535;
+    $('#stats').textContent = `${(st.shape||[]).join('×')} ${st.dtype||''} · min ${st.min} max ${st.max} of ${scale} · sat ${st.saturated_pct}%`;
   } catch { $('#stats').textContent = ''; }
 }
 

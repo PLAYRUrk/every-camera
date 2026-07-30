@@ -62,7 +62,10 @@ def test_no_driver_listens_for_sigint_alone(driver):
     handler), so this is a live porting rule rather than a formality: under
     systemd that camera would be SIGKILLed without its closing darks.
     """
-    source = (ROOT / "cameras" / f"{driver}_driver.py").read_text()
+    # Explicit encoding: the drivers are UTF-8, while read_text() defaults to
+    # the locale's, which on a Russian Windows is cp1252 and cannot decode the
+    # comments in infra_driver.py.
+    source = (ROOT / "cameras" / f"{driver}_driver.py").read_text(encoding="utf-8")
     assert "signal.signal(signal.SIGINT" not in source, \
         f"{driver}_driver.py installs a SIGINT-only handler"
     assert "install_stop_handler(" in source, \

@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import time
 
+import intensity
+
 from . import schedule as schedule_mod
 from ..common import cfgparse
 
@@ -28,9 +30,10 @@ DEFAULT_MODE = "sun"
 DEFAULT_LEGACY_VERSION = "3.0"
 
 # Full scale of this 16-bit instrument, the range every intensity setting is
-# expressed in. Spelled here for the same reason as the version above: reading a
-# config must not pull in numpy through .exposure.
-SATURATION_ADU = 65535.0
+# expressed in. ``intensity`` is safe to import here for the same reason the
+# version above is spelled out: it carries no numpy import of its own, so
+# reading a config still does not drag one in.
+SATURATION_ADU = float(intensity.FULL_SCALE)
 
 # The archive file name resolves to one second (``paths.frame_name``), so two
 # frames closer together than this cannot both be filed under the name the

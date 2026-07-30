@@ -850,6 +850,12 @@ class FocusWindow(QMainWindow):
         self.lbl_stream = QLabel("stream: idle")
         self.lbl_stream.setStyleSheet("color:#888; font-size:11px;")
         info_lay.addWidget(self.lbl_stream)
+        # Confirmation from the camera that it really did stand down, rather
+        # than an assumption that asking was enough.
+        self.lbl_hold = QLabel("")
+        self.lbl_hold.setWordWrap(True)
+        self.lbl_hold.setStyleSheet("color:#c87000; font-size:11px;")
+        info_lay.addWidget(self.lbl_hold)
         right_lay.addWidget(info_box)
 
         view_box = QGroupBox("Display")
@@ -1020,9 +1026,49 @@ class FocusWindow(QMainWindow):
             self._status(
                 f"{info.get('instance_name')} streams whatever its daemon "
                 f"produces; it has no free-running focus mode.")
+        if not self._agree_to_interrupt(info):
+            self._client = None
+            self.lbl_camera.setText("not connected")
+            self._status("Left the camera measuring — nothing was interrupted.")
+            return
         client = self._client
         self._tasks.run(client.params, self._on_params, self._on_error)
         self._start_stream()
+
+    def _agree_to_interrupt(self, info):
+        """Ask before taking a camera away from its measurements.
+
+        Focusing pauses the schedule for as long as this window is open, which
+        is what makes the tool usable — but on a camera that is measuring right
+        now it costs frames, and that is the operator's call, not ours. A camera
+        in setup mode or between its observing windows costs nothing, and asking
+        there would only teach the operator to click through the question.
+        """
+        if not info.get("hold_supported", True):
+            self._status(
+                f"{info.get('instance_name')}'s schedule belongs to its "
+                f"imagerd_rt daemon — focusing cannot pause it, so the live "
+                f"view shows whatever the daemon is producing.")
+            return True
+        if info.get("setup_mode") or not info.get("schedule_active"):
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Interrupt the measurements?")
+        box.setText(
+            f"<b>{info.get('instance_name', 'This camera')}</b> is measuring on "
+            f"its schedule right now.")
+        box.setInformativeText(
+            "Focusing pauses it until you stop the live view or close this "
+            "window. The frames its schedule would have taken meanwhile are not "
+            "made up afterwards.")
+        # Spelled out rather than Yes/No: "yes" to a question about interrupting
+        # is exactly the answer an operator misreads at three in the morning.
+        proceed = box.addButton("Pause and focus", QMessageBox.AcceptRole)
+        box.addButton("Leave it measuring", QMessageBox.RejectRole)
+        box.setDefaultButton(proceed)
+        box.exec_()
+        return box.clickedButton() is proceed
 
     def _on_params(self, payload, reset=True):
         """Show what the camera reports. ``reset`` overrides unapplied edits."""
@@ -1061,6 +1107,10 @@ class FocusWindow(QMainWindow):
         if not self._client:
             return
         self._reset_metrics()
+        # The hold goes out before the stream does. The stream renews the focus
+        # session on every frame it carries, so asking for the pause afterwards
+        # would race with a renewal that does not know about it.
+        self._send_heartbeat(hold=True)
         max_side = self.cmb_size.currentData() or None
         self._stream = MjpegStream(self._client, max_side=max_side,
                                    stretch=self.cmb_stretch.currentData(),
@@ -1069,7 +1119,6 @@ class FocusWindow(QMainWindow):
         self._stream.state.connect(
             lambda s: self.lbl_stream.setText(f"stream: {s}"))
         self._stream.start()
-        self._send_heartbeat()
         self._heartbeat.start()
         self._metrics.start()
         self._params_poll.start()
@@ -1101,9 +1150,10 @@ class FocusWindow(QMainWindow):
         self.roi_preview.set_source(None, None)
         self.view.clear_frame("Stopped")
         self.lbl_stream.setText("stream: idle")
+        self.lbl_hold.setText("")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self._status("Live view stopped — the camera is back to schedule only")
+        self._status("Live view stopped — the camera has resumed its schedule")
 
     def _request_focus_off(self):
         if not self._client:
@@ -1111,12 +1161,27 @@ class FocusWindow(QMainWindow):
         client = self._client
         self._tasks.run(client.stop_focus, None, lambda msg: None)
 
-    def _send_heartbeat(self):
+    def _send_heartbeat(self, hold=True):
+        """Renew the focus session, restating the hold every time.
+
+        Restating it matters: if the camera process restarts under a running
+        live view, the next heartbeat puts the pause back rather than leaving
+        the tool streaming while the schedule quietly carries on.
+        """
         if not self._client:
             return
         client = self._client
-        self._tasks.run(lambda: client.keep_focus(FOCUS_TTL_SECONDS),
-                        None, lambda msg: None)
+        self._tasks.run(lambda: client.keep_focus(FOCUS_TTL_SECONDS, hold=hold),
+                        self._on_focus_state, lambda msg: None)
+
+    def _on_focus_state(self, state):
+        """Show whether the camera really did stand down for us."""
+        if not isinstance(state, dict):
+            return
+        if state.get("hold") and not state.get("hold_supported", True):
+            return
+        held = bool(state.get("hold"))
+        self.lbl_hold.setText("measurements paused for focusing" if held else "")
 
     def _on_frame(self, jpeg, timestamp):
         image = QImage()

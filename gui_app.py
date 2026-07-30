@@ -1453,7 +1453,6 @@ class SpttTab(QWidget):
         self.btn_preview_stop.setEnabled(False)
 
     def _on_frame(self, frame):
-        from sptt_driver import ENCODING_12BPP
         self.current_frame = frame
         self.frame_count += 1
         now = time.time()
@@ -1463,10 +1462,10 @@ class SpttTab(QWidget):
             self.frame_count = 0
             self.fps_time = now
 
-        if self.cam and self.cam.encoding == ENCODING_12BPP:
-            display = (frame.astype(np.float32) / 4095.0 * 255).astype(np.uint8)
-        else:
-            display = frame
+        # The driver hands every encoding over on the program's 0..65535 scale,
+        # so the preview no longer has to know which one produced the frame.
+        display = np.ascontiguousarray(
+            frame_archive.to_uint8(frame, stretch="raw"))
         h, w = display.shape
         qimg = QImage(display.data, w, h, w, QImage.Format_Grayscale8)
         pixmap = QPixmap.fromImage(qimg)
@@ -2321,9 +2320,9 @@ class InfraTab(QWidget):
         self.btn_preview_stop.setEnabled(False)
 
     def _on_frame(self, frame_16):
-        from infra_driver import ADC_MAX
         self.last_frame = frame_16
-        frame_8 = np.clip(frame_16 * (255.0 / ADC_MAX), 0, 255).astype(np.uint8)
+        frame_8 = np.ascontiguousarray(
+            frame_archive.to_uint8(frame_16, stretch="raw"))
         h, w = frame_8.shape
         qimg = QImage(frame_8.data, w, h, w, QImage.Format_Grayscale8)
         label_size = self.image_label.size()

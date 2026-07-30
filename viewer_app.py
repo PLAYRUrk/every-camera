@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QStatusBar, QScrollArea,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 
 from net_client import (
     CameraClient, TaskRunner, DiscoveryTask, load_settings, save_settings,
@@ -55,6 +55,51 @@ STRETCH_MODES = [
     ("percentile", "Auto (0.5–99.5 %)"),
     ("raw", "Raw (no stretch)"),
 ]
+
+# What a frame was taken under, in the order an observer asks about it, with
+# every spelling the cameras actually use.
+#
+# The spellings are not tidy and cannot be made so: the shared writer records
+# ``CCD-TEMP`` (cameras/common/fits.py), the SPTT driver writes ``CCDTEMP``, and
+# the PIXIS carries imagerd_rt's ``CCDTemp`` besides — which astropy hands back
+# upper-cased, so a viewer that looks for one name finds nothing on two of the
+# three cameras. Hence aliases, and hence a summary built by meaning rather than
+# by key.
+#
+# ``(label, keys, unit)``. The first key present wins.
+SUMMARY_KEYS = [
+    ("exposure", ("EXPTIME",), " s"),
+    ("exposure", ("EXPTUS",), " µs"),
+    ("filter", ("FILTER", "FILTERWAVELENGTH"), ""),
+    ("gain", ("GAIN", "CCDGAIN"), ""),
+    ("binning", ("BINNING",), ""),
+    ("readout", ("READSPD",), ""),
+    ("CCD", ("CCD-TEMP", "CCDTEMP"), " °C"),
+    ("setpoint", ("SETTEMP",), " °C"),
+    ("type", ("IMAGETYP",), ""),
+    ("mode", ("OBSMODE",), ""),
+    ("ROI", ("ROI",), ""),
+    ("stack", ("STACK_N",), ""),
+    ("sub-frame", ("SPLITIDX",), ""),
+    ("of", ("SPLITNUM",), ""),
+    ("seq", ("SEQNO",), ""),
+]
+
+# Shown first in the details table; everything else follows in the order the
+# header has it, which is the order the writers put it in.
+DETAIL_ORDER = [
+    "DATE-OBS", "DATE-LOC", "EXPTIME", "EXPTUS", "IMAGETYP", "OBSMODE",
+    "FILTER", "FILTERWAVELENGTH", "FILTERDESCRIPTION", "GAIN", "CCDGAIN",
+    "BINNING", "READSPD", "ROI", "CCD-TEMP", "CCDTEMP", "SETTEMP", "SINKTEMP",
+    "TRGTEMP", "SKYMEAN", "SPLITNUM", "SPLITIDX", "STACK_N", "SUB_EXP",
+    "SEQNO", "ADCFULL", "BITDEPTH", "ENCODING", "INSTRUME", "SENSOR", "VENDOR",
+    "CAMSN", "CAMVER", "DRVVER", "DCAMVER", "SITEID", "DEVICEID",
+    "SITELAT", "SITELON", "SITEELEV",
+]
+
+# FITS bookkeeping the observer did not ask about.
+DETAIL_SKIP = {"SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND",
+               "BSCALE", "BZERO", "COMMENT", "HISTORY"}
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +166,170 @@ class ImageView(QScrollArea):
         super().resizeEvent(event)
         if self._zoom <= 0:
             self._apply()
+
+
+# ---------------------------------------------------------------------------
+# Frame details
+# ---------------------------------------------------------------------------
+class HistogramPlot(QWidget):
+    """Where a frame's light actually sits on the 0..65535 scale.
+
+    The server has always sent this alongside the statistics and nothing ever
+    drew it. It answers at a glance what ``min``/``max``/``mean`` only hint at:
+    whether a frame is buried in the pedestal, spread across the range, or piled
+    up against full scale.
+
+    Counts are drawn on a logarithmic height because sky frames are dominated by
+    one narrow peak — on a linear axis everything else is a flat line.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(90)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._counts = []
+        self._edges = []
+        self._full_scale = 65535
+
+    def set_data(self, counts, edges, full_scale=65535):
+        self._counts = list(counts or [])
+        self._edges = list(edges or [])
+        self._full_scale = full_scale or 65535
+        self.update()
+
+    def clear(self):
+        self.set_data([], [])
+
+    def paintEvent(self, event):
+        import math
+
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#141414"))
+        w, h = self.width(), self.height()
+        if not self._counts or max(self._counts) <= 0:
+            painter.setPen(QColor("#666"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "no histogram")
+            painter.end()
+            return
+
+        top = math.log10(max(self._counts) + 1.0) or 1.0
+        bar_w = w / float(len(self._counts))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#4a90d9"))
+        for i, count in enumerate(self._counts):
+            bar_h = (math.log10(count + 1.0) / top) * (h - 14)
+            if bar_h < 1 and count:
+                bar_h = 1        # a bin with anything in it must be visible
+            painter.drawRect(int(i * bar_w), int(h - bar_h),
+                             max(1, int(bar_w)), int(bar_h))
+
+        painter.setPen(QColor("#888"))
+        painter.setFont(QFont("", 8))
+        painter.drawText(2, h - 2, "0")
+        label = f"{int(self._full_scale)}"
+        painter.drawText(w - painter.fontMetrics().width(label) - 2, h - 2, label)
+        painter.end()
+
+
+class FrameInfoPanel(QWidget):
+    """Everything the frame's header says, next to the frame itself.
+
+    The summary under the picture holds the half-dozen numbers an observer
+    checks constantly; this holds the rest, because "the rest" differs per
+    camera and per mode and there is no shortlist that suits them all.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 0, 0, 0)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+        layout.addWidget(QLabel("Intensity histogram"))
+        self.histogram = HistogramPlot()
+        layout.addWidget(self.histogram)
+
+    def show_payload(self, payload):
+        header = (payload.get("metadata") or {}).get("fits_header") or {}
+        rows = self._rows(header, payload)
+        self.table.setRowCount(len(rows))
+        for row, (key, value) in enumerate(rows):
+            self.table.setItem(row, 0, QTableWidgetItem(key))
+            self.table.setItem(row, 1, QTableWidgetItem(value))
+        hist = payload.get("histogram") or {}
+        self.histogram.set_data(hist.get("counts"), hist.get("edges"),
+                                full_scale_of(payload))
+
+    def clear(self):
+        self.table.setRowCount(0)
+        self.histogram.clear()
+
+    def _rows(self, header, payload):
+        """Header cards in a useful order, with the file's own facts first.
+
+        A Canon frame is a JPEG and has no header at all; it still gets the
+        sharpness and file rows rather than an empty box.
+        """
+        rows = []
+        meta = payload.get("metadata") or {}
+        if meta.get("size"):
+            rows.append(("File size", f"{meta['size'] / 1024:.0f} KB"))
+        if meta.get("mtime"):
+            rows.append(("Written",
+                         dt.fromtimestamp(meta["mtime"]).strftime("%Y-%m-%d %H:%M:%S")))
+        sharp = payload.get("sharpness")
+        if sharp:
+            rows.append(("Sharpness", f"{float(sharp):,.0f}"))
+
+        remaining = {k.upper(): (k, v) for k, v in header.items()
+                     if k.upper() not in DETAIL_SKIP}
+        for key in DETAIL_ORDER:
+            entry = remaining.pop(key, None)
+            if entry is not None:
+                rows.append((entry[0], str(entry[1])))
+        for key, value in remaining.values():
+            rows.append((key, str(value)))
+        return rows
+
+
+def full_scale_of(payload):
+    """The intensity range this frame's numbers are on."""
+    stats = payload.get("stats") or {}
+    return payload.get("full_scale") or stats.get("full_scale") or 65535
+
+
+def summarise(payload, header):
+    """The two lines under the picture: conditions, then what was recorded."""
+    upper = {k.upper(): v for k, v in (header or {}).items()}
+    conditions = []
+    for label, keys, unit in SUMMARY_KEYS:
+        for key in keys:
+            if key in upper:
+                conditions.append(f"{label} {upper[key]}{unit}")
+                break
+
+    stats = payload.get("stats") or {}
+    measured = []
+    if stats:
+        shape = "×".join(str(x) for x in stats.get("shape", []))
+        measured.append(f"{shape} {stats.get('dtype', '')}".strip())
+        measured.append(f"min {stats.get('min'):.0f} "
+                        f"max {stats.get('max'):.0f} "
+                        f"mean {stats.get('mean')}")
+        measured.append(f"saturated {stats.get('saturated_pct')} %")
+        measured.append(f"scale 0–{int(full_scale_of(payload))}")
+    return conditions, measured
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +450,13 @@ class LanPanel(QWidget):
             lambda: self.view.set_zoom(self.cmb_zoom.currentData()))
         bar.addWidget(self.cmb_zoom)
 
+        self.cb_details = QCheckBox("Frame info")
+        self.cb_details.setToolTip("Show the full header and the histogram")
+        self.cb_details.setChecked(True)
+        self.cb_details.stateChanged.connect(
+            lambda state: self.details.setVisible(bool(state)))
+        bar.addWidget(self.cb_details)
+
         bar.addStretch()
         self.btn_save = QPushButton("Save original…")
         self.btn_save.setToolTip("Download the untouched capture file")
@@ -257,9 +473,13 @@ class LanPanel(QWidget):
         self.lbl_info.setWordWrap(True)
         right_lay.addWidget(self.lbl_info)
         splitter.addWidget(right)
+
+        self.details = FrameInfoPanel()
+        splitter.addWidget(self.details)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 900])
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([300, 780, 280])
 
     # -- camera selection ----------------------------------------------
     def discover(self):
@@ -320,6 +540,9 @@ class LanPanel(QWidget):
         self._client = CameraClient(host, port)
         self._remember(host, port)
         self.lbl_camera.setText(f"connecting to {host}:{port}…")
+        # The previous camera's frame is still on screen for a moment; its
+        # header must not be, or the two read as one frame.
+        self._clear_stats()
         self._tasks.run(self._client.info, self._on_info, self._on_error)
 
     def _remember(self, host, port):
@@ -413,28 +636,33 @@ class LanPanel(QWidget):
                         lambda data: self._show_frame(data, name),
                         self._on_error)
         self._tasks.run(lambda: client.frame_stats(name),
-                        self._show_stats, lambda msg: None)
+                        lambda payload: self._show_stats(payload, name),
+                        lambda msg: None)
 
     def _show_frame(self, data, name):
         if self.view.set_jpeg(data):
             self.btn_save.setEnabled(name is not None)
             self.status.emit(f"Showing {name or 'latest frame'}")
 
-    def _show_stats(self, payload):
-        stats = payload.get("stats", {})
+    def _show_stats(self, payload, name=None):
         meta = payload.get("metadata", {}) or {}
-        parts = []
-        if stats:
-            parts.append("×".join(str(x) for x in stats.get("shape", [])))
-            parts.append(str(stats.get("dtype", "")))
-            parts.append(f"min {stats.get('min')} / max {stats.get('max')}")
-            parts.append(f"mean {stats.get('mean')}")
-            parts.append(f"saturated {stats.get('saturated_pct')} %")
         header = meta.get("fits_header") or {}
-        for key in ("EXPTIME", "EXPTUS", "GAIN", "CCDTEMP", "ROI", "DATE-OBS"):
-            if key in header:
-                parts.append(f"{key} {header[key]}")
-        self.lbl_info.setText("   ·   ".join(p for p in parts if p) or "—")
+        conditions, measured = summarise(payload, header)
+
+        upper = {k.upper(): v for k, v in header.items()}
+        when = upper.get("DATE-OBS") or meta.get("timestamp") or ""
+        first = [when, name or "latest frame"]
+        lines = ["   ·   ".join(p for p in first if p)]
+        if conditions:
+            lines.append("   ·   ".join(conditions))
+        if measured:
+            lines.append("   ·   ".join(measured))
+        self.lbl_info.setText("\n".join(lines) or "—")
+        self.details.show_payload(payload)
+
+    def _clear_stats(self):
+        self.lbl_info.setText("—")
+        self.details.clear()
 
     # -- live ----------------------------------------------------------
     def _refresh_latest(self):
@@ -446,6 +674,11 @@ class LanPanel(QWidget):
         self.btn_save.setEnabled(False)
         self._tasks.run(lambda: client.latest_jpeg(stretch=stretch),
                         self._on_latest, self._on_error)
+        # The live branch used to skip this, so the panel under the picture kept
+        # describing whichever archived frame was opened last — which is worse
+        # than showing nothing, because it looks current.
+        self._tasks.run(client.frame_stats, self._show_stats,
+                        lambda msg: None)
 
     def _on_latest(self, result):
         data, timestamp = result

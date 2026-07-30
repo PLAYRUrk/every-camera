@@ -25,6 +25,7 @@ from datetime import datetime as dt, timezone
 from pathlib import Path
 
 import frame_archive
+import intensity
 
 from utils import (
     load_schedule_safe, claim_instance_name, get_instance_name,
@@ -32,6 +33,7 @@ from utils import (
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
+    publish_schedule_state, serving_focus_hold,
     announce_setup_mode, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
 )
@@ -50,6 +52,11 @@ DEFAULT_ROI = "1280x1024"
 
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 1024
+# The sensor's own digitisation, still needed by the sync-marker search in
+# _read_frame_usb: it tells a real frame header from a misaligned one by the
+# top four bits of each pixel being zero. Frames leave grab_frame() shifted up
+# to intensity.FULL_SCALE, so nothing past that point uses these.
+ADC_BITS = 12
 ADC_MAX = 4094
 
 CMD_PACKET_SIZE = 32
@@ -477,6 +484,12 @@ class TanhoCamera:
         frame[:, :self._raw_w] = raw_16[0::2]
         frame[:, self._raw_w:] = raw_16[1::2]
 
+        # Up to the program's 0..65535 scale, and not one line earlier: the sync
+        # marker search in _read_frame_usb accepts a candidate by checking that
+        # the top four bits of every pixel are zero, which is only true of the
+        # sensor's native 12-bit samples.
+        frame = intensity.to_full_scale(frame, ADC_BITS)
+
         if verbose_timing:
             # Enough to tell a replayed buffer from a fresh one; the byte-level
             # fingerprint (md5 + hex dumps) that used to be printed here was pure
@@ -665,6 +678,7 @@ def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
     hdr['INSTRUME'] = ('THCAMSW1300', 'Camera model')
     hdr['SENSOR'] = ('IMX990-AABA-C', 'Sensor model')
     hdr['DATE-OBS'] = (dt.now(timezone.utc).isoformat(), 'Observation date (UTC)')
+    hdr['ADCFULL'] = (intensity.FULL_SCALE, '[ADU] intensity full scale')
     if exposure_us is not None:
         hdr['EXPTIME'] = (exposure_us / 1e6, 'Total integration time (seconds)')
         hdr['EXPTUS'] = (exposure_us, 'Total integration time (microseconds)')
@@ -723,8 +737,7 @@ def frame_to_jpeg_bytes(frame):
     lives in ``frame_archive`` and is shared by every camera driver.
     """
     stretch = "minmax" if frame.dtype == np.uint32 else "raw"
-    return frame_archive.to_jpeg_bytes(frame, stretch=stretch,
-                                       full_scale=ADC_MAX)
+    return frame_archive.to_jpeg_bytes(frame, stretch=stretch)
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +771,9 @@ class InfraWorkerConsole(threading.Thread):
         self._last_file = None
         self._last_frame = None
         self._active_until = None
+        # Whether the last loop pass ran under a focus hold, so entering and
+        # leaving it is logged once instead of twice a second.
+        self._held = False
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
@@ -939,6 +955,10 @@ class InfraWorkerConsole(threading.Thread):
             "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
         }
 
+    def _focus_holding(self):
+        """True while a focus session has asked the schedule to stand down."""
+        return self._service is not None and self._service.focus_hold()
+
     def _handle_focus(self, now, stream: "_CameraStreamThread"):
         """Feed the focus tool from the stream thread that is already running.
 
@@ -948,7 +968,8 @@ class InfraWorkerConsole(threading.Thread):
         """
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds and not self.setup_mode:
+        if (now.second in self.capture_seconds and not self.setup_mode
+                and not self._focus_holding()):
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -995,8 +1016,22 @@ class InfraWorkerConsole(threading.Thread):
                     active_end = entry.end
                     break
 
-            if active_end is None:
-                self._save_status(SETUP_STATUS if self.setup_mode else "waiting")
+            holding = self._focus_holding()
+            if holding and not self._held:
+                console_ui.log("Focus session took the camera — scheduled "
+                               "captures are paused until it ends.")
+            elif self._held and not holding:
+                console_ui.log("Focus session ended — the schedule resumes.")
+                last_fired = (-1, -1)   # the second we stopped in is not owed a frame
+            self._held = holding
+            serving_focus_hold(self._service, holding)
+            publish_schedule_state(
+                self._service,
+                bool(active_end) and not self.setup_mode and not holding)
+
+            if active_end is None or holding:
+                self._save_status(SETUP_STATUS
+                                  if (self.setup_mode or holding) else "waiting")
                 self._handle_focus(now, stream)
                 self._stop_event.wait(0.5)
                 continue

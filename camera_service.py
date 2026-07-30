@@ -146,7 +146,7 @@ class CameraService:
 
     def __init__(self, camera_type, instance_name, output_dir="",
                  supports_focus=True, supports_params=True, node_name="",
-                 setup_mode=False):
+                 setup_mode=False, supports_hold=None):
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.output_dir = output_dir or ""
@@ -154,6 +154,12 @@ class CameraService:
         # discovery reply so observers see a place, not an address.
         self.node_name = node_name or ""
         self.supports_focus = bool(supports_focus)
+        # Whether a focus session can also pause the measurements. Normally it
+        # can, because the worker owns its own schedule; the sentry is the
+        # exception — its programme belongs to the imagerd_rt daemon, which
+        # this driver supervises rather than drives.
+        self.supports_hold = (bool(supports_focus) if supports_hold is None
+                              else bool(supports_hold))
         self.supports_params = bool(supports_params)
         # True when the camera is up for focusing only — no schedule, so no
         # frames are being archived. Reported to focus_app and to discovery so
@@ -185,6 +191,18 @@ class CameraService:
         self._focus_deadline = 0.0
         self._focus_errors = 0
         self._focus_disabled_reason = ""
+        # A focus session can additionally *hold* the camera: stop starting
+        # scheduled captures for as long as somebody is focusing. Separate from
+        # the deadline because the MJPEG stream renews the deadline on every
+        # chunk it sends and must not change what kind of session this is.
+        self._focus_hold = False
+        # Whether the worker is inside its measuring cycle right now. None until
+        # a driver says; focus_app uses it to decide whether taking the camera
+        # needs the operator's agreement.
+        self._schedule_active = None
+        # Set by the worker once it has actually stopped for the hold, so the
+        # operator is told the measurements really did pause.
+        self._hold_effective = False
 
     # ------------------------------------------------------------------
     # Worker side — cheap, non-blocking writes
@@ -251,6 +269,29 @@ class CameraService:
             return False
         with self._lock:
             return time.monotonic() < self._focus_deadline
+
+    def focus_hold(self):
+        """True while a focus session is asking the schedule to stand down.
+
+        Read by the workers at the points where they would otherwise start a
+        capture. Tied to the session deadline on purpose: if the focus tool
+        disappears without saying goodbye, the hold expires with the session and
+        measurements resume by themselves.
+        """
+        if not self.supports_hold:
+            return False
+        with self._lock:
+            return self._focus_hold and time.monotonic() < self._focus_deadline
+
+    def set_schedule_active(self, active):
+        """Tell observers whether measurements are running right now."""
+        with self._lock:
+            self._schedule_active = None if active is None else bool(active)
+
+    def note_hold_effective(self, held):
+        """Worker's confirmation that it has (or has not) paused for a hold."""
+        with self._lock:
+            self._hold_effective = bool(held)
 
     def note_focus_error(self, exc):
         """Record a failed focus iteration; disables focus after N in a row."""
@@ -323,7 +364,11 @@ class CameraService:
         with self._lock:
             snap = dict(self._status)
             snap.setdefault("node_name", self.node_name)
-            snap["focus_active"] = time.monotonic() < self._focus_deadline
+            active = time.monotonic() < self._focus_deadline
+            snap["focus_active"] = active
+            snap["focus_hold"] = active and self._focus_hold
+            snap["hold_effective"] = active and self._hold_effective
+            snap["schedule_active"] = self._schedule_active
             if self._focus_disabled_reason:
                 snap["focus_note"] = self._focus_disabled_reason
             snap["has_frame"] = self._frame is not None
@@ -340,6 +385,12 @@ class CameraService:
                 "node_name": self.node_name,
                 "output_dir": self.output_dir,
                 "setup_mode": self.setup_mode,
+                # Carried in /api/info as well as /api/status so the focus tool
+                # can decide whether connecting interrupts anything before it
+                # opens a stream, without a second round trip.
+                "schedule_active": self._schedule_active,
+                "focus_hold": self._focus_hold,
+                "hold_supported": self.supports_hold,
                 "supports_focus": self.supports_focus,
                 "supports_params": self.supports_params and bool(self._param_schema),
                 "param_schema": list(self._param_schema),
@@ -376,25 +427,46 @@ class CameraService:
             return {"id": req_id, "done": False}
         return None
 
-    def request_focus(self, ttl=DEFAULT_FOCUS_TTL):
-        """Start or extend a focus session. Returns the session state."""
+    def request_focus(self, ttl=DEFAULT_FOCUS_TTL, hold=None):
+        """Start or extend a focus session. Returns the session state.
+
+        ``hold`` is three-valued and that matters. ``True`` asks the camera to
+        stop measuring, ``False`` releases it, and ``None`` — the default —
+        leaves the hold as it is and only pushes the deadline out. The MJPEG
+        endpoint renews the session on every frame it sends, and it must not
+        turn an operator's hold into an ordinary session by doing so.
+        """
         if not self.supports_focus:
-            return {"focus_active": False, "supported": False}
+            return {"focus_active": False, "supported": False,
+                    "hold": False, "hold_supported": False}
         try:
             ttl = float(ttl)
         except (TypeError, ValueError):
             ttl = DEFAULT_FOCUS_TTL
         ttl = max(1.0, min(ttl, MAX_FOCUS_TTL))
         with self._lock:
+            was_measuring = bool(self._schedule_active)
             self._focus_deadline = time.monotonic() + ttl
             self._focus_errors = 0
             self._focus_disabled_reason = ""
-        return {"focus_active": True, "supported": True, "ttl": ttl}
+            if hold is not None:
+                self._focus_hold = bool(hold) and self.supports_hold
+                if not hold:
+                    self._hold_effective = False
+            held = self._focus_hold
+            schedule_active = self._schedule_active
+        return {"focus_active": True, "supported": True, "ttl": ttl,
+                "hold": held, "hold_supported": self.supports_hold,
+                "was_measuring": was_measuring,
+                "schedule_active": schedule_active}
 
     def stop_focus(self):
         with self._lock:
             self._focus_deadline = 0.0
-        return {"focus_active": False, "supported": self.supports_focus}
+            self._focus_hold = False
+            self._hold_effective = False
+        return {"focus_active": False, "supported": self.supports_focus,
+                "hold": False, "hold_supported": self.supports_hold}
 
 
 class NullService(CameraService):

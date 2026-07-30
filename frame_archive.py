@@ -20,6 +20,8 @@ import json
 
 import numpy as np
 
+import intensity
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -34,9 +36,10 @@ MIME_TYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 }
 
-# Cameras deliver 12-bit data in 16-bit containers; used as the default
-# full-scale value when a frame has no better hint.
-DEFAULT_ADC_MAX = 4094
+# Every driver scales its captures onto one range on the way in, so a frame
+# reaching this module is on it unless it came from an archive written before
+# that was true — see ``read_frame_with_scale``.
+FULL_SCALE = intensity.FULL_SCALE
 
 DEFAULT_JPEG_QUALITY = 85
 
@@ -185,6 +188,32 @@ def read_frame_file(path):
         return np.asarray(img)
 
 
+def read_frame_with_scale(path):
+    """Decode a captured file and say what intensity scale it is on.
+
+    Returns ``(array, full_scale)``. Frames this program writes now record their
+    scale in the header (``ADCFULL``); older archives were written straight off
+    a 12-bit sensor and say nothing, so they are recognised by that absence and
+    lifted to the current range. Without this an archive captured last year
+    would look sixteen times darker than one captured today.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in FITS_EXTENSIONS:
+        arr = read_fits(path)
+        recorded = intensity.full_scale_from_header(read_fits_header(path))
+    else:
+        # TIFF and PNG carry no scale of their own, so the guess is all there
+        # is: Canon's JPEGs are 8-bit, an infra TIFF written before the change
+        # is 12-bit, one written after fills the full range.
+        arr = read_frame_file(path)
+        recorded = intensity.legacy_full_scale(arr)
+    if recorded is None:
+        recorded = intensity.legacy_full_scale(arr)
+    if recorded < FULL_SCALE:
+        return intensity.rescale_to_full(arr, recorded), FULL_SCALE
+    return arr, recorded
+
+
 def read_fits(path):
     """Read the primary HDU of a FITS file as a numpy array."""
     try:
@@ -227,7 +256,12 @@ def read_fits_minimal(path):
         if len(data) < nbytes:
             raise ValueError(f"Truncated FITS data: {path}")
         if bitpix == 16:
-            arr = np.frombuffer(data, dtype=">i2").astype(np.uint16)
+            # FITS stores 16-bit data signed; unsigned frames carry BZERO=32768
+            # to shift it back. Ignoring that used to be invisible because no
+            # sensor here filled more than 12 bits — on a full 16-bit frame it
+            # moves every pixel by 32768.
+            arr = np.frombuffer(data, dtype=">i2").astype(np.int32)
+            arr = _apply_bscale(arr, header)
         elif bitpix == 8:
             arr = np.frombuffer(data, dtype=np.uint8)
         elif bitpix == 32:
@@ -239,6 +273,28 @@ def read_fits_minimal(path):
         else:
             raise ValueError(f"Unsupported BITPIX={bitpix}: {path}")
         return arr.reshape(naxis2, naxis1)
+
+
+def _apply_bscale(arr, header):
+    """Apply ``BZERO``/``BSCALE`` to integer FITS data.
+
+    The common case by far is ``BZERO=32768, BSCALE=1`` on 16-bit data, which
+    means "these signed shorts are really unsigned"; that path returns uint16.
+    Anything else is left in a type wide enough to hold the result.
+    """
+    try:
+        bzero = float(header.get("BZERO", 0) or 0)
+        bscale = float(header.get("BSCALE", 1) or 1)
+    except (TypeError, ValueError):
+        return arr.astype(np.uint16)
+    if bscale == 1.0 and bzero == 0.0:
+        # No offset recorded. Written before BZERO was, so signed values are
+        # really unsigned ones that wrapped: read them back the same way.
+        return arr.astype(np.uint16)
+    values = arr * bscale + bzero
+    if bscale == 1.0 and bzero == 32768.0:
+        return np.clip(values, 0, 65535).astype(np.uint16)
+    return values.astype(np.float32)
 
 
 def read_fits_header(path):
@@ -263,8 +319,9 @@ def to_uint8(frame, stretch="minmax", low_pct=0.5, high_pct=99.5,
                          drivers used to do inline).
       ``"percentile"`` — map [low_pct, high_pct] percentiles, which keeps faint
                          detail visible next to hot pixels.
-      ``"raw"``        — divide by ``full_scale`` (defaults to the 12-bit ADC
-                         maximum) without looking at the data.
+      ``"raw"``        — divide by ``full_scale`` (the program's 0..65535 scale
+                         unless a caller knows the frame is on an older one)
+                         without looking at the data.
     """
     arr = np.asarray(frame)
     if arr.dtype == np.uint8:
@@ -272,7 +329,7 @@ def to_uint8(frame, stretch="minmax", low_pct=0.5, high_pct=99.5,
     arr = arr.astype(np.float32)
 
     if stretch == "raw":
-        scale = float(full_scale or DEFAULT_ADC_MAX) or 1.0
+        scale = float(full_scale or FULL_SCALE) or 1.0
         return np.clip(arr * (255.0 / scale), 0, 255).astype(np.uint8)
 
     if stretch == "percentile":
@@ -390,8 +447,14 @@ def sharpness(frame):
     return float(lap.var())
 
 
-def frame_stats(frame):
-    """Basic statistics used by the viewer/focus UIs."""
+def frame_stats(frame, full_scale=None):
+    """Basic statistics used by the viewer/focus UIs.
+
+    ``full_scale`` is the range the values are on; it defaults to the program's
+    own. Passing it matters for saturation: a pixel is only clipped relative to
+    the scale its frame was digitised on, and this used to be guessed from the
+    brightest pixel — which read a dark 16-bit exposure as a 12-bit one.
+    """
     arr = np.asarray(frame)
     if arr.size == 0:
         return {}
@@ -399,10 +462,11 @@ def frame_stats(frame):
     finite = flat[np.isfinite(flat)] if flat.dtype.kind == "f" else flat
     if finite.size == 0:
         return {}
-    saturation = _full_scale_for(arr)
+    saturation = float(full_scale or FULL_SCALE)
     return {
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
+        "full_scale": saturation,
         "min": float(finite.min()),
         "max": float(finite.max()),
         "mean": round(float(finite.mean()), 2),
@@ -412,24 +476,20 @@ def frame_stats(frame):
     }
 
 
-def _full_scale_for(arr):
-    if arr.dtype == np.uint8:
-        return 255
-    if arr.dtype == np.uint16:
-        # 12-bit sensors in 16-bit containers saturate at ADC_MAX, but a true
-        # 16-bit frame saturates at 65535. Pick whichever the data suggests.
-        return DEFAULT_ADC_MAX if arr.max() <= DEFAULT_ADC_MAX + 1 else 65535
-    return float(arr.max()) if arr.size else 1.0
+def histogram(frame, bins=256, full_scale=None):
+    """Return ``(counts, edges)`` as plain lists, ready for JSON.
 
-
-def histogram(frame, bins=256):
-    """Return ``(counts, edges)`` as plain lists, ready for JSON."""
+    Binned over the full intensity range rather than over the data, so two
+    frames of the same camera produce histograms that can be compared: a range
+    taken from min/max silently rescales the axis under the reader.
+    """
     arr = np.asarray(frame)
     if arr.ndim == 3:
         arr = arr.mean(axis=2)
     if arr.size == 0:
         return [], []
-    counts, edges = np.histogram(arr, bins=bins)
+    top = float(full_scale or FULL_SCALE)
+    counts, edges = np.histogram(arr, bins=bins, range=(0.0, top))
     return counts.tolist(), edges.tolist()
 
 

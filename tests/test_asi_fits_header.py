@@ -100,6 +100,7 @@ FULL_CARDS = STRUCTURAL_HEAD + [
     ("SITELAT", 51.810646, "[deg] observatory latitude"),
     ("SITELON", 103.075555, "[deg] observatory longitude"),
     ("SITEELEV", 658.0, "[m] observatory elevation"),
+    ("ADCFULL", 65535, "[ADU] intensity full scale"),
     # ── PIXIS-only, and what the intensity loops decided ──────────────────
     ("GAIN", 3, "ADC analog gain: 1 Low, 2 Medium, 3 High"),
     ("SETTEMP", -60.0, "[C] sensor temperature setpoint"),
@@ -144,6 +145,7 @@ MINIMAL_CARDS = STRUCTURAL_HEAD + [
     ("SITELAT", 51.810646, "[deg] observatory latitude"),
     ("SITELON", 103.075555, "[deg] observatory longitude"),
     ("SITEELEV", 658.0, "[m] observatory elevation"),
+    ("ADCFULL", 65535, "[ADU] intensity full scale"),
     # GAIN, SETTEMP, SKYMEAN, SPLITNUM, SPLITIDX, BITDEPTH, CCDGAIN and SEQNO
     # are all absent — each is written only when its value was supplied.
     ("CCDTEMP", -999.0, "[C] CCD sensor temperature"),

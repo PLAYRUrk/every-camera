@@ -152,8 +152,18 @@ class CameraClient:
     def param_result(self, req_id):
         return self.get_json(f"/api/params/{req_id}")
 
-    def keep_focus(self, ttl=60):
-        return self.post_json("/api/focus", {"ttl": ttl})
+    def keep_focus(self, ttl=60, hold=None):
+        """Start or extend a focus session.
+
+        ``hold`` asks the camera to pause its schedule for the session. Left as
+        ``None`` it is not sent at all, which tells the camera to keep whatever
+        hold state it already has — the MJPEG stream renews the session on
+        every frame and must not cancel a hold by doing so.
+        """
+        body = {"ttl": ttl}
+        if hold is not None:
+            body["hold"] = bool(hold)
+        return self.post_json("/api/focus", body)
 
     def stop_focus(self):
         return self.post_json("/api/focus", {"enabled": False})
