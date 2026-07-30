@@ -10,7 +10,9 @@ Two sources:
   * **LAN** — talks to a camera's frame server and can open *any* frame it has
     ever captured, plus the newest one. This works even while the camera is
     busy measuring, and even if its worker has stalled, because the archive is
-    served straight off disk.
+    served straight off disk. The archive is shown a measuring session at a
+    time — a night, not a calendar day, so a run through midnight stays whole —
+    and on the Hamamatsu it can be split further by measuring cycle and filter.
 
   * **HiveMQ (MQTT)** — for cameras reachable only over the internet. To keep
     traffic down this fetches **only the latest frame** on request; browsing
@@ -30,26 +32,37 @@ import json
 import os
 import sys
 
-from datetime import datetime as dt
+from datetime import datetime as dt, time as time_of_day
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QListWidget,
-    QListWidgetItem, QGroupBox, QFileDialog, QMessageBox, QSizePolicy,
+    QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QDoubleSpinBox,
+    QTimeEdit, QTreeWidget, QTreeWidgetItem,
+    QGroupBox, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
     QStatusBar, QScrollArea,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTime, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 
 from net_client import (
     CameraClient, TaskRunner, DiscoveryTask, load_settings, save_settings,
     node_label, node_name_of,
 )
+from frame_grouping import (
+    entry_timestamp, group_by_session, group_japan_cycles, japan_filter_label,
+)
 
 DEFAULT_HTTP_PORT = 8765
 AUTO_REFRESH_MS = 3000
+# One request has to cover every day the tree shows, or whole days below the cut
+# would simply be missing from it rather than merely truncated. The listing is
+# three small fields per frame, so this stays a modest response.
+ARCHIVE_LIMIT = 5000
+# Only this camera writes a repeating general cycle into a flat directory, so
+# only here can a cycle be recovered from the archive.
+CYCLE_CAMERA_TYPE = "japan"
 STRETCH_MODES = [
     ("minmax", "Auto (min–max)"),
     ("percentile", "Auto (0.5–99.5 %)"),
@@ -347,7 +360,11 @@ class LanPanel(QWidget):
         self._discovery = None
         self._client = None
         self._frames = []
+        self._total = 0
+        self._sessions = 0
         self._current_name = None
+        self._camera_type = None
+        self._mode = None
         self._build_ui()
 
         self._auto_timer = QTimer(self)
@@ -400,6 +417,13 @@ class LanPanel(QWidget):
         arch_lay = QVBoxLayout(arch_box)
         row = QHBoxLayout()
         self.cmb_date = QComboBox()
+        # The camera filters by calendar day, and the days it offers are UTC. The
+        # tree below groups by *session*, so a night that runs through midnight
+        # stays whole — but only while this is left on "all dates", since a
+        # single-day request cannot contain the other half of that night.
+        self.cmb_date.setToolTip(
+            "Ask the camera for one UTC calendar day. Leave on “all dates” to see "
+            "whole nights, including those that run past midnight.")
         self.cmb_date.addItem("all dates", None)
         self.cmb_date.currentIndexChanged.connect(self._reload_frames)
         row.addWidget(self.cmb_date, 1)
@@ -407,10 +431,16 @@ class LanPanel(QWidget):
         btn_reload.clicked.connect(self._reload_all)
         row.addWidget(btn_reload)
         arch_lay.addLayout(row)
+        arch_lay.addWidget(self._build_cycle_controls())
 
-        self.list_frames = QListWidget()
-        self.list_frames.currentRowChanged.connect(self._on_frame_selected)
-        arch_lay.addWidget(self.list_frames, 1)
+        # A tree rather than a list: an archive is read a night at a time, and on
+        # the Hamamatsu a night is read a cycle at a time below that.
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.currentItemChanged.connect(self._on_frame_selected)
+        arch_lay.addWidget(self.tree, 1)
 
         self.lbl_count = QLabel("—")
         self.lbl_count.setStyleSheet("color:#888; font-size:11px;")
@@ -481,6 +511,106 @@ class LanPanel(QWidget):
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([300, 780, 280])
 
+    def _build_cycle_controls(self):
+        """The japan-only grouping switch, hidden until such a camera answers.
+
+        Off by default: on every other camera, and on this one until asked, the
+        archive is grouped by measuring session and nothing else.
+        """
+        self.cycle_box = QWidget()
+        box = QVBoxLayout(self.cycle_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(2)
+
+        self.cb_cycles = QCheckBox("Group by cycle and filter")
+        self.cb_cycles.setToolTip(
+            "Split each night into iterations of the general measuring cycle, and "
+            "each cycle by filter. Only meaningful for frames taken in time mode.")
+        box.addWidget(self.cb_cycles)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.cb_manual = QCheckBox("Period")
+        self.cb_manual.setToolTip(
+            "Set the cycle period yourself instead of letting the viewer work it "
+            "out from the frames")
+        row.addWidget(self.cb_manual)
+
+        self.spin_period = QDoubleSpinBox()
+        self.spin_period.setRange(1.0, 86400.0)
+        self.spin_period.setDecimals(1)
+        self.spin_period.setSingleStep(10.0)
+        self.spin_period.setSuffix(" s")
+        row.addWidget(self.spin_period, 1)
+
+        self.time_anchor = QTimeEdit()
+        self.time_anchor.setDisplayFormat("HH:mm:ss")
+        # UTC, because the file names are UTC and this viewer never learns the
+        # station's offset — the camera's own ``t_start`` is its local time.
+        self.time_anchor.setToolTip("Start of the first cycle, UTC")
+        row.addWidget(self.time_anchor)
+        box.addLayout(row)
+
+        self._load_cycle_settings()
+        for widget in (self.cb_cycles, self.cb_manual):
+            widget.stateChanged.connect(self._on_grouping_changed)
+        self.spin_period.valueChanged.connect(self._on_grouping_changed)
+        self.time_anchor.timeChanged.connect(self._on_grouping_changed)
+        self._sync_cycle_controls()
+        self.cycle_box.setVisible(False)
+        return self.cycle_box
+
+    # -- grouping ------------------------------------------------------
+    def _load_cycle_settings(self):
+        saved = self._settings.get("japan_grouping") or {}
+        self.cb_cycles.setChecked(bool(saved.get("enabled")))
+        self.cb_manual.setChecked(bool(saved.get("manual")))
+        try:
+            self.spin_period.setValue(float(saved.get("period") or 160.0))
+        except (TypeError, ValueError):
+            self.spin_period.setValue(160.0)
+        anchor = QTime.fromString(str(saved.get("anchor_utc") or ""), "HH:mm:ss")
+        self.time_anchor.setTime(anchor if anchor.isValid() else QTime(11, 0, 0))
+
+    def _save_cycle_settings(self):
+        self._settings["japan_grouping"] = {
+            "enabled": self.cb_cycles.isChecked(),
+            "manual": self.cb_manual.isChecked(),
+            "period": float(self.spin_period.value()),
+            "anchor_utc": self.time_anchor.time().toString("HH:mm:ss"),
+        }
+        save_settings(self._settings)
+
+    def _sync_cycle_controls(self):
+        grouping = self.cb_cycles.isChecked()
+        manual = grouping and self.cb_manual.isChecked()
+        self.cb_manual.setEnabled(grouping)
+        self.spin_period.setEnabled(manual)
+        self.time_anchor.setEnabled(manual)
+
+    def _on_grouping_changed(self):
+        self._sync_cycle_controls()
+        self._save_cycle_settings()
+        if (self.cb_cycles.isChecked() and self._mode
+                and self._mode != "time"):
+            self.status.emit(
+                f"This camera is in {self._mode} mode right now — cycles only "
+                "describe frames taken in time mode.")
+        # Everything needed is already in hand; regrouping is not a new request.
+        self._rebuild_tree()
+
+    def _cycle_grouping_on(self):
+        return (self._camera_type == CYCLE_CAMERA_TYPE
+                and self.cb_cycles.isChecked())
+
+    def _manual_cycle_settings(self):
+        """``(period, anchor)`` the operator forced, or ``(None, None)``."""
+        if not self.cb_manual.isChecked():
+            return None, None
+        chosen = self.time_anchor.time()
+        return (float(self.spin_period.value()),
+                time_of_day(chosen.hour(), chosen.minute(), chosen.second()))
+
     # -- camera selection ----------------------------------------------
     def discover(self):
         self.btn_discover.setEnabled(False)
@@ -540,6 +670,11 @@ class LanPanel(QWidget):
         self._client = CameraClient(host, port)
         self._remember(host, port)
         self.lbl_camera.setText(f"connecting to {host}:{port}…")
+        # The grouping switch belongs to a camera type, not to the window: it must
+        # not stay on screen while the next camera is still identifying itself.
+        self._camera_type = None
+        self._mode = None
+        self.cycle_box.setVisible(False)
         # The previous camera's frame is still on screen for a moment; its
         # header must not be, or the two read as one frame.
         self._clear_stats()
@@ -557,11 +692,22 @@ class LanPanel(QWidget):
             f"<b>{info.get('instance_name', '?')}</b> "
             f"({info.get('camera_type', '?')})<br>{node_name_of(info)}"
             f"<br>{info.get('output_dir') or 'no archive directory'}")
+        self._camera_type = info.get("camera_type")
+        self.cycle_box.setVisible(self._camera_type == CYCLE_CAMERA_TYPE)
         if not info.get("archive_available"):
             self.status.emit(
                 "Connected, but this camera has no archive directory "
                 "configured — only the latest frame is available.")
+        if self._camera_type == CYCLE_CAMERA_TYPE:
+            # Which mode it is in *now* does not decide how the archive is
+            # grouped — a directory can hold nights of both — but it is worth
+            # saying when the two disagree.
+            client = self._client
+            self._tasks.run(client.status, self._on_status, lambda msg: None)
         self._reload_all()
+
+    def _on_status(self, status):
+        self._mode = (status or {}).get("mode")
 
     def _on_error(self, message):
         self.status.emit(message)
@@ -590,37 +736,196 @@ class LanPanel(QWidget):
             return
         client = self._client
         date = self.cmb_date.currentData()
-        self._tasks.run(lambda: client.frames(date=date, limit=1000),
+        self._tasks.run(lambda: client.frames(date=date, limit=ARCHIVE_LIMIT),
                         self._on_frames, self._on_error)
 
     def _on_frames(self, listing):
         self._frames = listing.get("frames", [])
-        self.list_frames.blockSignals(True)
-        self.list_frames.clear()
-        for frame in self._frames:
-            when = dt.fromtimestamp(frame["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
-            item = QListWidgetItem(f"{frame['name']}\n    {when} · "
-                                   f"{frame['size'] // 1024} KB")
-            item.setData(Qt.UserRole, frame["name"])
-            self.list_frames.addItem(item)
-        self.list_frames.blockSignals(False)
-        total = listing.get("total", len(self._frames))
-        shown = len(self._frames)
-        self.lbl_count.setText(
-            f"{shown} of {total} frame(s)" if shown < total
-            else f"{total} frame(s)")
-        if self._frames:
-            self.list_frames.setCurrentRow(0)
+        self._total = listing.get("total", len(self._frames))
+        self._rebuild_tree()
+
+    # -- the tree ------------------------------------------------------
+    def _frame_item(self, frame):
+        """One leaf. Carries the frame's name, which is what selection acts on."""
+        stamp, from_name = entry_timestamp(frame)
+        if stamp is None:
+            when = "time unknown"
+        elif from_name:
+            # From the file name, and those are UTC on every camera that writes
+            # them; saying so keeps it apart from the local mtime below.
+            when = f"{stamp:%H:%M:%S} UTC"
         else:
+            when = f"{stamp:%Y-%m-%d %H:%M:%S} local"
+        item = QTreeWidgetItem(
+            [f"{frame['name']}\n    {when} · {frame['size'] // 1024} KB"])
+        item.setData(0, Qt.UserRole, frame["name"])
+        return item
+
+    @staticmethod
+    def _group_item(parent, text):
+        item = QTreeWidgetItem(parent, [text])
+        font = item.font(0)
+        font.setBold(True)
+        item.setFont(0, font)
+        return item
+
+    def _rebuild_tree(self):
+        """Redraw the tree from ``self._frames``. Never touches the network."""
+        previous = self._current_name
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        if self._cycle_grouping_on():
+            note = self._fill_cycle_tree()
+        else:
+            note = self._fill_session_tree()
+        self.tree.blockSignals(False)
+
+        self.lbl_count.setText(" · ".join(self._count_parts(note)))
+        if not self._frames:
             self.view.show_message("No frames in this archive")
             self.btn_save.setEnabled(False)
+            return
+        self._restore_selection(previous)
 
-    def _on_frame_selected(self, row):
-        if row < 0 or row >= len(self._frames) or not self._client:
+    def _session_item(self, session):
+        """One top-level row: a measuring session, which is a night, not a date.
+
+        A run that starts in the evening and ends after midnight carries two dates
+        and is still one row — ``group_by_session`` cuts on the quiet between
+        nights, so its beginning and its end never land in different lists.
+        """
+        return self._group_item(
+            self.tree,
+            f"{session['label']} · {len(session['frames'])} frame(s)")
+
+    def _fill_session_tree(self):
+        """Session -> frames. What every camera gets, japan included by default."""
+        sessions = group_by_session(self._frames)
+        for session in sessions:
+            item = self._session_item(session)
+            for frame in session["frames"]:
+                item.addChild(self._frame_item(frame))
+        self._sessions = len(sessions)
+        if sessions:
+            self.tree.topLevelItem(0).setExpanded(True)
+        return ""
+
+    def _fill_cycle_tree(self):
+        """Session -> cycle -> filter -> frames, for a japan archive."""
+        period, anchor = self._manual_cycle_settings()
+        sessions = group_japan_cycles(self._frames, period=period, anchor=anchor)
+        self._sessions = len(sessions)
+        for session in sessions:
+            item = self._session_item(session)
+            for cycle in session["cycles"]:
+                label = (f"Cycle {cycle['index']} · "
+                         f"{cycle['first']:%H:%M:%S}–{cycle['last']:%H:%M:%S} UTC"
+                         f" · {cycle['count']} frame(s)")
+                cycle_item = self._group_item(item, label)
+                for group in cycle["filters"]:
+                    self._fill_filter_group(cycle_item, group)
+            for group in session.get("filters", []):
+                self._fill_filter_group(item, group)
+            # Darks stand outside the cycle: the driver takes them once per
+            # unique exposure before and after the run, not on a slot.
+            if session["darks"]:
+                darks_item = self._group_item(
+                    item, f"Darks · {len(session['darks'])} frame(s)")
+                for frame in session["darks"]:
+                    darks_item.addChild(self._frame_item(frame))
+            if session["unparsed"]:
+                other = self._group_item(
+                    item, f"Other files · {len(session['unparsed'])}")
+                for frame in session["unparsed"]:
+                    other.addChild(self._frame_item(frame))
+
+        if sessions:
+            first = self.tree.topLevelItem(0)
+            first.setExpanded(True)
+            if first.childCount():
+                first.child(0).setExpanded(True)
+        return self._period_note(sessions)
+
+    def _fill_filter_group(self, parent, group):
+        item = self._group_item(
+            parent, f"{japan_filter_label(group['filter'])} · "
+                    f"{len(group['frames'])} frame(s)")
+        for frame in group["frames"]:
+            item.addChild(self._frame_item(frame))
+
+    @staticmethod
+    def _period_note(sessions):
+        """What to say about the period the cycles were cut with."""
+        if not sessions:
+            return ""
+        if not sessions[0]["period_auto"]:
+            return f"period {sessions[0]['period']:g} s (set)"
+        found = sorted({s["period"] for s in sessions if s["period"]})
+        if not found:
+            return "no cycle found — set the period"
+        shown = "/".join(f"{value:g}" for value in found[:3])
+        return f"period {shown} s (auto)"
+
+    def _count_parts(self, note):
+        shown, total = len(self._frames), self._total
+        parts = [f"{shown} of {total} frame(s)" if shown < total
+                 else f"{total} frame(s)"]
+        if self._sessions:
+            parts.append(f"{self._sessions} session(s)")
+        if note:
+            parts.append(note)
+        if shown < total:
+            parts.append("newest only — pick a date")
+        return parts
+
+    def _restore_selection(self, name):
+        """Keep the open frame selected across a regrouping; else open the newest.
+
+        Regrouping must not cost a reload of a frame that is already on screen,
+        so a surviving selection is restored with the signal blocked.
+        """
+        wanted = self._find_frame_item(name) if name else None
+        if wanted is not None:
+            self.tree.blockSignals(True)
+            self._expand_to(wanted)
+            self.tree.setCurrentItem(wanted)
+            self.tree.blockSignals(False)
+            self.tree.scrollToItem(wanted)
+            return
+        first = self._find_frame_item(None)
+        if first is not None:
+            self._expand_to(first)
+            self.tree.setCurrentItem(first)
+
+    def _find_frame_item(self, name):
+        """First leaf carrying ``name``, or the first leaf of all if ``name`` is None."""
+        stack = [self.tree.topLevelItem(i)
+                 for i in range(self.tree.topLevelItemCount() - 1, -1, -1)]
+        while stack:
+            item = stack.pop()
+            value = item.data(0, Qt.UserRole)
+            if value is not None and (name is None or value == name):
+                return item
+            for index in range(item.childCount() - 1, -1, -1):
+                stack.append(item.child(index))
+        return None
+
+    @staticmethod
+    def _expand_to(item):
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+
+    def _on_frame_selected(self, item, previous=None):
+        # Group rows carry no name: selecting a day or a cycle expands it and
+        # leaves the picture alone.
+        name = item.data(0, Qt.UserRole) if item is not None else None
+        if not name or not self._client:
             return
         self.cb_auto.setChecked(False)
-        self._current_name = self._frames[row]["name"]
-        self._load_frame(self._current_name)
+        self._current_name = name
+        self._load_frame(name)
 
     def _reload_current(self):
         if self._current_name:
@@ -684,9 +989,9 @@ class LanPanel(QWidget):
         data, timestamp = result
         if self.view.set_jpeg(data):
             self.status.emit(f"Latest frame{f' — {timestamp}' if timestamp else ''}")
-            self.list_frames.blockSignals(True)
-            self.list_frames.setCurrentRow(-1)
-            self.list_frames.blockSignals(False)
+            self.tree.blockSignals(True)
+            self.tree.setCurrentItem(None)
+            self.tree.blockSignals(False)
 
     def _on_auto_toggled(self, state):
         if state:
