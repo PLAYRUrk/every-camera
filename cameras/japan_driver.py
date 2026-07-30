@@ -27,9 +27,13 @@ both are load-bearing:
   avoids it by never starting one.
 * **Nothing waits without servicing the rest.** The gaps between exposures are
   where parameter changes are applied, focus frames are served and status is
-  published — see :meth:`JapanWorkerConsole._wait_until`. A focus frame is only
-  taken when it comfortably fits before the next scheduled slot, so live view can
-  never delay a measurement.
+  published — see :meth:`JapanWorkerConsole._service_tick`, which every wait in
+  this driver runs through, including the one that waits for the operator's
+  Enter. A focus frame is only taken when it comfortably fits before the next
+  scheduled slot, so live view can never delay a measurement; when it does not
+  fit, the reason is published rather than swallowed. A focus session opens the
+  shutter for itself and shuts it again afterwards, except during a dark run,
+  which owns the shutter outright.
 
 Schedule modes (``japan.mode`` in config.json):
 
@@ -299,6 +303,15 @@ class JapanWorkerConsole(threading.Thread):
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
         self._started_event = threading.Event()
+        # True only while a dark run owns the shutter. Focus must not touch it
+        # then: an opened shutter turns the rest of that run into light frames.
+        self._darks_running = False
+        # True when a focus session, rather than the observing programme, is what
+        # opened the shutter — so it can be shut again when the session ends.
+        self._focus_opened_shutter = False
+        # True once the operator has set the shutter from focus_app: their choice
+        # then stands for the rest of the session, whatever focus would prefer.
+        self._focus_shutter_manual = False
 
     # ------------------------------------------------------------------
     # Stop handling
@@ -440,6 +453,11 @@ class JapanWorkerConsole(threading.Thread):
                     is_open = _as_bool(value)
                     self.cam.set_shutter(is_open)
                     applied[name] = is_open
+                    # From here the operator owns the shutter for the rest of the
+                    # session: a focus session opens it by itself, and that must
+                    # never undo somebody deliberately closing it from focus_app.
+                    self._focus_shutter_manual = True
+                    self._focus_opened_shutter = False
                     # Only the darks are supposed to shoot shut. Closing it from
                     # focus_app during a run would quietly turn every scheduled
                     # frame into a dark, so say so where the operator will see it.
@@ -469,33 +487,115 @@ class JapanWorkerConsole(threading.Thread):
         self._service.set_current_params(self._current_params())
         self._refresh_camera_section()
 
+    def _focus_note(self, text=""):
+        if self._service is not None:
+            self._service.set_focus_note(text)
+
+    def _shutter_for_focus(self):
+        """Open the shutter for a focus session; put it back when one ends.
+
+        Without this, focusing before the programme has opened the shutter —
+        which is every moment between opening the camera and the post-dark
+        ``set_shutter(True)`` — returns black frames, and the operator has no way
+        to tell a shut shutter from a broken camera. A dark run keeps the
+        shutter: opening it there would silently turn darks into light frames.
+        """
+        if self._darks_running:
+            return False
+        active = self._service is not None and self._service.focus_active()
+        if not active:
+            self._focus_close_shutter()
+            self._focus_shutter_manual = False
+            return False
+        # The operator set the shutter by hand from focus_app; that outranks any
+        # guess made here, for as long as the session lasts.
+        if self._focus_shutter_manual:
+            return True
+        if not self.cam.shutter_open:
+            try:
+                self.cam.set_shutter(True)
+            except Exception as exc:
+                console_ui.warn(f"Could not open the shutter for focusing: {exc}")
+                return False
+            self._focus_opened_shutter = True
+            console_ui.log("Focus session — shutter opened (closed again when it ends)")
+            self._refresh_camera_section()
+        return True
+
+    def _focus_close_shutter(self):
+        """Shut the shutter again, but only if a focus session is what opened it."""
+        if not self._focus_opened_shutter:
+            return
+        self._focus_opened_shutter = False
+        try:
+            self.cam.set_shutter(False)
+        except Exception as exc:
+            console_ui.warn(f"Could not close the shutter after focusing: {exc}")
+        else:
+            console_ui.log("Focus session ended — shutter closed again")
+        self._refresh_camera_section()
+
     def _serve_focus(self, slack):
         """Grab one live frame for focus_app, if it fits in ``slack`` seconds."""
         if self._service is None or not self._service.focus_active():
+            return
+        if self._darks_running:
+            self._focus_note("shooting dark frames — the shutter must stay shut")
             return
         exposure = self.cam.current_exposure or 0.0
         needed = exposure * FOCUS_SLACK_FACTOR + FOCUS_SLACK_SECONDS
         # In setup mode there is no scheduled capture to be late for, so a long
         # exposure must not be refused just because the idle tick is shorter.
         if not self.setup_mode and slack is not None and slack < needed:
-            return          # a live frame must never push a scheduled one late
+            # A live frame must never push a scheduled one late. Silent refusal
+            # is what made this look like a broken camera, so say it instead.
+            self._focus_note(f"next scheduled frame in {slack:.0f} s — a live "
+                             f"frame needs about {needed:.0f} s")
+            return
         self._dash_update(focus=f"live frame ({exposure:g} s)")
         run_focus_iteration(
             self._service, self.cam.capture,
             on_error=lambda exc, stopped: console_ui.warn(
                 f"Focus frame failed: {exc}" + (" — focus disabled" if stopped else "")),
         )
+        self._focus_note("")
         self._dash_update(focus="active")
 
     # ------------------------------------------------------------------
     # Waiting
     # ------------------------------------------------------------------
+    def _service_tick(self, slack, status="running", last_status=0.0, readings=None,
+                      allow_focus=True):
+        """Everything that has to keep happening while the worker is not exposing.
+
+        Parameter changes, on-demand captures, status publication and focus
+        frames. Every wait in this driver runs through here, which is what makes
+        an observer's focus session work whatever the worker is doing —
+        including while it waits for the operator's Enter, where a hand-rolled
+        copy of this loop used to serve parameters but not focus.
+
+        Returns the (possibly refreshed) ``(last_status, readings)`` pair so a
+        caller can keep throttling its status publication across ticks.
+        """
+        if time.monotonic() - last_status >= 2.0:
+            last_status = time.monotonic()
+            readings = self._refresh_camera_section()
+            self._save_status(SETUP_STATUS if self.setup_mode else status,
+                              readings=readings)
+        self._serve_params()
+        if self._pending_capture_event.is_set():
+            self._handle_pending_capture()
+        if allow_focus:
+            self._shutter_for_focus()
+            self._serve_focus(slack)
+        return last_status, readings
+
     def _wait_until(self, target, phase=None, allow_focus=True):
         """Idle until ``target``, serving focus, parameters and status meanwhile.
 
         Returns True if the moment was reached, False if a stop was requested.
-        This is the only place the driver sleeps: everything that has to keep
-        happening between exposures happens here.
+        This is the only place the driver sleeps during a run: everything that
+        has to keep happening between exposures happens in :meth:`_service_tick`.
         """
         if phase:
             self._set_phase(phase)
@@ -507,24 +607,13 @@ class JapanWorkerConsole(threading.Thread):
         last_status = 0.0
         readings = None
         while not self._stop_event.is_set():
-            now = dt.now()
-            remaining = (target - now).total_seconds()
+            remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
                 break
-            if time.monotonic() - last_status >= 2.0:
-                last_status = time.monotonic()
-                readings = self._refresh_camera_section()
-                self._save_status(SETUP_STATUS if self.setup_mode else "running",
-                                  readings=readings)
-            self._serve_params()
-            if self._pending_capture_event.is_set():
-                self._handle_pending_capture()
-                remaining = (target - dt.now()).total_seconds()
-                if remaining <= 0:
-                    break
-            if allow_focus:
-                self._serve_focus(remaining)
-                remaining = (target - dt.now()).total_seconds()
+            last_status, readings = self._service_tick(
+                remaining, last_status=last_status, readings=readings,
+                allow_focus=allow_focus)
+            remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
                 break
             self._stop_event.wait(min(TICK, max(remaining, 0.001)))
@@ -672,45 +761,66 @@ class JapanWorkerConsole(threading.Thread):
         self._set_phase(f"dark frames ({phase})", detail=f"0/{total}")
         console_ui.log(f"Dark frames ({phase}): {self.cfg.schedule.dark_frames} × "
                        f"{len(combos)} exposure(s)")
+        # A focus session may have opened the shutter; from here until the run is
+        # over the shutter belongs to the darks, and ``_darks_running`` is what
+        # stops :meth:`_shutter_for_focus` from reopening it behind their back.
+        self._darks_running = True
+        self._focus_opened_shutter = False
+        self._focus_note("shooting dark frames — the shutter must stay shut")
         try:
             self.cam.set_shutter(False)
         except Exception as exc:
             console_ui.warn(f"Could not close the shutter: {exc}")
 
         done = 0
-        for exposure, binning in combos:
-            if self._force_quit:
-                break
-            try:
-                self.cam.set_exposure(exposure)
-                if binning:
-                    self.cam.set_binning(binning)
-            except Exception as exc:
-                console_ui.error(f"Could not set up darks ({exposure} s): {exc}")
-                continue
-            for _ in range(self.cfg.schedule.dark_frames):
+        try:
+            for exposure, binning in combos:
                 if self._force_quit:
                     break
-                if sync_to_seconds:
-                    seconds = sorted({s for entry in entries
-                                      for s in (entry.seconds or [0])})
-                    target = japan_schedule.next_second_slot(seconds)
-                    # Darks must still be taken after a stop request, so this wait
-                    # ignores the stop flag and only honours a forced quit.
-                    self._sleep_until(target)
-                done += 1
-                self._set_phase(f"dark frames ({phase})", detail=f"{done}/{total}")
-                self._capture_one(dt.now(), exposure, image_type="DARK",
-                                  obs_mode="dark",
-                                  label=f"DARK exp={exposure:g} s")
+                try:
+                    self.cam.set_exposure(exposure)
+                    if binning:
+                        self.cam.set_binning(binning)
+                except Exception as exc:
+                    console_ui.error(f"Could not set up darks ({exposure} s): {exc}")
+                    continue
+                for _ in range(self.cfg.schedule.dark_frames):
+                    if self._force_quit:
+                        break
+                    if sync_to_seconds:
+                        seconds = sorted({s for entry in entries
+                                          for s in (entry.seconds or [0])})
+                        target = japan_schedule.next_second_slot(seconds)
+                        # Darks must still be taken after a stop request, so this wait
+                        # ignores the stop flag and only honours a forced quit.
+                        self._sleep_until(target)
+                    done += 1
+                    self._set_phase(f"dark frames ({phase})", detail=f"{done}/{total}")
+                    self._capture_one(dt.now(), exposure, image_type="DARK",
+                                      obs_mode="dark",
+                                      label=f"DARK exp={exposure:g} s")
+        finally:
+            self._darks_running = False
+            self._focus_note("")
         console_ui.log(f"Dark frames ({phase}) complete: {self._darks} total")
 
     def _sleep_until(self, target):
-        """Plain wait that only a forced quit interrupts (used inside dark runs)."""
+        """Plain wait that only a forced quit interrupts (used inside dark runs).
+
+        Status keeps being published — a dark run is minutes long, and without
+        this the monitor and focus_app see a camera that has stopped answering.
+        Parameter requests are deliberately *not* served: a changed exposure
+        halfway through would leave the run with darks that match nothing.
+        """
+        last_status = 0.0
         while not self._force_quit:
             remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
                 return True
+            if time.monotonic() - last_status >= 2.0:
+                last_status = time.monotonic()
+                self._save_status(SETUP_STATUS if self.setup_mode else "running",
+                                  readings=self._refresh_camera_section())
             time.sleep(min(TICK, remaining))
         return False
 
@@ -838,11 +948,19 @@ class JapanWorkerConsole(threading.Thread):
             self._started_event.set()
 
         threading.Thread(target=_read, daemon=True, name="everycam-japan-start").start()
+        last_status = 0.0
+        readings = None
         while not self._started_event.is_set():
-            readings = self._refresh_camera_section()
-            self._save_status("waiting", readings=readings)
-            self._serve_params()
-            self._started_event.wait(1.0)
+            # Nothing is scheduled until Enter, so there is no slot for a live
+            # frame to be late for: ``slack=None`` is the same "take it now"
+            # this passes in setup mode. Ticking at TICK rather than a second
+            # keeps a newly opened focus session from waiting on the sleep.
+            last_status, readings = self._service_tick(
+                None, status="waiting", last_status=last_status, readings=readings)
+            self._started_event.wait(TICK)
+        # An operator who focused before starting gets the shutter back the way
+        # the programme expects it; the pre-darks are about to need it shut.
+        self._focus_close_shutter()
         if self._dash is not None:
             self._dash.set_footer("Ctrl+C — finish the frame, shoot the closing darks, stop")
         return not self._stop_event.is_set()
@@ -1300,6 +1418,7 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
         # sensor temperature being a reading rather than a setting.
         service = CameraService("japan", instance_name, conf.output_dir,
                                 node_name=node_name, setup_mode=setup_mode)
+        service.set_schedule(japan_schedule.schedule_snapshot(conf.schedule))
         server = start_frame_server(cfg.get("server", {}), service)
         if server:
             dash.update(server_url=server.url, focus="idle")

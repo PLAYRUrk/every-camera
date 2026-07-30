@@ -17,6 +17,18 @@ Two sources:
     the archive is deliberately LAN-only, since a full archive would mean
     megabytes of base64 through a public broker.
 
+On the LAN tab the archive can also be arranged the way it was shot — one
+branch per observing cycle, one per filter inside it — for any camera that
+reports its schedule, since nothing in a frame itself records which cycle it
+belongs to. For the japan camera a filter branch can additionally open a second
+window holding that filter's difference frame for that cycle:
+
+    first − (previous cycle's last · k0 + this cycle's last · k1) / 2
+
+with weights that fall linearly to zero across an operator-chosen window. Both
+are off until switched on, and the camera does the arithmetic (see
+``cycles.py`` and ``/api/composite``) — the viewer still never decodes a frame.
+
 Requirements on the observer machine: PyQt5, numpy, Pillow, and paho-mqtt for
 the MQTT source. No camera drivers.
 
@@ -38,7 +50,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QListWidget,
     QListWidgetItem, QGroupBox, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QStatusBar, QScrollArea,
+    QStatusBar, QScrollArea, QTreeWidget, QTreeWidgetItem, QStackedWidget,
+    QDialog, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage
@@ -55,6 +68,14 @@ STRETCH_MODES = [
     ("percentile", "Auto (0.5–99.5 %)"),
     ("raw", "Raw (no stretch)"),
 ]
+
+# The difference frame is built out of three japan frames around one cycle, and
+# nothing else files its archive that way — see cycles.py.
+COMPOSITE_CAMERA = "japan"
+
+# Roles on a tree node, so one selection handler can tell the three levels apart.
+NODE_KIND = Qt.UserRole          # "cycle" | "filter" | "frame"
+NODE_DATA = Qt.UserRole + 1      # frame name, or (cycle_id, filter_num)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,113 @@ class ImageView(QScrollArea):
 
 
 # ---------------------------------------------------------------------------
+# The per-filter difference frame (japan only)
+# ---------------------------------------------------------------------------
+class CompositeWindow(QDialog):
+    """The processed frame for one filter of one cycle, beside the main window.
+
+    A window of its own rather than a second tab: the point of it is to be read
+    *against* the ordinary frame in the main window, and a tab would hide the
+    one to show the other. Modeless, so the archive stays browsable, and it
+    parks itself to the right of the viewer the first time it opens.
+
+    It owns the ``T`` control, because that is the one number an operator wants
+    to try three values of while looking at the result.
+    """
+
+    window_changed = pyqtSignal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Every Camera — filter difference")
+        self.setWindowFlags(Qt.Window)
+        self.resize(560, 620)
+        self._placed = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        bar = QHBoxLayout()
+        self.lbl_what = QLabel("—")
+        self.lbl_what.setStyleSheet("font-weight:bold;")
+        bar.addWidget(self.lbl_what, 1)
+        bar.addWidget(QLabel("T:"))
+        self.sp_window = QDoubleSpinBox()
+        self.sp_window.setRange(1.0, 86400.0)
+        self.sp_window.setDecimals(0)
+        self.sp_window.setSingleStep(30.0)
+        self.sp_window.setSuffix(" s")
+        self.sp_window.setToolTip(
+            "The weighting window. A neighbouring frame this far away counts "
+            "for nothing; one taken at the same moment counts for 1.")
+        self.sp_window.setKeyboardTracking(False)
+        self.sp_window.valueChanged.connect(self.window_changed.emit)
+        bar.addWidget(self.sp_window)
+        root.addLayout(bar)
+
+        self.view = ImageView()
+        root.addWidget(self.view, 1)
+
+        self.lbl_weights = QLabel("—")
+        self.lbl_weights.setStyleSheet("font-size:11px;")
+        self.lbl_weights.setWordWrap(True)
+        root.addWidget(self.lbl_weights)
+
+        self.lbl_sources = QLabel("—")
+        self.lbl_sources.setStyleSheet("color:#888; font-size:11px;")
+        self.lbl_sources.setWordWrap(True)
+        root.addWidget(self.lbl_sources)
+
+    # -- content -------------------------------------------------------
+    def set_window_seconds(self, seconds, quiet=True):
+        """Set ``T`` without asking for a redraw (used when a camera is chosen)."""
+        if not seconds or seconds <= 0:
+            return
+        if quiet:
+            self.sp_window.blockSignals(True)
+        self.sp_window.setValue(float(seconds))
+        if quiet:
+            self.sp_window.blockSignals(False)
+
+    def window_seconds(self):
+        return float(self.sp_window.value())
+
+    def show_loading(self, cycle_label, filter_num):
+        self.lbl_what.setText(f"Filter {filter_num} · {cycle_label}")
+        self.view.show_message("Building the difference frame…")
+
+    def show_result(self, jpeg, headers, cycle_label, filter_num):
+        self.lbl_what.setText(f"Filter {filter_num} · {cycle_label}")
+        if not self.view.set_jpeg(jpeg):
+            return
+        k0 = headers.get("X-Composite-K0", "?")
+        k1 = headers.get("X-Composite-K1", "?")
+        gap0 = headers.get("X-Composite-Gap0", "?")
+        gap1 = headers.get("X-Composite-Gap1", "?")
+        self.lbl_weights.setText(
+            f"k0 = {k0} (Δ0 = {gap0} s, back to the previous cycle)   ·   "
+            f"k1 = {k1} (Δ1 = {gap1} s, on to this cycle's last frame)   ·   "
+            f"first − (previous·k0 + last·k1) / 2")
+        self.lbl_sources.setText(
+            f"first {headers.get('X-Composite-First', '?')}   ·   "
+            f"previous {headers.get('X-Composite-Previous', '?')}   ·   "
+            f"last {headers.get('X-Composite-Last', '?')}")
+
+    def show_error(self, message):
+        self.view.show_message(message)
+        self.lbl_weights.setText("—")
+        self.lbl_sources.setText("—")
+
+    def place_beside(self, other):
+        """Park to the right of the main window, once, on first show."""
+        if self._placed or other is None:
+            return
+        self._placed = True
+        frame = other.frameGeometry()
+        self.move(frame.x() + frame.width() + 8, frame.y())
+
+
+# ---------------------------------------------------------------------------
 # LAN source
 # ---------------------------------------------------------------------------
 class LanPanel(QWidget):
@@ -139,6 +267,13 @@ class LanPanel(QWidget):
         self._client = None
         self._frames = []
         self._current_name = None
+        # What the connected camera is and how it observes: both come from
+        # /api/info, and both decide what the grouping controls may offer.
+        self._camera_type = ""
+        self._schedule = {}
+        self._grouped = None
+        self._composite = None          # the second window, created on demand
+        self._composite_target = None   # (cycle_id, filter_num, cycle_label)
         self._build_ui()
 
         self._auto_timer = QTimer(self)
@@ -199,9 +334,37 @@ class LanPanel(QWidget):
         row.addWidget(btn_reload)
         arch_lay.addLayout(row)
 
+        self.cb_group = QCheckBox("Group by cycle / filter")
+        self.cb_group.setToolTip(
+            "Arrange the archive the way it was shot: one branch per observing "
+            "cycle, and inside it one per filter. Needs a camera that reports "
+            "its schedule — nothing in a frame records which cycle it belongs to.")
+        self.cb_group.stateChanged.connect(self._on_group_toggled)
+        arch_lay.addWidget(self.cb_group)
+
+        self.cb_composite = QCheckBox("Filter difference (japan)")
+        self.cb_composite.setToolTip(
+            "Clicking a filter inside a cycle opens a second window with\n"
+            "    first − (previous cycle's last · k0 + this cycle's last · k1) / 2\n"
+            "for that filter. Nothing is shown for the first cycle of a night or "
+            "for a cycle still being shot.")
+        self.cb_composite.setEnabled(False)
+        self.cb_composite.stateChanged.connect(self._on_composite_toggled)
+        arch_lay.addWidget(self.cb_composite)
+
+        # One place for the archive, two ways of showing it. A stack rather than
+        # two rebuilt widgets, so turning grouping off and on again is free and
+        # the flat list keeps behaving exactly as it did before it had company.
+        self.stack = QStackedWidget()
         self.list_frames = QListWidget()
         self.list_frames.currentRowChanged.connect(self._on_frame_selected)
-        arch_lay.addWidget(self.list_frames, 1)
+        self.stack.addWidget(self.list_frames)
+
+        self.tree_frames = QTreeWidget()
+        self.tree_frames.setHeaderHidden(True)
+        self.tree_frames.currentItemChanged.connect(self._on_tree_selected)
+        self.stack.addWidget(self.tree_frames)
+        arch_lay.addWidget(self.stack, 1)
 
         self.lbl_count = QLabel("—")
         self.lbl_count.setStyleSheet("color:#888; font-size:11px;")
@@ -334,11 +497,65 @@ class LanPanel(QWidget):
             f"<b>{info.get('instance_name', '?')}</b> "
             f"({info.get('camera_type', '?')})<br>{node_name_of(info)}"
             f"<br>{info.get('output_dir') or 'no archive directory'}")
+        self._camera_type = str(info.get("camera_type") or "").strip().lower()
+        self._schedule = info.get("schedule") or {}
+        self._sync_grouping_controls()
         if not info.get("archive_available"):
             self.status.emit(
                 "Connected, but this camera has no archive directory "
                 "configured — only the latest frame is available.")
         self._reload_all()
+
+    def _sync_grouping_controls(self):
+        """Restore the observer's grouping choices, as far as this camera allows.
+
+        Called when a camera is chosen, and only then: it is the one place that
+        reads the stored preference back. A camera that cannot be grouped turns
+        the boxes off without touching what is stored, so connecting to such a
+        camera and back does not quietly lose a setting.
+        """
+        can_group = bool(self._schedule.get("mode"))
+        is_japan = self._camera_type == COMPOSITE_CAMERA
+        stored = self._settings.get("viewer", {}) or {}
+
+        self.cb_group.setToolTip(
+            "Arrange the archive the way it was shot: one branch per observing "
+            "cycle, and inside it one per filter."
+            if can_group else
+            "This camera does not report a schedule, so its frames cannot be "
+            "grouped into cycles.")
+        self.cb_group.setEnabled(can_group)
+        self._set_quietly(self.cb_group,
+                          can_group and bool(stored.get("group_by_cycle")))
+        self.stack.setCurrentWidget(self.tree_frames if self.cb_group.isChecked()
+                                    else self.list_frames)
+
+        self._update_composite_enabled()
+        self._set_quietly(self.cb_composite,
+                          self.cb_composite.isEnabled()
+                          and bool(stored.get("filter_difference")))
+        if not self.cb_composite.isChecked():
+            self._close_composite()
+
+        period = float(self._schedule.get("period") or 0.0)
+        if self._composite is not None and period > 0:
+            self._composite.set_window_seconds(period)
+
+    def _update_composite_enabled(self):
+        """The difference frame needs a japan camera *and* the grouping tree."""
+        self.cb_composite.setEnabled(
+            bool(self._schedule.get("mode"))
+            and self._camera_type == COMPOSITE_CAMERA
+            and self.cb_group.isChecked())
+
+    @staticmethod
+    def _set_quietly(box, checked):
+        """Set a box from what the camera allows, without recording it as a choice."""
+        if box.isChecked() == checked:
+            return
+        box.blockSignals(True)
+        box.setChecked(checked)
+        box.blockSignals(False)
 
     def _on_error(self, message):
         self.status.emit(message)
@@ -369,6 +586,9 @@ class LanPanel(QWidget):
         date = self.cmb_date.currentData()
         self._tasks.run(lambda: client.frames(date=date, limit=1000),
                         self._on_frames, self._on_error)
+        if self.cb_group.isChecked():
+            self._tasks.run(lambda: client.cycles(date=date),
+                            self._on_cycles, self._on_error)
 
     def _on_frames(self, listing):
         self._frames = listing.get("frames", [])
@@ -387,10 +607,149 @@ class LanPanel(QWidget):
             f"{shown} of {total} frame(s)" if shown < total
             else f"{total} frame(s)")
         if self._frames:
-            self.list_frames.setCurrentRow(0)
+            if not self.cb_group.isChecked():
+                self.list_frames.setCurrentRow(0)
         else:
             self.view.show_message("No frames in this archive")
             self.btn_save.setEnabled(False)
+
+    # -- grouping ------------------------------------------------------
+    def _on_group_toggled(self, state):
+        self.stack.setCurrentWidget(self.tree_frames if state else self.list_frames)
+        self._update_composite_enabled()
+        self._remember_view_setting("group_by_cycle", bool(state))
+        if state:
+            self._reload_frames()
+        else:
+            self._close_composite()
+
+    def _on_cycles(self, grouped):
+        self._grouped = grouped
+        self.tree_frames.blockSignals(True)
+        self.tree_frames.clear()
+        reason = grouped.get("reason")
+        if reason:
+            self.tree_frames.addTopLevelItem(QTreeWidgetItem([reason]))
+            self.tree_frames.blockSignals(False)
+            self.status.emit(reason)
+            return
+        for cycle in grouped.get("cycles", []):
+            label = self._cycle_label(cycle)
+            node = QTreeWidgetItem([label])
+            node.setData(0, NODE_KIND, "cycle")
+            node.setData(0, NODE_DATA, cycle["id"])
+            for filter_num in sorted(cycle["filters"], key=lambda k: int(k)):
+                frames = cycle["filters"][filter_num]
+                child = QTreeWidgetItem(
+                    [f"filter {filter_num} — {len(frames)} frame"
+                     f"{'s' if len(frames) != 1 else ''}"])
+                child.setData(0, NODE_KIND, "filter")
+                child.setData(0, NODE_DATA, (cycle["id"], int(filter_num), label))
+                for frame in frames:
+                    when = frame["time"][11:19]
+                    leaf = QTreeWidgetItem([f"{when}  ·  {frame['name']}"])
+                    leaf.setData(0, NODE_KIND, "frame")
+                    leaf.setData(0, NODE_DATA, frame["name"])
+                    child.addChild(leaf)
+                node.addChild(child)
+            self.tree_frames.addTopLevelItem(node)
+        self.tree_frames.blockSignals(False)
+        period = float(grouped.get("period") or 0.0)
+        if self._composite is not None and period > 0:
+            self._composite.set_window_seconds(period)
+        self.status.emit(f"{len(grouped.get('cycles', []))} cycle(s) "
+                         f"in this archive")
+
+    @staticmethod
+    def _cycle_label(cycle):
+        started = str(cycle.get("start", ""))[:19].replace("T", " ")
+        tail = "" if cycle.get("complete") else "  ·  still running"
+        return f"cycle {cycle.get('index')} — {started}{tail}"
+
+    def _on_tree_selected(self, current, _previous):
+        if current is None:
+            return
+        kind = current.data(0, NODE_KIND)
+        data = current.data(0, NODE_DATA)
+        if kind == "frame":
+            self.cb_auto.setChecked(False)
+            self._current_name = data
+            self._load_frame(data)
+        elif kind == "filter":
+            self._composite_target = data
+            self._request_composite()
+
+    # -- the difference frame ------------------------------------------
+    def _on_composite_toggled(self, state):
+        self._remember_view_setting("filter_difference", bool(state))
+        if state:
+            self._request_composite()
+        else:
+            self._close_composite()
+
+    def _composite_dialog(self):
+        if self._composite is None:
+            self._composite = CompositeWindow(self.window())
+            self._composite.set_window_seconds(
+                float((self._grouped or {}).get("period")
+                      or self._schedule.get("period") or 0.0))
+            self._composite.window_changed.connect(
+                lambda _value: self._request_composite())
+        return self._composite
+
+    def _request_composite(self):
+        if not (self.cb_composite.isChecked() and self.cb_composite.isEnabled()):
+            return
+        if not self._client or not self._composite_target:
+            return
+        cycle_id, filter_num, label = self._composite_target
+        dialog = self._composite_dialog()
+        window = dialog.window_seconds()
+        if window <= 0:
+            return
+        client = self._client
+        date = self.cmb_date.currentData()
+        stretch = self.cmb_stretch.currentData()
+        # Only show the window once there is something in it: "no previous
+        # cycle" and "this cycle is not finished" are ordinary states, and an
+        # empty window popping up for them would be noise on every first click.
+        if dialog.isVisible():
+            dialog.show_loading(label, filter_num)
+        self._tasks.run(
+            lambda: client.composite(cycle_id, filter_num, window=window,
+                                     stretch=stretch, date=date),
+            lambda result: self._on_composite(result, cycle_id, filter_num, label),
+            lambda message: self._on_composite_failed(message, filter_num))
+
+    def _on_composite(self, result, cycle_id, filter_num, label):
+        if self._composite_target and self._composite_target[:2] != (cycle_id,
+                                                                     filter_num):
+            return          # the operator moved on while this was in flight
+        jpeg, headers = result
+        dialog = self._composite_dialog()
+        dialog.show_result(jpeg, headers, label, filter_num)
+        if not dialog.isVisible():
+            dialog.place_beside(self.window())
+            dialog.show()
+        self.status.emit(f"Difference frame for filter {filter_num}, {label}")
+
+    def _on_composite_failed(self, message, filter_num):
+        # The camera's refusals are written to be read by the operator, so they
+        # go to the status bar whole rather than being restated here.
+        self.status.emit(f"No difference frame for filter {filter_num}: {message}")
+        if self._composite is not None and self._composite.isVisible():
+            self._composite.show_error(message)
+
+    def _close_composite(self):
+        if self._composite is not None:
+            self._composite.hide()
+
+    def _remember_view_setting(self, key, value):
+        """Record a grouping choice — it belongs to the observer, not the camera."""
+        view = dict(self._settings.get("viewer", {}) or {})
+        view[key] = value
+        self._settings["viewer"] = view
+        save_settings(self._settings)
 
     def _on_frame_selected(self, row):
         if row < 0 or row >= len(self._frames) or not self._client:
@@ -400,6 +759,10 @@ class LanPanel(QWidget):
         self._load_frame(self._current_name)
 
     def _reload_current(self):
+        # The difference frame follows the same contrast control as the main
+        # window: read side by side, two different stretches would invite
+        # comparisons that are not there.
+        self._request_composite()
         if self._current_name:
             self._load_frame(self._current_name)
         elif self.cb_auto.isChecked() or self.view.has_frame():
@@ -487,6 +850,9 @@ class LanPanel(QWidget):
 
     def cleanup(self):
         self._auto_timer.stop()
+        if self._composite is not None:
+            self._composite.close()
+            self._composite = None
         self._tasks.wait_all()
 
 

@@ -1218,6 +1218,17 @@ class JapanConfigTab:
         self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM")
         _add_label_row(sgrid, row, "T_start (time mode):", self.le_t_start); row += 1
 
+        self.sb_sched_len = QDoubleSpinBox()
+        self.sb_sched_len.setRange(0.0, 86400.0)
+        self.sb_sched_len.setDecimals(1)
+        self.sb_sched_len.setSuffix(" s")
+        self.sb_sched_len.setToolTip(
+            "Length of one cycle in time mode. 0 derives it from the last slot.\n"
+            "A schedule file may state its own with a 'period = 1440' header, "
+            "which wins over this — that is where it stays in step with the slots.")
+        self.sb_sched_len.setValue(float(c.get("schedule_len") or 0.0))
+        _add_label_row(sgrid, row, "Cycle period:", self.sb_sched_len); row += 1
+
         self.sb_darks = QSpinBox()
         self.sb_darks.setRange(0, 100)
         self.sb_darks.setToolTip("Dark frames per unique exposure, shot before "
@@ -1346,6 +1357,7 @@ class JapanConfigTab:
             "mode": self.cb_mode.currentText(),
             "sun_max_angle": self.sb_sun_angle.value(),
             "t_start": self.le_t_start.text().strip(),
+            "schedule_len": self.sb_sched_len.value() or None,
             "dark_frames": self.sb_darks.value(),
             "dead_time": self.sb_dead.value(),
             "wait_for_enter": self.cb_wait_enter.isChecked(),

@@ -138,6 +138,25 @@ class CameraClient:
     def frame_stats(self, name=None):
         return self.get_json("/api/stats", name=name)
 
+    def cycles(self, date=None):
+        """The archive grouped into observing cycles and, inside each, filters."""
+        return self.get_json("/api/cycles", date=date)
+
+    def composite(self, cycle, filter_num, window=None, stretch="minmax",
+                  max_side=None, date=None, timeout=60.0):
+        """The per-filter difference frame for one cycle: ``(jpeg, headers)``.
+
+        The camera reads the three frames and does the arithmetic; what comes
+        back over the network is one JPEG and the weights it was built with, in
+        ``X-Composite-*`` headers. A frame the camera declines to build — no
+        previous cycle, a cycle still running — arrives as an HTTP 404 whose
+        message is meant to be shown as-is.
+        """
+        data, headers = self.get_bytes(
+            "/api/composite", timeout=timeout, cycle=cycle, filter=filter_num,
+            window=window, stretch=stretch, max=max_side, date=date)
+        return data, headers
+
     def latest_jpeg(self, max_side=None, stretch="minmax"):
         data, headers = self.get_bytes("/api/latest.jpg", max=max_side,
                                        stretch=stretch)

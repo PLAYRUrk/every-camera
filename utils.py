@@ -326,6 +326,10 @@ DEFAULT_CONFIG = {
         "t_start": "20:00",             # time mode: phase reference of the cycle
         "dark_frames": 3,
         "dead_time": 5.0,
+        "schedule_len": None,           # time mode: cycle period, s; None -> derived.
+                                        # A schedule file may state its own with a
+                                        # "period = 1440" header, which is the place
+                                        # it stays in step with the slots below it.
         "wait_for_enter": True,         # time mode: wait for the operator to start
         "schedule_file": "",            # legacy japan-camera schedule.txt, or .json
         "schedule": [],                 # sun:  {"filter":3,"exposure":30,"seconds":[0,30]}
@@ -1002,6 +1006,12 @@ def configure_console_japan(cfg, config_path=None):
     else:
         japan["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
                                 japan.get("t_start", "20:00"))
+        # A schedule file may say this itself with a "period = 1440" header, and
+        # that is the better place for it — it cannot then outlive its slots.
+        period = _ask_float("Cycle period in seconds "
+                            "(0 = derive it from the last slot)",
+                            float(japan.get("schedule_len") or 0.0))
+        japan["schedule_len"] = period if period > 0 else None
         japan["wait_for_enter"] = _ask_bool(
             "Wait for Enter before starting? (no = start unattended)",
             japan.get("wait_for_enter", True))

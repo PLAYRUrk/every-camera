@@ -76,16 +76,21 @@ class ScheduleCfg:
     entries: list = field(default_factory=list)
     dark_frames: int = 3
     dead_time: float = 5.0
+    schedule_len: float = None        # time mode: explicit period, seconds
 
     @property
     def period(self):
         """Length of one general cycle (``time`` mode only).
 
-        Always derived from the slots — last delta plus that exposure plus the
-        dead time — because the Hamamatsu program had no way to state a period
-        explicitly and its schedules are written on the assumption that it is
-        computed. (ASI's ``schedule_len`` override has no counterpart here.)
+        Derived from the slots — last delta plus that exposure plus the dead
+        time — which is what the Hamamatsu program did and what its schedules
+        are still written for. A schedule that states its own period wins:
+        ``period = 1440`` at the top of the file, or ``japan.schedule_len``.
+        Stating it in the file is the point — a period kept only in config.json
+        goes stale the moment the schedule beside it is swapped.
         """
+        if self.schedule_len:
+            return float(self.schedule_len)
         return schedule_mod.cycle_period(self.entries, self.dead_time)
 
 
@@ -115,6 +120,13 @@ def from_dict(japan_cfg):
     a japan-camera ``schedule.txt`` is exactly the legacy text format the shared
     parser reads, comma-separated in ``sun`` mode and semicolon-separated in
     ``time`` mode.
+
+    Such a file may open with ``key = value`` lines, and those speak last of all
+    for the settings this camera understands — ``mode``, ``sun_max_angle``,
+    ``t_start``, ``dark_frames``, ``dead_time`` and the cycle period
+    (``period = 1440``, stored as ``schedule_len``). The period especially
+    belongs with the slots it describes: kept only in config.json, it survives
+    the schedule it was measured for.
     """
     japan_cfg = japan_cfg or {}
     errors = []
@@ -190,12 +202,12 @@ def from_dict(japan_cfg):
                       "no equivalent for; it is ignored")
 
     # The schedule file speaks last, but only for the keys it is allowed to and
-    # only for the ones this camera understands: ``schedule_len``, ``site_id`` and
-    # ``device_id`` belong to the ASI archive and are ignored here.
+    # only for the ones this camera understands: ``site_id`` and ``device_id``
+    # belong to the ASI archive and are ignored here.
     settings = dict(japan_cfg)
     settings.update({key: value for key, value in overrides.items()
                      if key in ("mode", "sun_max_angle", "t_start",
-                                "dark_frames", "dead_time")})
+                                "dark_frames", "dead_time", "schedule_len")})
 
     if overrides.get("mode"):
         file_mode = str(overrides["mode"]).strip().lower()
@@ -211,6 +223,20 @@ def from_dict(japan_cfg):
                       "using 20:00")
         t_start = time(20, 0)
 
+    schedule_len = None
+    raw_len = settings.get("schedule_len")
+    if raw_len not in (None, "", 0):
+        try:
+            schedule_len = float(raw_len)
+        except (TypeError, ValueError):
+            errors.append(f"the cycle period must be a number of seconds, got "
+                          f"{raw_len!r}; deriving it from the slots instead")
+        else:
+            if schedule_len <= 0:
+                errors.append(f"the cycle period must be positive, got "
+                              f"{schedule_len}; deriving it from the slots instead")
+                schedule_len = None
+
     sched = ScheduleCfg(
         mode=mode,
         sun_max_angle=cfgparse.as_float(settings, "sun_max_angle", -10.0),
@@ -218,6 +244,7 @@ def from_dict(japan_cfg):
         entries=entries,
         dark_frames=cfgparse.as_int(settings, "dark_frames", 3),
         dead_time=cfgparse.as_float(settings, "dead_time", 5.0),
+        schedule_len=schedule_len,
     )
     if sched.dark_frames < 0:
         errors.append(f"japan.dark_frames must not be negative, got "

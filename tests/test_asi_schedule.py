@@ -203,15 +203,15 @@ def test_seconds_are_deduplicated_and_sorted():
 # Parsing: legacy schedule.txt
 # ---------------------------------------------------------------------------
 def test_legacy_sun_file_is_understood():
-    entries, errors = sched.parse_schedule_text("# comment\n1,55,0:30\n2,55,15\n",
-                                                "sun")
+    entries, errors, _ = sched.parse_schedule_text(
+        "# comment\n1,55,0:30\n2,55,15\n", "sun")
     assert errors == []
     assert [(e.filter, e.exposure, e.seconds) for e in entries] == [
         (1, 55.0, [0, 30]), (2, 55.0, [15])]
 
 
 def test_legacy_time_file_is_understood():
-    entries, errors = sched.parse_schedule_text("100;3;25;1\n130;5;25;2\n", "time")
+    entries, errors, _ = sched.parse_schedule_text("100;3;25;1\n130;5;25;2\n", "time")
     assert errors == []
     assert [(e.delta, e.filter, e.binning) for e in entries] == [
         (100.0, 3, 1), (130.0, 5, 2)]
@@ -219,14 +219,14 @@ def test_legacy_time_file_is_understood():
 
 
 def test_a_malformed_legacy_line_is_reported():
-    entries, errors = sched.parse_schedule_text("1,55\nnot a line\n1,55,0\n", "sun")
+    entries, errors, _ = sched.parse_schedule_text("1,55\nnot a line\n1,55,0\n", "sun")
     assert len(entries) == 1
     assert len(errors) == 2
 
 
 def test_legacy_round_trip_through_text():
-    entries, _ = sched.parse_schedule_text("100;3;25;1\n130;5;25;2\n", "time")
-    again, errors = sched.parse_schedule_text(
+    entries, _, _ = sched.parse_schedule_text("100;3;25;1\n130;5;25;2\n", "time")
+    again, errors, _ = sched.parse_schedule_text(
         sched.schedule_to_text(entries, "time"), "time")
     assert errors == []
     assert [e.as_dict() for e in again] == [e.as_dict() for e in entries]

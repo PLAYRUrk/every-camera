@@ -3032,6 +3032,7 @@ class AsiTab(QWidget):
     def _on_start(self):
         import console_ui
         from cameras.asi import config as asi_config
+        from cameras.asi import schedule as asi_schedule
         from cameras.asi_driver import (
             AsiCamera, AsiWorkerConsole, publish_setpoint_limits,
         )
@@ -3082,6 +3083,7 @@ class AsiTab(QWidget):
         self._service = CameraService("asi", instance, conf.output_dir,
                                       node_name=node_name,
                                       setup_mode=setup_mode)
+        self._service.set_schedule(asi_schedule.schedule_snapshot(conf.schedule))
         publish_setpoint_limits(self._service, self.cam)
         self._server = start_frame_server(self._cfg.get("server", {}),
                                           self._service)
@@ -3338,6 +3340,7 @@ class JapanTab(QWidget):
         from camera_service import CameraService
         from frame_server import start_frame_server
         from utils import get_instance_name, claim_instance_name, get_node_name
+        from cameras.common import schedule as common_schedule
         from pathlib import Path
 
         japan_cfg = dict(self._cfg.get("japan", {}))
@@ -3385,6 +3388,7 @@ class JapanTab(QWidget):
         self._service = CameraService("japan", instance, conf.output_dir,
                                       node_name=node_name,
                                       setup_mode=setup_mode)
+        self._service.set_schedule(common_schedule.schedule_snapshot(conf.schedule))
         self._server = start_frame_server(self._cfg.get("server", {}),
                                           self._service)
 

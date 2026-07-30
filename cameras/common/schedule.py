@@ -22,6 +22,11 @@ converted imagerd_rt schedule in JSON, or from a legacy asi-camera
 ``schedule.txt``; :func:`parse_schedule_text` reads the oldest format so an
 existing station file keeps working.
 
+Either file format may also carry the globals in :data:`FILE_OVERRIDE_KEYS` —
+notably ``schedule_len``, writable as ``period = 1440`` at the top of a text
+schedule. A schedule and the length of its cycle belong together: keeping the
+period in config.json meant that swapping schedules silently kept the old one.
+
 Everything here is pure: no camera, no clock beyond what is passed in. That is
 what makes the cycle arithmetic — the subtlest part of the driver — testable.
 """
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -53,6 +59,17 @@ GAIN_MAX = 3
 # say, the output directory.
 FILE_OVERRIDE_KEYS = ("mode", "sun_max_angle", "schedule_len", "t_start",
                       "dark_frames", "dead_time", "site_id", "device_id")
+
+# What an operator may write instead of the canonical key. ``period`` is the
+# word the console, the setup wizard and the observers all use for
+# ``schedule_len``, and a schedule file is edited by hand far more often than
+# config.json is.
+FILE_OVERRIDE_ALIASES = {"period": "schedule_len", "cycle": "schedule_len"}
+
+# A ``key = value`` line in a text schedule. Slot lines are separated by ``;``
+# (cycle modes) or ``,`` (sun mode) and never contain ``=``, so the two shapes
+# cannot be confused for one another.
+_DIRECTIVE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
 @dataclass
@@ -175,16 +192,54 @@ def entries_from_config(slots, mode, default_binning=1):
 
 
 def parse_schedule_text(text, mode, default_binning=1):
-    """Parse a legacy asi-camera ``schedule.txt``. Returns ``(entries, errors)``.
+    """Parse a legacy asi-camera ``schedule.txt``.
+
+    Returns ``(entries, errors, overrides)``.
 
     ``sun``   mode: ``filter,exposure,seconds``       e.g. ``1,55,0:30``
     cycle modes: ``delta;filter;exposure;binning``    e.g. ``100;3;25;1``
+
+    A line may instead be ``key = value``, which sets one of
+    :data:`FILE_OVERRIDE_KEYS` for the whole programme — the same globals the
+    JSON schedule format carries. This is what lets a station state the length
+    of its cycle where the cycle itself is written::
+
+        period = 1440
+        0;1;55;1
+        100;3;25;1
+
+    Without it the period could only be set in config.json, and every change of
+    schedule meant editing two files in step — which is exactly how a schedule
+    and its period drift apart.
     """
-    slots, errors = [], []
+    slots, errors, overrides = [], [], {}
+    # Two passes, because ``mode`` decides how a slot line is punctuated: a file
+    # that sets it below its slots must still be read the way it says.
+    body = []
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        directive = _DIRECTIVE.match(line)
+        if not directive:
+            body.append((lineno, line))
+            continue
+        key = directive.group(1).strip().lower()
+        key = FILE_OVERRIDE_ALIASES.get(key, key)
+        value = directive.group(2).strip()
+        if key not in FILE_OVERRIDE_KEYS:
+            errors.append(f"Line {lineno}: unknown setting {key!r}; the "
+                          f"schedule file may set {', '.join(FILE_OVERRIDE_KEYS)}")
+        elif not value:
+            errors.append(f"Line {lineno}: {key} has no value")
+        else:
+            overrides[key] = value
+
+    file_mode = str(overrides.get("mode", mode)).strip().lower()
+    if file_mode in MODES:
+        mode = file_mode
+
+    for lineno, line in body:
         try:
             if mode in CYCLE_MODES:
                 parts = [p.strip() for p in line.split(";")]
@@ -217,7 +272,7 @@ def parse_schedule_text(text, mode, default_binning=1):
         slots.append(slot)
 
     entries, slot_errors = entries_from_config(slots, mode, default_binning)
-    return entries, errors + slot_errors
+    return entries, errors + slot_errors, overrides
 
 
 def parse_schedule_json(text, mode, default_binning=1):
@@ -260,13 +315,20 @@ def load_schedule_file(path, mode, default_binning=1):
         text = fh.read()
     if str(path).lower().endswith(".json") or text.lstrip()[:1] in ("{", "["):
         return parse_schedule_json(text, mode, default_binning)
-    entries, errors = parse_schedule_text(text, mode, default_binning)
-    return entries, errors, {}
+    return parse_schedule_text(text, mode, default_binning)
 
 
-def schedule_to_text(entries, mode):
-    """Render entries back into the legacy file format (used by the setup tools)."""
+def schedule_to_text(entries, mode, period=None):
+    """Render entries back into the legacy file format (used by the setup tools).
+
+    ``period`` is written as a ``period =`` header when given, so a file that
+    stated its own cycle length still states it after a round trip through an
+    editor. Passing ``None`` leaves the period to be derived from the slots, as
+    it always was.
+    """
     lines = []
+    if period:
+        lines.append(f"period = {float(period):g}")
     if mode in CYCLE_MODES:
         lines.append("# delta(s);filter;exposure(s);binning")
         for entry in sorted(entries, key=lambda e: e.delta or 0):
@@ -350,6 +412,32 @@ def slot_budget(entries, period, entry, dead_time):
     """
     readout = entry.readout if entry.readout is not None else dead_time
     return max(slot_gap(entries, period, entry) - float(readout), 0.0)
+
+
+def schedule_snapshot(sched):
+    """Describe an observing programme for observers, as plain JSON types.
+
+    Which cycle a frame belongs to is written nowhere — not in the file name,
+    not in the FITS header — so an archive can only be grouped into cycles by
+    replaying this phase reference and period against the frame times. Published
+    through ``CameraService.set_schedule`` and consumed by ``cycles.py``.
+
+    Duck-typed on purpose: the japan and asi ``ScheduleCfg`` classes are
+    separate but agree on every field read here.
+    """
+    if sched is None:
+        return {}
+    t_start = getattr(sched, "t_start", None)
+    entries = list(getattr(sched, "entries", None) or [])
+    return {
+        "mode": getattr(sched, "mode", ""),
+        "t_start": t_start.strftime("%H:%M:%S") if t_start else None,
+        "period": float(getattr(sched, "period", 0.0) or 0.0),
+        "dead_time": float(getattr(sched, "dead_time", 0.0) or 0.0),
+        "entries": [{"filter": e.filter, "delta": e.delta,
+                     "exposure": e.exposure, "seconds": list(e.seconds or [])}
+                    for e in entries],
+    }
 
 
 def next_cycle_slot(t_start, period, entries, now):

@@ -24,6 +24,8 @@ Endpoints
     GET  /api/status             worker status snapshot
     GET  /api/dates              days present in the archive
     GET  /api/frames             archive listing (date/limit/offset)
+    GET  /api/cycles             the archive grouped into cycles and filters
+    GET  /api/composite          per-filter difference frame for one cycle
     GET  /api/frame              one archived frame (as=jpeg|raw)
     GET  /api/thumb              small JPEG preview of an archived frame
     GET  /api/stats              statistics + histogram of a frame
@@ -47,6 +49,7 @@ from urllib.parse import urlparse, parse_qs
 
 import console_ui
 
+import cycles
 import frame_archive
 
 SERVER_VERSION = "every-camera/1.0"
@@ -189,6 +192,12 @@ class _Handler(BaseHTTPRequestHandler):
         values = query.get(name)
         return values[0] if values else default
 
+    def _float_arg(self, query, name, default):
+        try:
+            return float(self._arg(query, name, default))
+        except (TypeError, ValueError):
+            return float(default)
+
     def _int_arg(self, query, name, default, minimum=None, maximum=None):
         try:
             value = int(self._arg(query, name, default))
@@ -251,6 +260,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"dates": frame_archive.list_dates(self.service.output_dir)})
         elif path == "/api/frames":
             self._get_frames()
+        elif path == "/api/cycles":
+            self._get_cycles()
+        elif path == "/api/composite":
+            self._get_composite()
         elif path == "/api/frame":
             self._get_frame()
         elif path == "/api/thumb":
@@ -291,6 +304,92 @@ class _Handler(BaseHTTPRequestHandler):
             limit=limit, offset=offset)
         listing["output_dir"] = self.service.output_dir
         self._send_json(listing)
+
+    # -- cycles --------------------------------------------------------
+    def _grouped_cycles(self, date=None):
+        """The archive, grouped by the schedule this camera reports."""
+        listing = frame_archive.list_frames(self.service.output_dir, date=date,
+                                            limit=self.max_list)
+        schedule = self.service.info().get("schedule") or {}
+        return cycles.group_cycles(listing.get("frames", []), schedule)
+
+    def _get_cycles(self):
+        query = self._query()
+        grouped = self._grouped_cycles(date=self._arg(query, "date"))
+        grouped["output_dir"] = self.service.output_dir
+        self._send_json(grouped)
+
+    def _get_composite(self):
+        """The per-filter difference frame for one cycle, as a JPEG.
+
+        The arithmetic happens here rather than in the viewer on purpose: the
+        three japan frames it needs are ~24 MB of raw data, against ~200 KB for
+        the answer, and ``frame_archive`` is already the one place in this
+        project that knows how to turn sensor counts into a picture.
+        """
+        query = self._query()
+        cycle_id = self._arg(query, "cycle")
+        filter_num = self._arg(query, "filter")
+        if cycle_id is None or filter_num is None:
+            self._error(400, "missing 'cycle' or 'filter' parameter")
+            return
+        try:
+            cycle_id = int(cycle_id)
+            filter_num = int(filter_num)
+        except (TypeError, ValueError):
+            self._error(400, "'cycle' and 'filter' must be integers")
+            return
+
+        grouped = self._grouped_cycles(date=self._arg(query, "date"))
+        if grouped.get("reason"):
+            self._error(404, grouped["reason"])
+            return
+        first, previous, last, reason = cycles.pick_composite_frames(
+            grouped, cycle_id, filter_num)
+        if reason:
+            # Not an error the operator can fix — it is the documented "there is
+            # nothing to show yet" case, and the viewer says so instead of
+            # opening a window.
+            self._send_json({"error": reason, "available": False}, code=404)
+            return
+
+        window = self._float_arg(query, "window", grouped.get("period") or 0.0)
+        if window <= 0:
+            self._error(400, "'window' must be a positive number of seconds")
+            return
+        max_side = self._int_arg(query, "max", 0, 0, 8192) or None
+        stretch = self._arg(query, "stretch", "minmax")
+        if stretch not in ("minmax", "percentile", "raw"):
+            stretch = "minmax"
+
+        times = [dt.fromisoformat(f["time"]) for f in (first, previous, last)]
+        k0, k1 = cycles.composite_weights(times[0], times[1], times[2], window)
+        try:
+            arrays = []
+            for frame in (first, previous, last):
+                path = frame_archive.resolve_frame_path(self.service.output_dir,
+                                                        frame["name"])
+                if not path:
+                    self._error(404, f"No such frame: {frame['name']}")
+                    return
+                arrays.append(frame_archive.read_frame_file(path))
+            result = cycles.composite_image(*arrays, k0, k1)
+            jpeg = frame_archive.to_jpeg_bytes(result, max_side=max_side,
+                                               stretch=stretch)
+        except Exception as exc:
+            self._error(415, f"Could not build the difference frame: {exc}")
+            return
+
+        self._send(200, jpeg, "image/jpeg", extra_headers={
+            "X-Composite-K0": f"{k0:.6f}",
+            "X-Composite-K1": f"{k1:.6f}",
+            "X-Composite-Gap0": f"{(times[0] - times[1]).total_seconds():.1f}",
+            "X-Composite-Gap1": f"{(times[2] - times[0]).total_seconds():.1f}",
+            "X-Composite-Window": f"{float(window):.1f}",
+            "X-Composite-First": first["name"],
+            "X-Composite-Previous": previous["name"],
+            "X-Composite-Last": last["name"],
+        })
 
     def _resolve_or_fail(self, query):
         name = self._arg(query, "name")
@@ -704,6 +803,36 @@ boot();
 # ---------------------------------------------------------------------------
 # Standalone mode — serve an existing directory of captures, no camera needed
 # ---------------------------------------------------------------------------
+def _schedule_from_config(config_path, camera_type):
+    """The observing programme from a config.json, for ``/api/cycles``.
+
+    Imported here rather than at module scope: the camera config modules are
+    pure Python, but this file is also the one an observer runs against a
+    directory of frames, and it should not grow a package dependency for a flag
+    that is usually unset.
+    """
+    try:
+        from cameras.common.schedule import schedule_snapshot
+        section = str(camera_type or "").strip().lower()
+        # Read the file directly rather than through ``utils.load_config``: that
+        # one writes a default config when the path is missing, which is not
+        # something a read-only archive server should do to a mistyped path.
+        with open(config_path) as fh:
+            cfg = json.load(fh).get(section, {})
+        if section == "japan":
+            from cameras.japan.config import from_dict
+        elif section == "asi":
+            from cameras.asi.config import from_dict
+        else:
+            console_ui.warn(f"--config has no schedule for camera type "
+                            f"{camera_type!r}; cycles will not be grouped")
+            return {}
+        return schedule_snapshot(from_dict(cfg).schedule)
+    except Exception as exc:
+        console_ui.warn(f"Could not read a schedule from {config_path}: {exc}")
+        return {}
+
+
 def main():
     import argparse
     from camera_service import NullService
@@ -719,12 +848,21 @@ def main():
                         help="Friendly machine name shown to observers "
                              "(default: hostname)")
     parser.add_argument("--camera-type", default="unknown")
+    parser.add_argument("--config", default=None,
+                        help="config.json to read the schedule from, so "
+                             "/api/cycles can group this archive")
     parser.add_argument("--no-discovery", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     service = NullService(args.output_dir, args.name, args.camera_type,
                           node_name=args.node_name)
+    # An archive served without its camera still groups into cycles, as long as
+    # the schedule that produced it is at hand — otherwise /api/cycles can only
+    # say that it does not know how this camera observes.
+    if args.config:
+        service.set_schedule(_schedule_from_config(args.config,
+                                                   args.camera_type))
     server = start_frame_server({
         "enabled": True, "port": args.port, "bind": args.bind,
         "discovery": not args.no_discovery,

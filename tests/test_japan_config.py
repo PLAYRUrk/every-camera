@@ -247,16 +247,97 @@ def test_a_schedule_file_may_still_set_what_this_camera_understands(tmp_path):
     assert conf.schedule.dark_frames == 5
 
 
-def test_asi_only_globals_in_a_schedule_file_are_ignored(tmp_path):
-    """``schedule_len`` and the station identity belong to the ASI archive."""
+def test_the_station_identity_in_a_schedule_file_is_ignored(tmp_path):
+    """``site_id`` and ``device_id`` belong to the ASI archive, not this one."""
     path = tmp_path / "schedule.json"
-    path.write_text('{"schedule_len": 1440, "site_id": "TORY", '
-                    '"device_id": "ASI0", '
+    path.write_text('{"site_id": "TORY", "device_id": "ASI0", '
                     '"slots": [{"delta": 0, "filter": 1, "exposure": 5, '
                     '"binning": 1}]}')
     conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
                                    "dead_time": 5.0,
                                    "schedule_file": str(path)})
-    # The period is still derived from the slots, not taken from schedule_len.
     assert conf.schedule.period == pytest.approx(10.0)
-    assert not hasattr(conf.schedule, "schedule_len")
+    assert not hasattr(conf, "site_id")
+
+
+# ---------------------------------------------------------------------------
+# The cycle period, stated where the cycle is written
+# ---------------------------------------------------------------------------
+def test_the_period_is_derived_from_the_slots_by_default(tmp_path):
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5},
+                     {"delta": 100, "filter": 3, "exposure": 25}]})
+    assert conf.schedule.period == pytest.approx(130.0)
+
+
+def test_a_text_schedule_may_state_its_own_period(tmp_path):
+    """The point of the header: swapping schedules must not mean editing config."""
+    path = tmp_path / "schedule.txt"
+    path.write_text("period = 1440\n"
+                    "# delta(s);filter;exposure(s);binning\n"
+                    "0;1;55;1\n100;3;25;1\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "dead_time": 5.0,
+                                   "schedule_file": str(path)})
+    assert problems(conf) == ""
+    assert conf.schedule.period == pytest.approx(1440.0)
+    assert len(conf.schedule.entries) == 2
+
+
+def test_a_json_schedule_may_state_its_own_period(tmp_path):
+    path = tmp_path / "schedule.json"
+    path.write_text('{"schedule_len": 900, '
+                    '"slots": [{"delta": 0, "filter": 1, "exposure": 5}]}')
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "dead_time": 5.0,
+                                   "schedule_file": str(path)})
+    assert conf.schedule.period == pytest.approx(900.0)
+
+
+def test_the_schedule_file_period_beats_the_one_in_config(tmp_path):
+    path = tmp_path / "schedule.txt"
+    path.write_text("period = 1440\n0;1;55;1\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "schedule_len": 60,
+                                   "schedule_file": str(path)})
+    assert conf.schedule.period == pytest.approx(1440.0)
+
+
+def test_config_may_still_set_the_period_without_a_file():
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "schedule_len": 720,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}]})
+    assert conf.schedule.period == pytest.approx(720.0)
+
+
+@pytest.mark.parametrize("value", ["nonsense", "-30", "0"])
+def test_an_unusable_period_is_reported_and_derived_instead(tmp_path, value):
+    path = tmp_path / "schedule.txt"
+    path.write_text(f"period = {value}\n0;1;5;1\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "dead_time": 5.0,
+                                   "schedule_file": str(path)})
+    assert conf.schedule.period == pytest.approx(10.0)
+    if value != "0":
+        # "0" is indistinguishable from "unset" and passes quietly.
+        assert "period" in problems(conf)
+
+
+def test_an_unknown_header_is_reported_and_the_slots_still_load(tmp_path):
+    path = tmp_path / "schedule.txt"
+    path.write_text("output_dir = /tmp/somewhere\n0;1;5;1\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "schedule_file": str(path)})
+    assert "output_dir" in problems(conf)
+    assert len(conf.schedule.entries) == 1
+
+
+def test_a_text_schedule_may_set_the_mode_below_its_slots(tmp_path):
+    """The mode decides how a slot line is punctuated, so it is read first."""
+    path = tmp_path / "schedule.txt"
+    path.write_text("1,55,0:30\n2,55,15\nmode = sun\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "schedule_file": str(path)})
+    assert conf.schedule.mode == "sun"
+    assert [e.seconds for e in conf.schedule.entries] == [[0, 30], [15]]

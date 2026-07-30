@@ -185,6 +185,15 @@ class CameraService:
         self._focus_deadline = 0.0
         self._focus_errors = 0
         self._focus_disabled_reason = ""
+        # Why the worker is not serving live frames right now, when focus is on
+        # and working — a short exposure gap, a dark run. Distinct from
+        # ``_focus_disabled_reason``, which means focus was switched off.
+        self._focus_note = ""
+
+        # What the camera is observing: mode, cycle period, slots. Published so
+        # an observer can reconstruct the cycles a flat archive was filed under
+        # — nothing records the cycle number in the frames themselves.
+        self._schedule = {}
 
     # ------------------------------------------------------------------
     # Worker side — cheap, non-blocking writes
@@ -211,6 +220,16 @@ class CameraService:
     def set_current_params(self, params):
         with self._lock:
             self._current_params = dict(params)
+
+    def set_schedule(self, schedule):
+        """Publish the observing programme this camera is following.
+
+        Read by ``/api/info`` and by the archive grouping in ``cycles.py``: the
+        cycle a frame belongs to is not recorded anywhere in the frame, so the
+        only way to reconstruct it is the phase reference and period from here.
+        """
+        with self._lock:
+            self._schedule = dict(schedule) if schedule else {}
 
     def take_param_request(self):
         """Pop the pending parameter request, if any.
@@ -268,6 +287,17 @@ class CameraService:
             self._focus_errors = 0
             self._focus_disabled_reason = ""
 
+    def set_focus_note(self, text=""):
+        """Say why no live frame is coming, while focus is on and healthy.
+
+        A refused focus frame used to be silent: focus_app showed a connected
+        stream and a stale picture with nothing to explain it. This is the one
+        line it can show instead. Cheap enough to call on every idle tick.
+        """
+        text = str(text or "")
+        with self._lock:
+            self._focus_note = text
+
     # ------------------------------------------------------------------
     # Network side — never blocks the worker
     # ------------------------------------------------------------------
@@ -324,8 +354,11 @@ class CameraService:
             snap = dict(self._status)
             snap.setdefault("node_name", self.node_name)
             snap["focus_active"] = time.monotonic() < self._focus_deadline
+            # "focus was switched off" outranks "no frame just now".
             if self._focus_disabled_reason:
                 snap["focus_note"] = self._focus_disabled_reason
+            elif self._focus_note:
+                snap["focus_note"] = self._focus_note
             snap["has_frame"] = self._frame is not None
             snap["frame_counter"] = self._frame_counter
             snap["frame_ts"] = (self._frame_ts.isoformat()
@@ -343,6 +376,7 @@ class CameraService:
                 "supports_focus": self.supports_focus,
                 "supports_params": self.supports_params and bool(self._param_schema),
                 "param_schema": list(self._param_schema),
+                "schedule": dict(self._schedule),
             }
 
     def params(self):
