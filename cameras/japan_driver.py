@@ -64,6 +64,7 @@ from utils import (
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
+    publish_schedule_state, serving_focus_hold,
     run_focus_iteration, announce_setup_mode, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
 )
@@ -299,6 +300,9 @@ class JapanWorkerConsole(threading.Thread):
         self._last_frame = None
         self._phase = "starting"
         self._next_slot = None
+        # Set when a focus hold swallowed the slot we were waiting for, so the
+        # mode loops know to plan again instead of shooting a stale target.
+        self._schedule_dirty = False
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
@@ -364,6 +368,7 @@ class JapanWorkerConsole(threading.Thread):
         # The schedule moves the filter, the exposure and the shutter on its
         # own; focus_app only ever sees what is published from here.
         publish_current_params(self._service, self._current_params)
+        publish_schedule_state(self._service, self._measuring_now())
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "japan",
@@ -606,9 +611,23 @@ class JapanWorkerConsole(threading.Thread):
         self._dash_update(next_at=self._next_slot)
         last_status = 0.0
         readings = None
+        # Before the wait, not only inside it: a slot whose moment has already
+        # passed leaves the loop below immediately, and on a tight schedule that
+        # is every slot — a hold checked only in the loop would never be seen.
+        if allow_focus and self._hold_for_focus():
+            self._next_slot = None
+            self._dash_update(next_at=None)
+            return not self._stop_event.is_set()
         while not self._stop_event.is_set():
             remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
+                break
+            # Checked before the tick, not after: a hold serves its own frames
+            # with no slack limit, so letting the tick go first would take one
+            # slack-limited frame — or refuse one — for no reason.
+            if allow_focus and self._hold_for_focus():
+                # The operator took the camera. The slot we were waiting for
+                # is gone; the caller re-reads the schedule.
                 break
             last_status, readings = self._service_tick(
                 remaining, last_status=last_status, readings=readings,
@@ -621,9 +640,75 @@ class JapanWorkerConsole(threading.Thread):
         self._dash_update(next_at=None)
         return not self._stop_event.is_set()
 
+    def _hold_for_focus(self):
+        """Stand down while somebody is focusing. True if a hold happened.
+
+        The same contract as the PIXIS driver's: connecting the focus tool stops
+        the schedule outright rather than squeezing live frames into whatever
+        gap a slot leaves, and the operator agrees to that in focus_app before
+        it happens. A capture already under way is never interrupted — this is
+        only reached between them — and an abandoned session releases the camera
+        when its deadline passes.
+        """
+        if (self.setup_mode or self._service is None
+                or not self._service.focus_hold()):
+            return False
+        self._schedule_dirty = True
+        console_ui.log("Focus session took the camera — scheduled captures are "
+                       "paused until it ends.")
+        self._set_phase("paused for focusing")
+        self._next_slot = None
+        self._dash_update(next_at=None, focus="holding the camera")
+        publish_schedule_state(self._service, False)
+        serving_focus_hold(self._service, True)
+        last_status = 0.0
+        readings = None
+        while not self._stop_event.is_set() and self._service.focus_hold():
+            # ``slack=None``: the schedule is standing down, so there is no slot
+            # for a live frame to be late for. Same servicing step as every
+            # other wait, which is what also opens the shutter for the session.
+            last_status, readings = self._service_tick(
+                None, status=SETUP_STATUS, last_status=last_status,
+                readings=readings)
+            self._stop_event.wait(TICK)
+        # Hand the shutter back before the schedule resumes; the next thing the
+        # programme does may well be a dark.
+        self._focus_close_shutter()
+        serving_focus_hold(self._service, False)
+        self._dash_update(focus="idle")
+        if not self._stop_event.is_set():
+            console_ui.log("Focus session ended — resuming the schedule at the "
+                           "next slot.")
+        return True
+
+    def _take_schedule_dirty(self):
+        """True once after a focus hold, so a mode loop plans its next slot again.
+
+        Reading it clears it: the slot the loop waited for passed while the
+        camera was held, and shooting it now would file a frame under a time
+        that has gone by. Missed slots are not made up.
+        """
+        dirty = self._schedule_dirty
+        self._schedule_dirty = False
+        return dirty
+
     def _wait_seconds(self, seconds, phase=None, allow_focus=True):
         return self._wait_until(dt.now() + timedelta(seconds=seconds), phase,
                                 allow_focus)
+
+    def _measuring_now(self):
+        """Is the observing programme running at this moment?
+
+        What focus_app asks before it connects; see the PIXIS driver for why
+        the waiting phases deliberately do not count.
+        """
+        if self.setup_mode:
+            return False
+        phase = self._phase or ""
+        if phase.startswith("waiting"):
+            return False
+        return phase not in ("starting", "setup", "stopped",
+                             "paused for focusing")
 
     def _set_phase(self, phase, detail=None):
         self._phase = phase
@@ -911,6 +996,8 @@ class JapanWorkerConsole(threading.Thread):
                 target = japan_schedule.next_second_slot(entry.seconds or [0])
                 if not self._wait_until(target, phase="measuring"):
                     return
+                if self._take_schedule_dirty():
+                    break          # the window is re-read from the top
                 if angle_fn(dt.now()) > sched.sun_max_angle:
                     console_ui.log("Window closed while waiting — skipping frame.")
                     continue
@@ -1010,6 +1097,8 @@ class JapanWorkerConsole(threading.Thread):
 
             if not self._wait_until(slot, phase="measuring"):
                 break
+            if self._take_schedule_dirty():
+                continue           # the cycle is re-anchored on the clock
 
             # The camera is the authority on what was actually applied: if
             # ``prepare`` threw halfway through, filing the frame under the

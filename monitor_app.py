@@ -428,7 +428,12 @@ class CameraTile(QFrame):
         notes = []
         if rec.get("setup_mode"):
             notes.append("Setup mode — no schedule, nothing is being archived.")
-        if rec.get("focus_active"):
+        if rec.get("hold_effective"):
+            # Distinguished from an ordinary focus session on purpose: this
+            # camera has stopped measuring, and a monitor that only said
+            # "someone is focusing" would leave that looking like a fault.
+            notes.append("Measurements paused while someone focuses this camera.")
+        elif rec.get("focus_active"):
             notes.append("Someone is focusing this camera.")
         if rec.get("focus_note"):
             notes.append(str(rec["focus_note"]))

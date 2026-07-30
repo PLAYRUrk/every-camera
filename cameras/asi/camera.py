@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import console_ui
+import intensity
 
 from . import picam
 from .picam import PicamParameter as P
@@ -335,7 +336,11 @@ class PixisCamera:
             return None
         # The PICAM buffer is reused by the next acquisition — copy it out now.
         buf = (ctypes.c_ubyte * expected).from_address(address)
-        return np.frombuffer(bytes(buf), dtype="<u2").reshape(h, w).copy()
+        frame = np.frombuffer(bytes(buf), dtype="<u2").reshape(h, w).copy()
+        # A 16-bit readout is what this instrument reports and the shift is a
+        # no-op for it; a shallower one would otherwise reach the autoexposure
+        # loop on a scale where it can never see saturation.
+        return intensity.to_full_scale(frame, self._bit_depth)
 
     # --- identification -----------------------------------------------------
     def info(self) -> dict:

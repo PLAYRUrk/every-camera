@@ -37,7 +37,7 @@ import math
 import re
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Filter positions of this instrument (documented in the station schedule file):
 #   1 = 557.7 nm, 2 = 630.0 nm, 3 = broadband OH, 4 = 840.0 nm,
@@ -414,6 +414,14 @@ def slot_budget(entries, period, entry, dead_time):
     return max(slot_gap(entries, period, entry) - float(readout), 0.0)
 
 
+def _as_utc_time(t_start):
+    """A local time of day as ``"HH:MM:SS"`` UTC, or None."""
+    if t_start is None:
+        return None
+    local = datetime.combine(datetime.now().date(), t_start).astimezone()
+    return local.astimezone(timezone.utc).strftime("%H:%M:%S")
+
+
 def schedule_snapshot(sched):
     """Describe an observing programme for observers, as plain JSON types.
 
@@ -432,6 +440,11 @@ def schedule_snapshot(sched):
     return {
         "mode": getattr(sched, "mode", ""),
         "t_start": t_start.strftime("%H:%M:%S") if t_start else None,
+        # The same instant in UTC. Frame names are UTC on every camera that
+        # writes them, and an observer never learns the station's offset — so
+        # the anchor has to travel in the clock the names are in, and only the
+        # camera can convert it.
+        "t_start_utc": _as_utc_time(t_start),
         "period": float(getattr(sched, "period", 0.0) or 0.0),
         "dead_time": float(getattr(sched, "dead_time", 0.0) or 0.0),
         "entries": [{"filter": e.filter, "delta": e.delta,

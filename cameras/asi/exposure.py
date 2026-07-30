@@ -36,10 +36,13 @@ import math
 
 import numpy as np
 
-# The imager is a true 16-bit instrument: the PICAM backend refuses anything
-# deeper (``camera.py:_configure_static``) and the simulator hands out 16-bit
-# frames, so full scale is a constant rather than something to sniff per frame.
-SATURATION_ADU = 65535.0
+import intensity
+
+# The scale every frame in this program arrives on: the PICAM backend refuses a
+# camera deeper than 16 bits and shifts a shallower one up on the way out
+# (``camera.py``), so full scale is a constant rather than something to sniff
+# per frame.
+SATURATION_ADU = float(intensity.FULL_SCALE)
 
 # A pixel this close to full scale is clipped for our purposes.
 SATURATED_AT = 0.98

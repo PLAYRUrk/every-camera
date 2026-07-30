@@ -138,23 +138,18 @@ class CameraClient:
     def frame_stats(self, name=None):
         return self.get_json("/api/stats", name=name)
 
-    def cycles(self, date=None):
-        """The archive grouped into observing cycles and, inside each, filters."""
-        return self.get_json("/api/cycles", date=date)
+    def composite(self, first, previous, last, window, stretch="minmax",
+                  max_side=None, timeout=60.0):
+        """The difference frame built from three named frames: ``(jpeg, headers)``.
 
-    def composite(self, cycle, filter_num, window=None, stretch="minmax",
-                  max_side=None, date=None, timeout=60.0):
-        """The per-filter difference frame for one cycle: ``(jpeg, headers)``.
-
-        The camera reads the three frames and does the arithmetic; what comes
-        back over the network is one JPEG and the weights it was built with, in
-        ``X-Composite-*`` headers. A frame the camera declines to build — no
-        previous cycle, a cycle still running — arrives as an HTTP 404 whose
-        message is meant to be shown as-is.
+        The caller picks the frames, because the caller holds the grouping they
+        came out of; the camera reads them and does the arithmetic, and what
+        comes back is one JPEG plus the weights it was built with, in
+        ``X-Composite-*`` headers.
         """
         data, headers = self.get_bytes(
-            "/api/composite", timeout=timeout, cycle=cycle, filter=filter_num,
-            window=window, stretch=stretch, max=max_side, date=date)
+            "/api/composite", timeout=timeout, first=first, previous=previous,
+            last=last, window=window, stretch=stretch, max=max_side)
         return data, headers
 
     def latest_jpeg(self, max_side=None, stretch="minmax"):
@@ -171,8 +166,18 @@ class CameraClient:
     def param_result(self, req_id):
         return self.get_json(f"/api/params/{req_id}")
 
-    def keep_focus(self, ttl=60):
-        return self.post_json("/api/focus", {"ttl": ttl})
+    def keep_focus(self, ttl=60, hold=None):
+        """Start or extend a focus session.
+
+        ``hold`` asks the camera to pause its schedule for the session. Left as
+        ``None`` it is not sent at all, which tells the camera to keep whatever
+        hold state it already has — the MJPEG stream renews the session on
+        every frame and must not cancel a hold by doing so.
+        """
+        body = {"ttl": ttl}
+        if hold is not None:
+            body["hold"] = bool(hold)
+        return self.post_json("/api/focus", body)
 
     def stop_focus(self):
         return self.post_json("/api/focus", {"enabled": False})

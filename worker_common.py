@@ -72,6 +72,40 @@ def publish_current_params(service, snapshot):
         console_ui.warn(f"Could not publish current parameters: {exc}")
 
 
+def publish_schedule_state(service, active):
+    """Say whether the camera is inside its measuring cycle right now.
+
+    ``focus_app`` asks for this before it connects: taking a camera that is
+    measuring costs the operator frames and has to be agreed to, while taking
+    an idle one — daytime, outside the schedule's intervals, or a station with
+    no schedule at all — costs nothing and must not nag.
+
+    Drivers call this on the status cadence they already have, so a camera that
+    crosses into its observing window while the tool is open reports it.
+    """
+    if service is None:
+        return
+    try:
+        service.set_schedule_active(active)
+    except Exception:
+        pass
+
+
+def serving_focus_hold(service, held):
+    """Confirm to observers that the worker has paused (or resumed).
+
+    Separate from :func:`publish_schedule_state` because the two answer
+    different questions: that one is "would connecting interrupt anything",
+    this one is "did the interruption actually take effect".
+    """
+    if service is None:
+        return
+    try:
+        service.note_hold_effective(held)
+    except Exception:
+        pass
+
+
 class WorkerMqtt:
     """Status and frame publishing for one camera worker.
 

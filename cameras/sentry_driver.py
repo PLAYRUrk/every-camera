@@ -46,7 +46,7 @@ from utils import (
 )
 from worker_common import (
     WorkerMqtt, announce_setup_mode, SETUP_STATUS,
-    install_stop_handler, stop_signal_name,
+    publish_schedule_state, install_stop_handler, stop_signal_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -251,10 +251,17 @@ class SentryCamera:
             return {}
 
     def get_latest_image(self) -> "np.ndarray | None":
-        """Read aux/image.fits and return as uint16 numpy array, or None."""
+        """Read aux/image.fits on the program's intensity scale, or None.
+
+        The file belongs to imagerd_rt, so its depth is whatever that daemon
+        wrote; reading it through the archive helper applies the header's
+        BZERO/BSCALE and lifts a shallower frame, instead of casting the raw
+        values to uint16 and hoping.
+        """
         try:
-            return np.asarray(frame_archive.read_fits(str(self._image_file)),
-                              dtype=np.uint16)
+            frame, _scale = frame_archive.read_frame_with_scale(
+                str(self._image_file))
+            return frame
         except Exception:
             return None
 
@@ -494,6 +501,11 @@ class SentryWorkerConsole(threading.Thread):
     def _save_status(self, status: str, force: bool = False):
         meta = self.cam.get_metadata()
         seqno = self.cam.get_seqno()
+        # The daemon is the one measuring, so "is the schedule running" is the
+        # same question as "is imagerd_rt alive". Focus cannot pause it either
+        # way; reporting it honestly is what stops focus_app promising it can.
+        publish_schedule_state(self._service,
+                               not self.setup_mode and self.cam.is_running())
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "sentry",
@@ -647,9 +659,12 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
         # imagerd_rt owns exposure/schedule, so no remote parameter editing.
         from camera_service import CameraService
         from frame_server import start_frame_server
+        # Live frames can be streamed, but the measurements cannot be paused
+        # for them: the schedule belongs to imagerd_rt, and stopping that
+        # daemon from here would be reaching into another program's run.
         service = CameraService("sentry", instance_name, output_dir,
-                                supports_params=False, node_name=node_name,
-                                setup_mode=setup_mode)
+                                supports_params=False, supports_hold=False,
+                                node_name=node_name, setup_mode=setup_mode)
         server = start_frame_server(cfg.get("server", {}), service)
         if server:
             dash.update(server_url=server.url)

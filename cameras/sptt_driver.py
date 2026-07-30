@@ -18,6 +18,7 @@ from datetime import datetime as dt
 from pathlib import Path
 
 import frame_archive
+import intensity
 
 from utils import (
     claim_instance_name, get_instance_name, get_local_ip, get_system_info,
@@ -25,6 +26,7 @@ from utils import (
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
+    publish_schedule_state, serving_focus_hold,
     run_focus_iteration, MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode,
     SETUP_STATUS, install_stop_handler, stop_signal_name,
 )
@@ -120,6 +122,12 @@ def read_raw_frame(size, ep_tr):
 
 
 def decode_frame(raw_chunks, w, h, encoding, binning=0):
+    """Unpack one raw USB transfer into a frame on the program's 0..65535 scale.
+
+    The sensor digitises 12 bits (or 8, in the low-bandwidth encoding); this is
+    the one place that knows it, so the shift up to full scale happens here and
+    nothing downstream has to ask how deep a SPTT pixel is.
+    """
     raw = []
     for buf in raw_chunks:
         raw.extend(buf)
@@ -133,14 +141,15 @@ def decode_frame(raw_chunks, w, h, encoding, binning=0):
     else:
         pixels = raw
 
-    dtype = np.uint16 if encoding == ENCODING_12BPP else np.uint8
+    dtype = np.uint16
+    bits = 12 if encoding == ENCODING_12BPP else 8
 
     if binning > 0:
         arr = np.array(pixels[:w * h], dtype=dtype)
         if len(arr) < w * h:
             arr = np.pad(arr, (0, w * h - len(arr)))
-        
-        return arr.reshape(h, w)
+
+        return intensity.to_full_scale(arr.reshape(h, w), bits)
 
     frame = [0] * (w * h)
     for i in range(h):
@@ -152,7 +161,8 @@ def decode_frame(raw_chunks, w, h, encoding, binning=0):
             if idx < len(pixels):
                 frame[dst_off + j] = pixels[idx]
 
-    return np.array(frame, dtype=dtype).reshape(h, w)
+    return intensity.to_full_scale(
+        np.array(frame, dtype=dtype).reshape(h, w), bits)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +469,11 @@ def _save_fits_minimal(filepath, frame, metadata=None):
 
     h, w = frame.shape
     bitpix = 16 if frame.dtype in (np.uint16, np.int16) else 8
+    # FITS has no unsigned 16-bit type: the values go out as signed shorts with
+    # an offset, which is what astropy writes for a uint16 array too. Without
+    # this the frame silently wrapped into negative numbers above 32767 —
+    # harmless while the sensor filled only 12 bits, wrong now that it fills 16.
+    unsigned = bitpix == 16 and frame.dtype == np.uint16
 
     # Build header
     cards = []
@@ -467,6 +482,9 @@ def _save_fits_minimal(filepath, frame, metadata=None):
     cards.append(f"NAXIS   =                    2 / number of axes")
     cards.append(f"NAXIS1  = {w:>20d} / width")
     cards.append(f"NAXIS2  = {h:>20d} / height")
+    if unsigned:
+        cards.append(f"BZERO   = {32768:>20d} / offset for unsigned 16-bit data")
+        cards.append(f"BSCALE  = {1:>20d} / linear scaling factor")
 
     if metadata:
         for key, value in metadata.items():
@@ -493,7 +511,8 @@ def _save_fits_minimal(filepath, frame, metadata=None):
 
     # Write
     if bitpix == 16:
-        data = frame.astype(np.int16).byteswap().tobytes()
+        values = (frame.astype(np.int32) - 32768) if unsigned else frame
+        data = values.astype(">i2").tobytes()
     else:
         data = frame.astype(np.uint8).tobytes()
 
@@ -532,6 +551,9 @@ class SpttWorkerConsole(threading.Thread):
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
+        # Whether the last loop pass ran under a focus hold, so the transitions
+        # in and out of it are logged once rather than ten times a second.
+        self._held = False
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
@@ -669,11 +691,21 @@ class SpttWorkerConsole(threading.Thread):
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
         }
 
+    def _focus_holding(self):
+        """True while a focus session has asked the schedule to stand down."""
+        return self._service is not None and self._service.focus_hold()
+
     def _handle_focus(self, now):
-        """Grab one extra frame for the focus tool, away from capture seconds."""
+        """Grab one extra frame for the focus tool.
+
+        Held sessions get every tick, the same as setup mode: the operator has
+        agreed to interrupt the measurements, so there is no capture second to
+        keep clear any more.
+        """
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds and not self.setup_mode:
+        if (now.second in self.capture_seconds and not self.setup_mode
+                and not self._focus_holding()):
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -718,7 +750,18 @@ class SpttWorkerConsole(threading.Thread):
             now = dt.now()
 
             fire_key = (now.minute, now.second)
-            if self.setup_mode:
+            holding = self._focus_holding()
+            if holding and not self._held:
+                console_ui.log("Focus session took the camera — captures at "
+                               ":00 and :30 are paused until it ends.")
+            elif self._held and not holding:
+                console_ui.log("Focus session ended — captures resume.")
+                last_fired = (-1, -1)   # the second we stopped in is not owed a frame
+            self._held = holding
+            serving_focus_hold(self._service, holding)
+            publish_schedule_state(self._service,
+                                   not self.setup_mode and not holding)
+            if self.setup_mode or holding:
                 # No schedule to honour: focus gets every tick, nothing is saved.
                 self._handle_focus(now)
                 self._save_status(SETUP_STATUS)
@@ -766,6 +809,10 @@ class SpttWorkerConsole(threading.Thread):
                 "GAIN": self.cam.gain,
                 "BINNING": self.cam.binning,
                 "ENCODING": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
+                # ENCODING says how the sensor digitised; this says what scale
+                # the pixels in this file are actually on, which is the same for
+                # every camera in this program.
+                "ADCFULL": intensity.FULL_SCALE,
             }
             if cam_status:
                 metadata["CCDTEMP"] = cam_status.get("temp_ccd", 0)

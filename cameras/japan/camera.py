@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import console_ui
+import intensity
 
 from . import dcamsdk
 from .config import readout_text
@@ -160,7 +161,12 @@ class HamamatsuCamera:
                     break
         finally:
             self._dcam.buf_release()
-        return image
+        if image is None:
+            return None
+        # MONO16 is what this camera is configured for and passes through
+        # untouched; a MONO8 buffer is widened and shifted so the rest of the
+        # program never has to ask which pixel type produced a frame.
+        return intensity.to_full_scale(image, 8 if image.dtype == np.uint8 else 16)
 
     # --- identification -----------------------------------------------------
     def info(self) -> dict:

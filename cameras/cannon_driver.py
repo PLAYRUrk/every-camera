@@ -23,6 +23,7 @@ from utils import (
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
+    publish_schedule_state, serving_focus_hold,
     run_focus_iteration, announce_setup_mode, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
 )
@@ -307,6 +308,9 @@ class CannonWorkerConsole(threading.Thread):
         self._last_shot = None
         self._last_frame_data = None
         self._active_until = None
+        # Whether the last loop pass ran under a focus hold, so entering and
+        # leaving it is logged once instead of twice a second.
+        self._held = False
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
@@ -403,15 +407,22 @@ class CannonWorkerConsole(threading.Thread):
         except Exception:
             return capture_image(self.cam)
 
+    def _focus_holding(self):
+        """True while a focus session has asked the schedule to stand down."""
+        return self._service is not None and self._service.focus_hold()
+
     def _handle_focus(self, now):
         """Serve the focus tool between scheduled shots.
 
-        Scheduled captures always win: this is skipped on the capture seconds
-        themselves, so focusing can never delay a measurement.
+        Scheduled captures win while the session is an ordinary one: this is
+        skipped on the capture seconds themselves. A *held* session is the
+        operator having agreed to interrupt the measurements, and then there is
+        no capture second left to keep clear.
         """
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in self.capture_seconds and not self.setup_mode:
+        if (now.second in self.capture_seconds and not self.setup_mode
+                and not self._focus_holding()):
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -457,8 +468,22 @@ class CannonWorkerConsole(threading.Thread):
                     active_end = entry.end
                     break
 
-            if active_end is None:
-                self._save_status(SETUP_STATUS if self.setup_mode else "waiting")
+            holding = self._focus_holding()
+            if holding and not self._held:
+                console_ui.log("Focus session took the camera — scheduled shots "
+                               "are paused until it ends.")
+            elif self._held and not holding:
+                console_ui.log("Focus session ended — the schedule resumes.")
+                last_fired = (-1, -1)   # the second we stopped in is not owed a frame
+            self._held = holding
+            serving_focus_hold(self._service, holding)
+            publish_schedule_state(
+                self._service,
+                bool(active_end) and not self.setup_mode and not holding)
+
+            if active_end is None or holding:
+                self._save_status(SETUP_STATUS
+                                  if (self.setup_mode or holding) else "waiting")
                 self._handle_focus(now)
                 self._stop_event.wait(0.5)
                 continue

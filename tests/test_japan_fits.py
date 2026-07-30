@@ -1,7 +1,7 @@
 """What a Hamamatsu frame's header says — and, just as much, what it does not.
 
 The Japan writer is built on the same core as the ASI one
-(``cameras/common/fits.py``), which is the point: eighteen cards, one
+(``cameras/common/fits.py``), which is the point: nineteen cards, one
 implementation. The risk that creates is leakage — a PIXIS-only card, or the
 sixteen imagerd_rt legacy records, appearing in a Hamamatsu frame because the
 shared code grew a default. So these tests assert the exact card list, not just
@@ -54,6 +54,7 @@ EXPECTED_CARDS = [
     ("SITELAT", 53.324236, "[deg] observatory latitude"),
     ("SITELON", 107.741264, "[deg] observatory longitude"),
     ("SITEELEV", 515.0, "[m] observatory elevation"),
+    ("ADCFULL", 65535, "[ADU] intensity full scale"),
     ("BSCALE", 1, ""),
     ("BZERO", 32768, ""),
 ]
@@ -88,7 +89,7 @@ def cards_of(header):
 # ---------------------------------------------------------------------------
 # The whole header, card for card
 # ---------------------------------------------------------------------------
-def test_the_header_is_exactly_the_eighteen_shared_cards(tmp_path):
+def test_the_header_is_exactly_the_nineteen_shared_cards(tmp_path):
     actual = cards_of(write_frame(tmp_path / "frame.fits"))
     assert [name for name, _, _ in actual] == \
            [name for name, _, _ in EXPECTED_CARDS]

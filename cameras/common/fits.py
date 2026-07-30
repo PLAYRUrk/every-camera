@@ -26,6 +26,8 @@ import numpy as np
 
 from astropy.io import fits
 
+import intensity
+
 from .timeutil import to_utc
 
 # Written where a program had a reading it could not take. imagerd_rt's value,
@@ -51,6 +53,7 @@ CORE_COMMENTS = {
     "SITELAT": "[deg] observatory latitude",
     "SITELON": "[deg] observatory longitude",
     "SITEELEV": "[m] observatory elevation",
+    "ADCFULL": "[ADU] intensity full scale",
 }
 
 
@@ -114,6 +117,12 @@ def write_core_header(
     h["SITELAT"] = (lat, say["SITELAT"])
     h["SITELON"] = (lon, say["SITELON"])
     h["SITEELEV"] = (elevation, say["SITEELEV"])
+    # The scale the pixel values are on. Written by every camera here, so a
+    # reader never has to guess it from the data — and so a frame captured
+    # before the program standardised on 16 bits stays distinguishable. The
+    # PIXIS's own ``BitDepth`` card says the same thing in imagerd_rt's words
+    # and stays where it is, in the ASI writer.
+    h["ADCFULL"] = (intensity.FULL_SCALE, say["ADCFULL"])
 
 
 def write_image(path: Path, data: np.ndarray | None, header) -> None:
