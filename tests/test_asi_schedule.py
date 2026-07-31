@@ -301,6 +301,63 @@ def test_slot_binning_defaults_to_the_camera_binning():
 
 
 # ---------------------------------------------------------------------------
+# Which occurrence of t_start a run is anchored to
+# ---------------------------------------------------------------------------
+def test_starting_in_the_evening_anchors_to_tonight():
+    """The ordinary case: up before the programme begins, so it is still ahead."""
+    anchor = sched.cycle_anchor(time(20, 0), datetime(2026, 7, 30, 19, 0))
+    assert anchor == datetime(2026, 7, 30, 20, 0)
+
+
+def test_starting_after_t_start_anchors_to_tonight_too():
+    anchor = sched.cycle_anchor(time(20, 0), datetime(2026, 7, 30, 23, 30))
+    assert anchor == datetime(2026, 7, 30, 20, 0)
+
+
+def test_restarting_after_midnight_anchors_to_last_evening():
+    """The bug this exists for: a 00:30 restart is late in *that* night, not early.
+
+    Combining t_start with today's date put the anchor 21.5 h in the future, so
+    the driver believed it had started early — it shot the opening darks it
+    should have skipped, and on a period that does not divide into a day it put
+    every slot of the night on the wrong phase.
+    """
+    anchor = sched.cycle_anchor(time(22, 0), datetime(2026, 7, 31, 0, 30))
+    assert anchor == datetime(2026, 7, 30, 22, 0)
+    assert datetime(2026, 7, 31, 0, 30) >= anchor, "the run must count as late"
+
+
+def test_the_far_side_of_the_day_rolls_forward():
+    """A morning programme restarted late the evening before is the mirror case."""
+    anchor = sched.cycle_anchor(time(6, 0), datetime(2026, 7, 30, 23, 30))
+    assert anchor == datetime(2026, 7, 31, 6, 0)
+
+
+@pytest.mark.parametrize("hour", range(0, 24))
+def test_the_anchor_is_never_more_than_twelve_hours_away(hour):
+    now = datetime(2026, 7, 30, hour, 17, 3)
+    anchor = sched.cycle_anchor(time(22, 0), now)
+    assert abs((anchor - now).total_seconds()) <= 12 * 3600
+    assert anchor.time() == time(22, 0)
+
+
+def test_a_days_worth_of_periods_keeps_the_same_slots():
+    """Rolling the anchor by a day must not move the slots it generates.
+
+    True whenever the period divides into 24 h, which the station's schedules do
+    — that is why this was survivable rather than obvious.
+    """
+    entries, _errors, _ov = sched.parse_schedule_text("0;1;55;1\n720;2;55;1\n",
+                                                      "time")
+    now = datetime(2026, 7, 31, 0, 30)
+    tonight = datetime(2026, 7, 31, 22, 0)
+    last_night = datetime(2026, 7, 30, 22, 0)
+    a_slot, a_entry, _a = sched.next_cycle_slot(tonight, 1440.0, entries, now)
+    b_slot, b_entry, _b = sched.next_cycle_slot(last_night, 1440.0, entries, now)
+    assert a_slot == b_slot and a_entry.filter == b_entry.filter
+
+
+# ---------------------------------------------------------------------------
 # sun_cycle: the cycle imagerd_rt started by the sun rather than by the clock
 # ---------------------------------------------------------------------------
 def test_sun_cycle_slots_parse_like_time_slots():

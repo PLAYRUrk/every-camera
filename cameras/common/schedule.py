@@ -475,6 +475,32 @@ def next_cycle_slot(t_start, period, entries, now):
     return base + timedelta(seconds=ordered[0].delta or 0.0), ordered[0], k + 1
 
 
+def cycle_anchor(t_start, now):
+    """The occurrence of ``t_start`` that belongs to the night ``now`` is in.
+
+    ``t_start`` is a time of day, so it happens once every 24 h and something has
+    to choose which one. Combining it with today's date — what both drivers used
+    to do — is right for the ordinary case of starting up in the evening before
+    the programme begins, and wrong for a restart after midnight: a station
+    coming back at 00:30 under ``t_start = 22:00`` would read the anchor as
+    22:00 *tonight*, twenty-one and a half hours away. It would then believe it
+    had started early, shoot the opening darks it should have skipped, and — on
+    any period that does not divide into a day — put every slot of the night on
+    the wrong phase.
+
+    So the anchor is simply the nearest occurrence, in either direction: within
+    twelve hours ahead it is tonight's, beyond that it was last night's. Both
+    readings describe the same repeating cycle; this one picks the night the
+    operator is actually standing in.
+    """
+    anchor = datetime.combine(now.date(), t_start)
+    if anchor - now > timedelta(hours=12):
+        return anchor - timedelta(days=1)
+    if now - anchor > timedelta(hours=12):
+        return anchor + timedelta(days=1)
+    return anchor
+
+
 def next_second_slot(seconds, now=None):
     """Next datetime matching any of ``seconds`` within this or the next minute."""
     now = now or datetime.now()

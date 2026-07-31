@@ -1216,7 +1216,9 @@ class AsiWorkerConsole(threading.Thread):
     def _run_time_mode(self):
         sched = self.cfg.schedule
         started = dt.now()
-        t_start = dt.combine(started.date(), sched.t_start)
+        # The occurrence of t_start belonging to the night we are in, which past
+        # midnight is yesterday's — see asi_schedule.cycle_anchor.
+        t_start = asi_schedule.cycle_anchor(sched.t_start, started)
         period = sched.period
         late = started >= t_start
         self._dash_update(schedule=f"cycle {period:.0f} s from "

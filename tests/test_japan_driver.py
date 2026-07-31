@@ -241,21 +241,17 @@ def test_the_published_params_match_the_focus_app_schema(worker):
 # ---------------------------------------------------------------------------
 # Time mode
 # ---------------------------------------------------------------------------
-def earlier_today(hours=2):
-    """A ``HH:MM:SS`` that really is in the past *today*.
+def hours_ago(hours=2):
+    """A ``t_start`` of ``hours`` ago, as the config spells it: ``HH:MM:SS``.
 
-    ``dt.now() - 2h`` crosses midnight in the small hours, and ``%H:%M:%S`` then
-    throws the date away: the driver combines ``t_start`` with *today's* date
-    (``_run_time_mode``), so last night's 22:27 comes back as tonight's, the run
-    is no longer late, and the opening darks these tests forbid are shot after
-    all. Clamped to the start of the day, so a test means the same thing at
-    00:30 as it does at noon.
+    ``%H:%M:%S`` throws the date away, so in the small hours this is last
+    night's time — which is exactly the case ``schedule.cycle_anchor`` exists
+    for, and running these tests at 00:30 is what caught its absence. Keep it
+    relative rather than clamping it to today: as written, the suite means the
+    same thing at every hour *and* covers the midnight roll-over when it happens
+    to run there.
     """
-    moment = dt.now()
-    past = moment - timedelta(hours=hours)
-    if past.date() != moment.date():
-        past = moment.replace(hour=0, minute=0, second=0, microsecond=0)
-    return past.strftime("%H:%M:%S")
+    return (dt.now() - timedelta(hours=hours)).strftime("%H:%M:%S")
 
 
 def time_config(tmp_path, t_start, **overrides):
@@ -270,7 +266,7 @@ def time_config(tmp_path, t_start, **overrides):
 
 def test_a_late_start_skips_the_opening_darks(tmp_path):
     """Started after T_start there is no time for them; only the closing ones run."""
-    past = earlier_today()
+    past = hours_ago()
     worker = make_worker(tmp_path, time_config(tmp_path, past))
     run_time(worker, seconds=2.0)
     assert darks(tmp_path) == []
@@ -308,7 +304,7 @@ def test_the_slots_are_phase_locked_to_t_start(tmp_path):
 
 
 def test_the_closing_darks_always_run(tmp_path):
-    past = earlier_today()
+    past = hours_ago()
     conf = time_config(tmp_path, past)
     worker = make_worker(tmp_path, conf)
     run_time(worker, seconds=1.5)
@@ -319,7 +315,7 @@ def test_the_closing_darks_always_run(tmp_path):
 
 
 def test_a_time_frames_header_says_time(tmp_path):
-    past = earlier_today()
+    past = hours_ago()
     worker = make_worker(tmp_path, time_config(tmp_path, past))
     run_time(worker, seconds=2.0)
     names = lights(tmp_path)
