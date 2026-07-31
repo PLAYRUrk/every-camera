@@ -818,9 +818,15 @@ class JapanWorkerConsole(threading.Thread):
         else:
             self._shots += 1
         if self._service is not None:
+            # ``path`` so the frame server can read this frame's own FITS header
+            # back off the disk it was just written to: the observer's info panel
+            # is otherwise empty for a live frame, there being no header here to
+            # publish and no cheap way to build one.
             self._service.publish_frame(image, now, {"image_type": image_type,
                                                      "filter": self.cam.current_filter,
-                                                     "exposure": exposure})
+                                                     "exposure": exposure,
+                                                     "name": name,
+                                                     "path": str(path)})
         self._dash_update(frames=self._shots, darks=self._darks,
                           last_file=name, errors=self._errors)
         console_ui.log(f"Saved {name}")

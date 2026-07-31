@@ -455,6 +455,39 @@ class _Handler(BaseHTTPRequestHandler):
                 self.thumb_cache.put(key, cached)
         self._send(200, cached, "image/jpeg")
 
+    def _merge_written_header(self, meta):
+        """Fill a live frame's metadata from the file the driver just wrote.
+
+        The camera publishes the newest frame as pixels and three or four facts
+        about it; the FITS header an observer actually reads — exposure, filter,
+        temperature, the instrument's own record of itself — exists only in the
+        file. The driver hands over that file's path, so the live frame can be
+        described out of exactly the same function the archive is described with,
+        and the info panel stops going blank the moment "Follow live" is ticked.
+
+        The path comes from this program's own driver, never from the request, so
+        it needs no traversal check — only the ordinary "is it still there".
+        ``resolve_frame_path`` would refuse it anyway: the ASI archive is a date
+        tree and that function takes plain names. The path is dropped afterwards
+        because it is a fact about this machine's disk, not about the frame.
+        """
+        path = meta.pop("path", None)
+        if not path:
+            return
+        base = self.service.output_dir
+        try:
+            if not base or os.path.commonpath(
+                    [os.path.realpath(base), os.path.realpath(path)]) \
+                    != os.path.realpath(base):
+                return
+            written = frame_archive.frame_metadata(path)
+        except (OSError, ValueError):
+            return
+        # The live facts win: they describe the frame in hand, and the file is
+        # only being consulted for what the frame itself cannot say.
+        for key, value in written.items():
+            meta.setdefault(key, value)
+
     def _get_stats(self):
         query = self._query()
         name = self._arg(query, "name")
@@ -489,6 +522,7 @@ class _Handler(BaseHTTPRequestHandler):
                 frame = intensity.rescale_to_full(frame, 255)
             meta = dict(meta or {})
             meta["timestamp"] = ts.isoformat() if ts else None
+            self._merge_written_header(meta)
         counts, edges = frame_archive.histogram(frame, full_scale=full_scale)
         self._send_json({
             "name": name,

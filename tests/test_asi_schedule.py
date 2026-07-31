@@ -550,3 +550,46 @@ def test_a_station_may_replace_the_filter_table():
     })
     assert conf.filter_info(1).wavelength == "4278"
     assert conf.filter_info(2).wavelength == ""
+
+
+# ---------------------------------------------------------------------------
+# A stated period against the slots that describe it
+# ---------------------------------------------------------------------------
+def test_a_stated_period_far_longer_than_the_slots_is_reported():
+    """The hole that makes a phase-locked run look like a hung one.
+
+    A cycle stated at twice what its slots close at has no slot in its second
+    half, so ``next_cycle_slot`` steps past the whole of it to the first slot of
+    the following cycle. Start such a run less than one stated period before
+    ``t_start`` and that slot *is* ``t_start``: the camera waits, correctly, and
+    looks broken.
+    """
+    entries = [entry(delta) for delta in range(0, 661, 60)]
+    said = sched.period_mismatch("time", entries, 1440, dead_time=5.0, what="asi")
+    assert "1440" in said and "690" in said
+
+
+def test_slots_that_overrun_the_stated_period_are_reported():
+    entries = [entry(0), entry(600)]
+    said = sched.period_mismatch("time", entries, 300, dead_time=5.0, what="asi")
+    assert "overruns" in said
+
+
+def test_a_tail_no_longer_than_the_gaps_inside_the_cycle_passes():
+    entries = [entry(delta) for delta in range(0, 661, 60)]
+    assert sched.period_mismatch("time", entries, 700, dead_time=5.0) == ""
+
+
+def test_a_sun_schedule_has_no_cycle_to_disagree_about():
+    entries = [sched.Entry(filter=1, exposure=30.0, seconds=[0])]
+    assert sched.period_mismatch("sun", entries, 1440, dead_time=5.0) == ""
+
+
+def test_the_check_reaches_asi_config():
+    conf = asi_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 1440,
+        "schedule": [{"delta": d, "filter": 1, "exposure": 25}
+                     for d in range(0, 661, 60)]})
+    assert any("period" in problem for problem in conf.errors)
+    assert conf.schedule.period == pytest.approx(1440.0)

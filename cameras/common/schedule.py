@@ -384,6 +384,59 @@ def cycle_period(entries, dead_time):
     return (last.delta or 0.0) + last.exposure + readout
 
 
+def period_mismatch(mode, entries, schedule_len, dead_time, what="the schedule"):
+    """Say it when a stated cycle period disagrees with the slots it describes.
+
+    Returns the sentence to warn with, or ``""`` when there is nothing to say.
+
+    A period is stated in one place (``period = 1440`` in the schedule file, or
+    ``schedule_len`` in config.json) and described in another — the slots — and
+    nothing used to compare the two. It should: a station that set the period to
+    twice what its slots close at spent the second half of every cycle with no
+    slot in it, and the driver's answer to "when is the next frame" was then the
+    first slot of the *following* cycle. Started less than one such period before
+    ``t_start``, that answer is ``t_start`` itself, so the camera sits doing
+    nothing until the appointed hour. The arithmetic was right and the number was
+    wrong, and from the outside there was no way to tell which.
+
+    Not every difference is worth a word. A cycle may close a little after its
+    last slot, and a programme of one frame per cycle is nothing but tail. What
+    marks the mistake is a gap at the end of the cycle longer than any gap
+    *inside* it: room for another slot, and no slot in it. Below that the tail is
+    ordinary and this keeps quiet.
+
+    The period is never corrected here, only reported. Which of the two numbers
+    is the wrong one is the operator's to say.
+    """
+    if mode not in CYCLE_MODES or not entries or not schedule_len:
+        return ""
+    stated = float(schedule_len)
+    derived = cycle_period(entries, dead_time)
+
+    last = max(entries, key=lambda e: e.delta or 0.0)
+    own = last.readout is not None
+    readout = last.readout if own else dead_time
+    how = (f"Δ{last.delta or 0.0:g} + {last.exposure:g} s exposure + "
+           f"{readout:g} s {'readout' if own else 'dead time'}")
+
+    if stated < derived - 1.0:
+        return (f"{what}: period = {stated:g} s, but the slots need {derived:g} s "
+                f"({how}). The last slot overruns the cycle by "
+                f"{derived - stated:g} s.")
+
+    deltas = sorted(float(e.delta or 0.0) for e in entries)
+    if len(deltas) < 2:
+        return ""
+    widest = max(b - a for a, b in zip(deltas, deltas[1:]))
+    tail = stated - derived
+    if tail <= widest:
+        return ""
+    return (f"{what}: period = {stated:g} s, but the slots close the cycle at "
+            f"{derived:g} s ({how}). The last {tail:g} s of every cycle hold no "
+            f"slot, though its slots are never more than {widest:g} s apart — "
+            f"one of the two numbers is not what was meant.")
+
+
 def slot_gap(entries, period, entry):
     """Seconds from this slot to the next one in the cycle, wrapping at the end.
 

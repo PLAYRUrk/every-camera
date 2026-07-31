@@ -334,13 +334,19 @@ def from_dict(asi_cfg):
                               f"{schedule_len}; deriving it from the slots instead")
                 schedule_len = None
 
+    dead_time = _float(settings, "dead_time", 5.0)
+    disagreement = schedule_mod.period_mismatch(
+        mode, entries, schedule_len, dead_time, what="asi")
+    if disagreement:
+        errors.append(disagreement)
+
     sched = ScheduleCfg(
         mode=mode,
         sun_max_angle=_float(settings, "sun_max_angle", -10.0),
         t_start=t_start,
         entries=entries,
         dark_frames=_int(settings, "dark_frames", 3),
-        dead_time=_float(settings, "dead_time", 5.0),
+        dead_time=dead_time,
         schedule_len=schedule_len,
     )
 

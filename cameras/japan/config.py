@@ -237,13 +237,19 @@ def from_dict(japan_cfg):
                               f"{schedule_len}; deriving it from the slots instead")
                 schedule_len = None
 
+    dead_time = cfgparse.as_float(settings, "dead_time", 5.0)
+    disagreement = schedule_mod.period_mismatch(
+        mode, entries, schedule_len, dead_time, what="japan")
+    if disagreement:
+        errors.append(disagreement)
+
     sched = ScheduleCfg(
         mode=mode,
         sun_max_angle=cfgparse.as_float(settings, "sun_max_angle", -10.0),
         t_start=t_start,
         entries=entries,
         dark_frames=cfgparse.as_int(settings, "dark_frames", 3),
-        dead_time=cfgparse.as_float(settings, "dead_time", 5.0),
+        dead_time=dead_time,
         schedule_len=schedule_len,
     )
     if sched.dark_frames < 0:

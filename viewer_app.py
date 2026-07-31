@@ -60,9 +60,16 @@ import cycles as composite
 # is what the difference frame is asked for. Frame rows use ``Qt.UserRole`` for
 # their name, and the two must not collide.
 FILTER_ROLE = Qt.UserRole + 1
+# Role carrying a group row's identity across a rebuild, so that a tree redrawn
+# under the observer keeps the nights and cycles they had opened. Row text will
+# not do: it carries a frame count, which is exactly what changes.
+GROUP_ROLE = Qt.UserRole + 2
 
 DEFAULT_HTTP_PORT = 8765
 AUTO_REFRESH_MS = 3000
+# How often the archive is asked whether it has grown. The question is one
+# listing row, not the whole archive — see ``LanPanel._poll_archive``.
+LIST_REFRESH_MS = 5000
 # One request has to cover every day the tree shows, or whole days below the cut
 # would simply be missing from it rather than merely truncated. The listing is
 # three small fields per frame, so this stays a modest response.
@@ -76,34 +83,9 @@ STRETCH_MODES = [
     ("raw", "Raw (no stretch)"),
 ]
 
-# What a frame was taken under, in the order an observer asks about it, with
-# every spelling the cameras actually use.
-#
-# The spellings are not tidy and cannot be made so: the shared writer records
-# ``CCD-TEMP`` (cameras/common/fits.py), the SPTT driver writes ``CCDTEMP``, and
-# the PIXIS carries imagerd_rt's ``CCDTemp`` besides — which astropy hands back
-# upper-cased, so a viewer that looks for one name finds nothing on two of the
-# three cameras. Hence aliases, and hence a summary built by meaning rather than
-# by key.
-#
-# ``(label, keys, unit)``. The first key present wins.
-SUMMARY_KEYS = [
-    ("exposure", ("EXPTIME",), " s"),
-    ("exposure", ("EXPTUS",), " µs"),
-    ("filter", ("FILTER", "FILTERWAVELENGTH"), ""),
-    ("gain", ("GAIN", "CCDGAIN"), ""),
-    ("binning", ("BINNING",), ""),
-    ("readout", ("READSPD",), ""),
-    ("CCD", ("CCD-TEMP", "CCDTEMP"), " °C"),
-    ("setpoint", ("SETTEMP",), " °C"),
-    ("type", ("IMAGETYP",), ""),
-    ("mode", ("OBSMODE",), ""),
-    ("ROI", ("ROI",), ""),
-    ("stack", ("STACK_N",), ""),
-    ("sub-frame", ("SPLITIDX",), ""),
-    ("of", ("SPLITNUM",), ""),
-    ("seq", ("SEQNO",), ""),
-]
+# Metadata keys the panel has already spoken for by the time it falls back to
+# listing whatever else the camera published.
+META_SHOWN = {"fits_header", "size", "mtime", "timestamp", "name", "path"}
 
 # Shown first in the details table; everything else follows in the order the
 # header has it, which is the order the writers put it in.
@@ -358,11 +340,14 @@ class HistogramPlot(QWidget):
 
 
 class FrameInfoPanel(QWidget):
-    """Everything the frame's header says, next to the frame itself.
+    """Everything known about the frame, next to the frame itself.
 
-    The summary under the picture holds the half-dozen numbers an observer
-    checks constantly; this holds the rest, because "the rest" differs per
-    camera and per mode and there is no shortlist that suits them all.
+    There used to be a second description as well, two lines of small type under
+    the picture. It was a shortlist of the same header this table already spells
+    out in full, at a size that had to be leaned in to read, and the one thing in
+    it that was *not* a duplicate — what the pixels actually measure — now leads
+    the table instead. One place to look is the whole point: a viewer that says a
+    frame's exposure twice invites the question of which one is current.
     """
 
     def __init__(self, parent=None):
@@ -386,9 +371,9 @@ class FrameInfoPanel(QWidget):
         self.histogram = HistogramPlot()
         layout.addWidget(self.histogram)
 
-    def show_payload(self, payload):
+    def show_payload(self, payload, name=None):
         header = (payload.get("metadata") or {}).get("fits_header") or {}
-        rows = self._rows(header, payload)
+        rows = self._rows(header, payload, name)
         self.table.setRowCount(len(rows))
         for row, (key, value) in enumerate(rows):
             self.table.setItem(row, 0, QTableWidgetItem(key))
@@ -401,19 +386,33 @@ class FrameInfoPanel(QWidget):
         self.table.setRowCount(0)
         self.histogram.clear()
 
-    def _rows(self, header, payload):
-        """Header cards in a useful order, with the file's own facts first.
+    def _rows(self, header, payload, name=None):
+        """Which frame, what its pixels measure, then everything its header says.
 
-        A Canon frame is a JPEG and has no header at all; it still gets the
-        sharpness and file rows rather than an empty box.
+        That order is the order the questions come in. Which frame am I looking
+        at and when was it taken; is it exposed sensibly or has it saturated;
+        and only then the four dozen cards describing the instrument.
+
+        A Canon frame is a JPEG and has no header at all, and a camera in setup
+        mode writes no file to read one from; both still get the file, pixel and
+        published-fact rows rather than an empty box.
         """
-        rows = []
         meta = payload.get("metadata") or {}
+        # ``metadata.name`` is the live frame's own file, published by the driver
+        # that wrote it — which is how a followed frame gets named at all.
+        rows = [("Frame", payload.get("name") or name or meta.get("name")
+                 or "latest frame")]
+
+        upper = {k.upper(): v for k, v in header.items()}
+        when = upper.get("DATE-OBS") or meta.get("timestamp")
+        if when:
+            rows.append(("Taken", str(when)))
         if meta.get("size"):
             rows.append(("File size", f"{meta['size'] / 1024:.0f} KB"))
         if meta.get("mtime"):
             rows.append(("Written",
                          dt.fromtimestamp(meta["mtime"]).strftime("%Y-%m-%d %H:%M:%S")))
+        rows.extend(self._measured(payload))
         sharp = payload.get("sharpness")
         if sharp:
             rows.append(("Sharpness", f"{float(sharp):,.0f}"))
@@ -426,6 +425,34 @@ class FrameInfoPanel(QWidget):
                 rows.append((entry[0], str(entry[1])))
         for key, value in remaining.values():
             rows.append((key, str(value)))
+
+        if not header:
+            # No file to read a header from — say what the camera did publish
+            # rather than leaving the panel to describe a frame in three rows.
+            for key, value in meta.items():
+                if key not in META_SHOWN and value not in (None, ""):
+                    rows.append((str(key), str(value)))
+        return rows
+
+    @staticmethod
+    def _measured(payload):
+        """What the pixels actually are. The one thing no header records."""
+        stats = payload.get("stats") or {}
+        if not stats:
+            return []
+        rows = []
+        shape = "×".join(str(x) for x in stats.get("shape", []))
+        if shape:
+            rows.append(("Size", f"{shape} px"))
+        if stats.get("dtype"):
+            rows.append(("Data type", str(stats["dtype"])))
+        if stats.get("min") is not None:
+            rows.append(("Min / max / mean",
+                         f"{stats['min']:.0f} / {stats['max']:.0f} / "
+                         f"{stats.get('mean')}"))
+        if stats.get("saturated_pct") is not None:
+            rows.append(("Saturated", f"{stats['saturated_pct']} %"))
+        rows.append(("Scale", f"0–{int(full_scale_of(payload))}"))
         return rows
 
 
@@ -433,29 +460,6 @@ def full_scale_of(payload):
     """The intensity range this frame's numbers are on."""
     stats = payload.get("stats") or {}
     return payload.get("full_scale") or stats.get("full_scale") or 65535
-
-
-def summarise(payload, header):
-    """The two lines under the picture: conditions, then what was recorded."""
-    upper = {k.upper(): v for k, v in (header or {}).items()}
-    conditions = []
-    for label, keys, unit in SUMMARY_KEYS:
-        for key in keys:
-            if key in upper:
-                conditions.append(f"{label} {upper[key]}{unit}")
-                break
-
-    stats = payload.get("stats") or {}
-    measured = []
-    if stats:
-        shape = "×".join(str(x) for x in stats.get("shape", []))
-        measured.append(f"{shape} {stats.get('dtype', '')}".strip())
-        measured.append(f"min {stats.get('min'):.0f} "
-                        f"max {stats.get('max'):.0f} "
-                        f"mean {stats.get('mean')}")
-        measured.append(f"saturated {stats.get('saturated_pct')} %")
-        measured.append(f"scale 0–{int(full_scale_of(payload))}")
-    return conditions, measured
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +493,18 @@ class LanPanel(QWidget):
         self._auto_timer = QTimer(self)
         self._auto_timer.setInterval(AUTO_REFRESH_MS)
         self._auto_timer.timeout.connect(self._refresh_latest)
+
+        # The archive grows while it is being read. ``(total, newest name)`` of
+        # the last listing drawn; the poll below compares against it.
+        self._archive_signature = None
+        self._poll_in_flight = False
+        self._poll_failed = False
+        # Whether this camera's archive has been drawn once. The first drawing
+        # opens the newest frame; later ones leave the observer's choices alone.
+        self._drawn = False
+        self._list_timer = QTimer(self)
+        self._list_timer.setInterval(LIST_REFRESH_MS)
+        self._list_timer.timeout.connect(self._poll_archive)
 
     # -- UI ------------------------------------------------------------
     def _build_ui(self):
@@ -547,6 +563,10 @@ class LanPanel(QWidget):
         self.cmb_date.currentIndexChanged.connect(self._reload_frames)
         row.addWidget(self.cmb_date, 1)
         btn_reload = QPushButton("Reload")
+        btn_reload.setToolTip(
+            "Re-read the archive now. New frames arrive on their own every few "
+            "seconds; this is for when the camera's directory changed some other "
+            "way, such as files removed by hand.")
         btn_reload.clicked.connect(self._reload_all)
         row.addWidget(btn_reload)
         arch_lay.addLayout(row)
@@ -616,11 +636,6 @@ class LanPanel(QWidget):
 
         self.view = ImageView()
         right_lay.addWidget(self.view, 1)
-
-        self.lbl_info = QLabel("—")
-        self.lbl_info.setStyleSheet("font-size:11px;")
-        self.lbl_info.setWordWrap(True)
-        right_lay.addWidget(self.lbl_info)
         splitter.addWidget(right)
 
         self.details = FrameInfoPanel()
@@ -739,7 +754,10 @@ class LanPanel(QWidget):
                 f"This camera is in {self._mode} mode right now — cycles only "
                 "describe frames taken in time mode.")
         # Everything needed is already in hand; regrouping is not a new request.
-        self._rebuild_tree()
+        # It is, though, a different tree: the observer asked to be shown the
+        # archive another way, so it opens the way a first drawing does rather
+        # than restoring what was open in the shape they just left.
+        self._rebuild_tree(preserve=False)
 
     def _cycle_grouping_on(self):
         return (self._camera_type == CYCLE_CAMERA_TYPE
@@ -849,6 +867,12 @@ class LanPanel(QWidget):
         self._camera_type = None
         self._mode = None
         self.cycle_box.setVisible(False)
+        # The poll belongs to the camera it was started for: left running, it
+        # would compare the next camera's archive against this one's listing.
+        self._list_timer.stop()
+        self._archive_signature = None
+        self._poll_failed = False
+        self._drawn = False
         # The previous camera's frame is still on screen for a moment; its
         # header must not be, or the two read as one frame.
         self._clear_stats()
@@ -881,6 +905,10 @@ class LanPanel(QWidget):
             client = self._client
             self._tasks.run(client.status, self._on_status, lambda msg: None)
         self._reload_all()
+        # A camera with no archive has nothing to poll; one that has grows under
+        # the observer, and until now said so only when asked.
+        if info.get("archive_available"):
+            self._list_timer.start()
 
     def _on_status(self, status):
         self._mode = (status or {}).get("mode")
@@ -918,7 +946,53 @@ class LanPanel(QWidget):
     def _on_frames(self, listing):
         self._frames = listing.get("frames", [])
         self._total = listing.get("total", len(self._frames))
+        self._archive_signature = self._signature_of(listing)
         self._rebuild_tree()
+
+    @staticmethod
+    def _signature_of(listing):
+        """What makes this listing different from the last one.
+
+        The total alone would miss a night trimmed and reshot to the same count;
+        the newest name alone would miss frames removed from behind it.
+        """
+        frames = listing.get("frames") or []
+        return (listing.get("total", len(frames)),
+                frames[0]["name"] if frames else None)
+
+    def _poll_archive(self):
+        """Ask whether the archive has changed, and reload it only if it has.
+
+        The observer watches a camera that is still shooting, so the tree has to
+        keep up on its own — but a full listing is every frame of every night and
+        a rebuilt tree throws away the scroll position and everything opened.
+        Hence the question is asked with ``limit=1``, which is the same ``total``
+        and the same newest frame in three fields, and the full reload happens
+        only on a real difference.
+        """
+        if not self._client or self._poll_in_flight:
+            return
+        client = self._client
+        date = self.cmb_date.currentData()
+        self._poll_in_flight = True
+
+        def _done(listing):
+            self._poll_in_flight = False
+            if self._poll_failed:
+                self._poll_failed = False
+                self.status.emit("Archive reachable again.")
+            if self._signature_of(listing) != self._archive_signature:
+                self._reload_all()
+
+        def _failed(message):
+            self._poll_in_flight = False
+            # Once per outage, not once every five seconds: a camera rebooting
+            # would otherwise scroll everything else out of the status bar.
+            if not self._poll_failed:
+                self._poll_failed = True
+                self.status.emit(f"Archive not answering: {message}")
+
+        self._tasks.run(lambda: client.frames(date=date, limit=1), _done, _failed)
 
     # -- the tree ------------------------------------------------------
     def _frame_item(self, frame):
@@ -938,22 +1012,36 @@ class LanPanel(QWidget):
         return item
 
     @staticmethod
-    def _group_item(parent, text):
+    def _group_item(parent, text, key=None):
         item = QTreeWidgetItem(parent, [text])
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
+        if key is not None:
+            item.setData(0, GROUP_ROLE, key)
         return item
 
-    def _rebuild_tree(self):
-        """Redraw the tree from ``self._frames``. Never touches the network."""
+    def _rebuild_tree(self, preserve=True):
+        """Redraw the tree from ``self._frames``. Never touches the network.
+
+        The archive now reloads on its own every few seconds, so this runs while
+        somebody is reading the tree rather than only when they asked for it.
+        Everything they arranged has to survive it: which nights and cycles are
+        open, where the list is scrolled to, and which frame is selected.
+
+        ``preserve=False`` is for a regrouping, where the tree the observer
+        arranged no longer exists to be put back.
+        """
         previous = self._current_name
+        opened = self._expanded_keys() if preserve else set()
+        scrolled = self.tree.verticalScrollBar().value()
+
         self.tree.blockSignals(True)
         self.tree.clear()
         if self._cycle_grouping_on():
-            note = self._fill_cycle_tree()
+            note = self._fill_cycle_tree(opened)
         else:
-            note = self._fill_session_tree()
+            note = self._fill_session_tree(opened)
         self.tree.blockSignals(False)
 
         self.lbl_count.setText(" · ".join(self._count_parts(note)))
@@ -961,7 +1049,34 @@ class LanPanel(QWidget):
             self.view.show_message("No frames in this archive")
             self.btn_save.setEnabled(False)
             return
-        self._restore_selection(previous)
+        # Opening the newest frame is a first drawing's courtesy, not something
+        # to repeat over an observer who has since chosen otherwise — including
+        # choosing the live view, which holds no selection at all.
+        self._restore_selection(previous, default=not preserve or not self._drawn)
+        self._drawn = True
+        if opened:
+            self._restore_expanded(opened)
+            self.tree.verticalScrollBar().setValue(scrolled)
+
+    def _walk(self):
+        """Every item in the tree, parents before children."""
+        stack = [self.tree.topLevelItem(i)
+                 for i in range(self.tree.topLevelItemCount() - 1, -1, -1)]
+        while stack:
+            item = stack.pop()
+            yield item
+            for index in range(item.childCount() - 1, -1, -1):
+                stack.append(item.child(index))
+
+    def _expanded_keys(self):
+        return {item.data(0, GROUP_ROLE) for item in self._walk()
+                if item.isExpanded() and item.data(0, GROUP_ROLE) is not None}
+
+    def _restore_expanded(self, opened):
+        for item in self._walk():
+            key = item.data(0, GROUP_ROLE)
+            if key is not None and key in opened:
+                item.setExpanded(True)
 
     def _session_item(self, session):
         """One top-level row: a measuring session, which is a night, not a date.
@@ -969,12 +1084,17 @@ class LanPanel(QWidget):
         A run that starts in the evening and ends after midnight carries two dates
         and is still one row — ``group_by_session`` cuts on the quiet between
         nights, so its beginning and its end never land in different lists.
+
+        Its identity across a rebuild is where the night *began*, not its label:
+        the label gains a second date the moment the run passes midnight, and a
+        night must not collapse under the observer for having done that.
         """
         return self._group_item(
             self.tree,
-            f"{session['label']} · {len(session['frames'])} frame(s)")
+            f"{session['label']} · {len(session['frames'])} frame(s)",
+            key=("session", session.get("start")))
 
-    def _fill_session_tree(self):
+    def _fill_session_tree(self, opened=None):
         """Session -> frames. What every camera gets, japan included by default."""
         sessions = group_by_session(self._frames)
         for session in sessions:
@@ -982,11 +1102,13 @@ class LanPanel(QWidget):
             for frame in session["frames"]:
                 item.addChild(self._frame_item(frame))
         self._sessions = len(sessions)
-        if sessions:
+        # Only on a first drawing. Later ones restore what the observer opened,
+        # and re-opening the newest night over that would fight them.
+        if sessions and not opened:
             self.tree.topLevelItem(0).setExpanded(True)
         return ""
 
-    def _fill_cycle_tree(self):
+    def _fill_cycle_tree(self, opened=None):
         """Session -> cycle -> filter -> frames, for a japan archive."""
         period, anchor = self._manual_cycle_settings()
         sessions = group_japan_cycles(self._frames, period=period, anchor=anchor)
@@ -996,41 +1118,47 @@ class LanPanel(QWidget):
         self._grouped = sessions
         for number, session in enumerate(sessions):
             item = self._session_item(session)
+            start = session.get("start")
             for cycle in session["cycles"]:
                 label = (f"Cycle {cycle['index']} · "
                          f"{cycle['first']:%H:%M:%S}–{cycle['last']:%H:%M:%S} UTC"
                          f" · {cycle['count']} frame(s)")
-                cycle_item = self._group_item(item, label)
+                cycle_item = self._group_item(
+                    item, label, key=("cycle", start, cycle["index"]))
                 for group in cycle["filters"]:
-                    self._fill_filter_group(cycle_item, group,
+                    self._fill_filter_group(cycle_item, group, start,
+                                            cycle["index"],
                                             (number, cycle["index"],
                                              group["filter"]))
             for group in session.get("filters", []):
-                self._fill_filter_group(item, group)
+                self._fill_filter_group(item, group, start, None)
             # Darks stand outside the cycle: the driver takes them once per
             # unique exposure before and after the run, not on a slot.
             if session["darks"]:
                 darks_item = self._group_item(
-                    item, f"Darks · {len(session['darks'])} frame(s)")
+                    item, f"Darks · {len(session['darks'])} frame(s)",
+                    key=("darks", start))
                 for frame in session["darks"]:
                     darks_item.addChild(self._frame_item(frame))
             if session["unparsed"]:
                 other = self._group_item(
-                    item, f"Other files · {len(session['unparsed'])}")
+                    item, f"Other files · {len(session['unparsed'])}",
+                    key=("other", start))
                 for frame in session["unparsed"]:
                     other.addChild(self._frame_item(frame))
 
-        if sessions:
+        if sessions and not opened:
             first = self.tree.topLevelItem(0)
             first.setExpanded(True)
             if first.childCount():
                 first.child(0).setExpanded(True)
         return self._period_note(sessions)
 
-    def _fill_filter_group(self, parent, group, target=None):
+    def _fill_filter_group(self, parent, group, start, cycle_index, target=None):
         item = self._group_item(
             parent, f"{japan_filter_label(group['filter'])} · "
-                    f"{len(group['frames'])} frame(s)")
+                    f"{len(group['frames'])} frame(s)",
+            key=("filter", start, cycle_index, group["filter"]))
         # Only a filter *inside a cycle* can carry a difference frame; the
         # per-session filter groups exist precisely because no cycle was found.
         if target is not None:
@@ -1063,11 +1191,18 @@ class LanPanel(QWidget):
             parts.append("newest only — pick a date")
         return parts
 
-    def _restore_selection(self, name):
-        """Keep the open frame selected across a regrouping; else open the newest.
+    def _restore_selection(self, name, default=True):
+        """Keep the open frame selected across a rebuild; else open the newest.
 
-        Regrouping must not cost a reload of a frame that is already on screen,
+        A rebuild must not cost a reload of a frame that is already on screen,
         so a surviving selection is restored with the signal blocked.
+
+        ``default=False`` leaves an empty selection empty. Nothing being selected
+        is a state in its own right — it is what "Follow live" leaves behind —
+        and now that the tree redraws itself every few seconds, helpfully
+        selecting the newest archived frame would fire ``_on_frame_selected``,
+        which switches Follow live off. The observer would watch the live view
+        turn itself back into an archive view the moment a frame landed.
         """
         wanted = self._find_frame_item(name) if name else None
         if wanted is not None:
@@ -1077,6 +1212,8 @@ class LanPanel(QWidget):
             self.tree.blockSignals(False)
             self.tree.scrollToItem(wanted)
             return
+        if not default:
+            return
         first = self._find_frame_item(None)
         if first is not None:
             self._expand_to(first)
@@ -1084,15 +1221,10 @@ class LanPanel(QWidget):
 
     def _find_frame_item(self, name):
         """First leaf carrying ``name``, or the first leaf of all if ``name`` is None."""
-        stack = [self.tree.topLevelItem(i)
-                 for i in range(self.tree.topLevelItemCount() - 1, -1, -1)]
-        while stack:
-            item = stack.pop()
+        for item in self._walk():
             value = item.data(0, Qt.UserRole)
             if value is not None and (name is None or value == name):
                 return item
-            for index in range(item.childCount() - 1, -1, -1):
-                stack.append(item.child(index))
         return None
 
     @staticmethod
@@ -1224,23 +1356,9 @@ class LanPanel(QWidget):
             self.status.emit(f"Showing {name or 'latest frame'}")
 
     def _show_stats(self, payload, name=None):
-        meta = payload.get("metadata", {}) or {}
-        header = meta.get("fits_header") or {}
-        conditions, measured = summarise(payload, header)
-
-        upper = {k.upper(): v for k, v in header.items()}
-        when = upper.get("DATE-OBS") or meta.get("timestamp") or ""
-        first = [when, name or "latest frame"]
-        lines = ["   ·   ".join(p for p in first if p)]
-        if conditions:
-            lines.append("   ·   ".join(conditions))
-        if measured:
-            lines.append("   ·   ".join(measured))
-        self.lbl_info.setText("\n".join(lines) or "—")
-        self.details.show_payload(payload)
+        self.details.show_payload(payload, name)
 
     def _clear_stats(self):
-        self.lbl_info.setText("—")
         self.details.clear()
 
     # -- live ----------------------------------------------------------
@@ -1299,6 +1417,7 @@ class LanPanel(QWidget):
 
     def cleanup(self):
         self._auto_timer.stop()
+        self._list_timer.stop()
         if self._difference is not None:
             self._difference.close()
             self._difference = None

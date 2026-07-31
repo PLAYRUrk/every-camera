@@ -272,11 +272,18 @@ def test_the_period_is_derived_from_the_slots_by_default(tmp_path):
 
 
 def test_a_text_schedule_may_state_its_own_period(tmp_path):
-    """The point of the header: swapping schedules must not mean editing config."""
+    """The point of the header: swapping schedules must not mean editing config.
+
+    The second slot sits near the end of the cycle so that this stays a test of
+    the header and nothing else. Left at Δ100 it also described a 1440 s cycle
+    with twenty-two idle minutes in it, which ``period_mismatch`` now — rightly —
+    has something to say about; the stated period still differs from the derived
+    1410 s, so it is no weaker a test of which of the two wins.
+    """
     path = tmp_path / "schedule.txt"
     path.write_text("period = 1440\n"
                     "# delta(s);filter;exposure(s);binning\n"
-                    "0;1;55;1\n100;3;25;1\n")
+                    "0;1;55;1\n1380;3;25;1\n")
     conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
                                    "dead_time": 5.0,
                                    "schedule_file": str(path)})
@@ -341,3 +348,84 @@ def test_a_text_schedule_may_set_the_mode_below_its_slots(tmp_path):
                                    "schedule_file": str(path)})
     assert conf.schedule.mode == "sun"
     assert [e.seconds for e in conf.schedule.entries] == [[0, 30], [15]]
+
+
+# ---------------------------------------------------------------------------
+# A stated period against the slots that describe it
+# ---------------------------------------------------------------------------
+def _twelve_minute_cycle():
+    """Twelve slots a minute apart: Δ660 + 55 s + 5 s dead time = 720 s."""
+    return [{"delta": delta, "filter": (delta // 60) % 6 + 1, "exposure": 55}
+            for delta in range(0, 661, 60)]
+
+
+def test_a_period_twice_the_slots_is_reported():
+    """The mistake that looked like a driver that had hung.
+
+    A cycle stated at 1440 s whose slots close at 720 s leaves the whole second
+    half of every cycle with no slot in it. Phase-locked to ``t_start``, the next
+    slot a run started less than one such period early can find is then the first
+    slot of the following cycle — which is ``t_start`` itself, so the camera sits
+    there doing nothing until the appointed hour and never says why.
+    """
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 1440, "schedule": _twelve_minute_cycle()})
+    assert "1440" in problems(conf) and "720" in problems(conf)
+    # Reported, not corrected: a quiet tail may be deliberate.
+    assert conf.schedule.period == pytest.approx(1440.0)
+
+
+def test_a_period_shorter_than_the_slots_is_reported_too():
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 400, "schedule": _twelve_minute_cycle()})
+    assert "overruns" in problems(conf)
+
+
+def test_a_period_that_matches_its_slots_is_silent():
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 720, "schedule": _twelve_minute_cycle()})
+    assert conf.errors == []
+
+
+def test_a_derived_period_cannot_disagree_with_itself():
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule": _twelve_minute_cycle()})
+    assert conf.errors == []
+    assert conf.schedule.period == pytest.approx(720.0)
+
+
+def test_sun_mode_says_nothing_about_a_period_it_does_not_use():
+    conf = japan_config.from_dict({
+        "mode": "sun", "schedule_len": 1440,
+        "schedule": [{"filter": 1, "exposure": 55, "seconds": [0]}]})
+    assert conf.errors == []
+
+
+def test_the_disagreement_is_found_in_a_schedule_file_too(tmp_path):
+    path = tmp_path / "schedule.txt"
+    path.write_text("period = 1440\n0;1;55;1\n660;6;55;1\n")
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "dead_time": 5.0,
+                                   "schedule_file": str(path)})
+    assert "720" in problems(conf)
+
+
+def test_an_ordinary_tail_at_the_end_of_a_cycle_is_not_worth_a_word():
+    """Closing a minute after the last slot is a schedule, not a mistake."""
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 780, "schedule": _twelve_minute_cycle()})
+    assert conf.errors == []
+
+
+def test_one_slot_per_cycle_is_all_tail_and_still_fine():
+    """A programme of one frame per cycle has no inner gap to be judged against."""
+    conf = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00", "dead_time": 5.0,
+        "schedule_len": 1440,
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 55}]})
+    assert conf.errors == []
