@@ -232,6 +232,74 @@ def test_legacy_round_trip_through_text():
     assert [e.as_dict() for e in again] == [e.as_dict() for e in entries]
 
 
+def test_a_cycle_line_may_name_gain_and_readout():
+    """The 5th and 6th fields a converted imagerd_rt schedule needs."""
+    entries, errors, _ = sched.parse_schedule_text(
+        "1428;3;7;4;3;5\n0;3;25;1;;5\n60;3;25;1\n", "time")
+    assert errors == []
+    assert [(e.gain, e.readout) for e in entries] == [
+        (3, 5.0),        # both named
+        (None, 5.0),     # an empty field skips the gain
+        (None, None),    # a four-field station line names neither
+    ]
+
+
+def test_gain_and_readout_survive_the_round_trip():
+    entries, _, _ = sched.parse_schedule_text("0;3;25;1;;5\n1428;3;7;4;3;5\n", "time")
+    again, errors, _ = sched.parse_schedule_text(
+        sched.schedule_to_text(entries, "time"), "time")
+    assert errors == []
+    assert [e.as_dict() for e in again] == [e.as_dict() for e in entries]
+
+
+def test_a_schedule_without_a_gain_still_writes_four_fields():
+    """Nothing forces the long line on a station file that never needed it."""
+    entries, _, _ = sched.parse_schedule_text("100;3;25;1\n", "time")
+    assert sched.schedule_to_text(entries, "time").splitlines()[-1] == "100;3;25;1"
+
+
+def test_a_bad_cycle_line_names_every_field():
+    _, errors, _ = sched.parse_schedule_text("100;3\n", "time")
+    assert len(errors) == 1
+    assert "delta;filter;exposure;binning;gain;readout" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# The shipped TORY schedule, in both formats
+# ---------------------------------------------------------------------------
+SCHEDULES = Path(__file__).resolve().parent.parent / "schedules"
+
+
+def _numeric(overrides):
+    """Text directives arrive as strings, JSON keys as numbers — compare values."""
+    out = {}
+    for key, value in overrides.items():
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            out[key] = str(value)
+    return out
+
+
+def test_the_tory_text_schedule_says_what_its_json_says():
+    """asi_tory_1440.txt is a conversion of asi_tory_1440.json, and lossless."""
+    from_json = sched.load_schedule_file(SCHEDULES / "asi_tory_1440.json", "sun")
+    from_text = sched.load_schedule_file(SCHEDULES / "asi_tory_1440.txt", "sun")
+
+    assert from_json[1] == [] and from_text[1] == []
+    assert [e.as_dict() for e in from_text[0]] == [e.as_dict() for e in from_json[0]]
+    assert _numeric(from_text[2]) == _numeric(from_json[2])
+
+
+def test_the_tory_text_schedule_closes_its_cycle():
+    entries, _, overrides = sched.load_schedule_file(
+        SCHEDULES / "asi_tory_1440.txt", "sun")
+    assert len(entries) == 36
+    assert sched.cycle_period(entries, 5.0) == 1440.0
+    assert sched.period_mismatch("sun_cycle", entries,
+                                 float(overrides["schedule_len"]), 5.0) == ""
+
+
 # ---------------------------------------------------------------------------
 # Config assembly
 # ---------------------------------------------------------------------------

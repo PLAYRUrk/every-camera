@@ -197,7 +197,16 @@ def parse_schedule_text(text, mode, default_binning=1):
     Returns ``(entries, errors, overrides)``.
 
     ``sun``   mode: ``filter,exposure,seconds``       e.g. ``1,55,0:30``
-    cycle modes: ``delta;filter;exposure;binning``    e.g. ``100;3;25;1``
+    cycle modes: ``delta;filter;exposure;binning;gain;readout``
+
+    In a cycle line only the first three fields are required; ``binning`` falls
+    back to the camera's, and ``gain`` and ``readout`` are left unset — the slot
+    then takes the camera-wide gain and the schedule-wide dead time, as a
+    four-field station file always has. A field may also be left empty to skip
+    it, so ``0;3;25;1;;5`` names a readout without naming a gain::
+
+        100;3;25;1              # gain and readout from the camera
+        1428;3;7;4;3;5          # a converted imagerd_rt slot, in full
 
     A line may instead be ``key = value``, which sets one of
     :data:`FILE_OVERRIDE_KEYS` for the whole programme — the same globals the
@@ -244,8 +253,10 @@ def parse_schedule_text(text, mode, default_binning=1):
             if mode in CYCLE_MODES:
                 parts = [p.strip() for p in line.split(";")]
                 if len(parts) < 3:
-                    errors.append(f"Line {lineno}: expected "
-                                  f"'delta;filter;exposure;binning', got {line!r}")
+                    errors.append(
+                        f"Line {lineno}: expected "
+                        f"'delta;filter;exposure;binning;gain;readout' "
+                        f"(the last three optional), got {line!r}")
                     continue
                 slot = {
                     "delta": float(parts[0]),
@@ -254,6 +265,13 @@ def parse_schedule_text(text, mode, default_binning=1):
                     "binning": int(parts[3]) if len(parts) > 3 and parts[3]
                     else default_binning,
                 }
+                # Only name the optional fields when the line does. A key left
+                # out here is what makes ``entries_from_config`` fall back to
+                # the camera-wide gain and the schedule-wide dead time.
+                if len(parts) > 4 and parts[4]:
+                    slot["gain"] = int(parts[4])
+                if len(parts) > 5 and parts[5]:
+                    slot["readout"] = float(parts[5])
             else:
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) < 3:
@@ -330,10 +348,21 @@ def schedule_to_text(entries, mode, period=None):
     if period:
         lines.append(f"period = {float(period):g}")
     if mode in CYCLE_MODES:
-        lines.append("# delta(s);filter;exposure(s);binning")
+        # The long line only appears once something needs it, so a schedule that
+        # never named a gain still round-trips to the four fields a station file
+        # has always had.
+        detailed = any(e.gain is not None or e.readout is not None
+                       for e in entries)
+        lines.append("# delta(s);filter;exposure(s);binning" +
+                     (";gain;readout(s)" if detailed else ""))
         for entry in sorted(entries, key=lambda e: e.delta or 0):
-            lines.append(f"{entry.delta:g};{entry.filter};{entry.exposure:g};"
-                         f"{entry.binning or 1}")
+            line = (f"{entry.delta:g};{entry.filter};{entry.exposure:g};"
+                    f"{entry.binning or 1}")
+            if detailed:
+                gain = "" if entry.gain is None else f"{entry.gain:g}"
+                readout = "" if entry.readout is None else f"{entry.readout:g}"
+                line += f";{gain};{readout}"
+            lines.append(line)
     else:
         lines.append("# filter,exposure(s),seconds")
         for entry in entries:
