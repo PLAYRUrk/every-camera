@@ -50,6 +50,25 @@ def announce_setup_mode(reason=None):
                    "restart to begin measuring.")
 
 
+def empty_schedule_reason(section, configured, errors=()):
+    """Word an empty schedule the way the operator can act on it.
+
+    A schedule that *was* configured and came out empty is a different problem
+    from one that was never written, and telling the operator to "add slots"
+    when the slots are right there in front of them sends them looking in the
+    wrong place. That happens most often when ``mode`` and the slots disagree —
+    cycle modes need a ``delta``, ``sun`` mode needs ``seconds`` — so the first
+    rejection is quoted here rather than left in the warnings above.
+    """
+    # No trailing full stop: the callers punctuate the sentence they build.
+    if configured:
+        detail = f" First problem: {errors[0].rstrip('.')}" if errors else ""
+        return (f"every slot of the {section} schedule was rejected, so there "
+                f"is nothing left to run.{detail}")
+    return (f"the {section} schedule is empty — add slots to {section}.schedule "
+            f"in config.json or point {section}.schedule_file at a file")
+
+
 def publish_current_params(service, snapshot):
     """Hand ``focus_app`` the camera's parameter values, as of now.
 

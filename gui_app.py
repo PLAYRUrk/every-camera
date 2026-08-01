@@ -3055,9 +3055,10 @@ class AsiTab(QWidget):
             return
         setup_mode = not conf.schedule.entries
         if setup_mode:
-            self._log_local("The schedule is empty — starting in setup mode: "
-                            "live frames for focus_app.py, nothing archived. "
-                            "Add slots in setup_app.py to measure.", "warn")
+            from worker_common import empty_schedule_reason
+            self._log_local(
+                f"Starting in setup mode — {empty_schedule_reason('asi', asi_cfg.get('schedule') or asi_cfg.get('schedule_file'), conf.errors)}. "
+                f"Live frames go to focus_app.py, nothing is archived.", "warn")
 
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("ASI", self._cfg))

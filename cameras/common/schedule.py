@@ -162,6 +162,17 @@ def entries_from_config(slots, mode, default_binning=1):
                 readout = None
 
         if mode in CYCLE_MODES:
+            # A slot written for the wrong mode is the commonest way a schedule
+            # comes out empty, and the camera then starts in setup mode. Say so
+            # here: "expected a number, got None" left the operator to work out
+            # both which field was missing and why it was needed.
+            if slot.get("delta") is None:
+                hint = (" This slot has 'seconds' instead, which belongs to "
+                        "'sun' mode — either set mode to 'sun' or give the slot "
+                        "a delta." if slot.get("seconds") is not None else "")
+                errors.append(f"{what}: {mode!r} mode needs 'delta', the offset "
+                              f"in seconds from the start of the cycle.{hint}")
+                continue
             delta = _as_float(slot.get("delta"), what, errors)
             if delta is None:
                 continue

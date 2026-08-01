@@ -193,6 +193,29 @@ def test_a_bad_slot_is_reported_and_skipped_not_fatal():
     assert {e.split(":")[0] for e in errors} == {"Slot 1", "Slot 2", "Slot 3"}
 
 
+def test_a_sun_slot_under_a_cycle_mode_says_what_is_wrong():
+    """The commonest way a schedule empties itself — and drops into setup mode.
+
+    ``mode`` and the slots disagree: a cycle mode needs ``delta``, and these
+    slots only carry ``seconds``. The message has to name both the missing field
+    and the mode, or the operator is left staring at a camera that came up in
+    setup mode with its schedule plainly written in config.json.
+    """
+    entries, errors = sched.entries_from_config(
+        [{"filter": 1, "exposure": 55, "seconds": [0]}], "sun_cycle")
+    assert entries == []
+    assert len(errors) == 1
+    assert "delta" in errors[0] and "sun_cycle" in errors[0]
+    assert "seconds" in errors[0]          # points at what the slot has instead
+
+
+def test_a_cycle_slot_missing_its_delta_is_still_reported():
+    _, errors = sched.entries_from_config(
+        [{"filter": 1, "exposure": 55, "binning": 4}], "time")
+    assert len(errors) == 1
+    assert "delta" in errors[0]
+
+
 def test_seconds_are_deduplicated_and_sorted():
     entries, _ = sched.entries_from_config(
         [{"filter": 1, "exposure": 5, "seconds": [30, 0, 30]}], "sun")

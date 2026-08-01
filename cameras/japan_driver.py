@@ -65,7 +65,7 @@ from utils import (
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
     publish_schedule_state, serving_focus_hold,
-    run_focus_iteration, announce_setup_mode, SETUP_STATUS,
+    run_focus_iteration, announce_setup_mode, empty_schedule_reason, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
 )
 
@@ -1495,8 +1495,10 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
             setup_mode = True
             announce_setup_mode(
                 "requested with --setup" if conf.schedule.entries else
-                "the Japan schedule is empty — add slots to japan.schedule in "
-                "config.json or point japan.schedule_file at a file")
+                empty_schedule_reason(
+                    "japan",
+                    japan_cfg.get("schedule") or japan_cfg.get("schedule_file"),
+                    conf.errors))
 
         console_ui.log("Opening the camera…")
         cam = JapanCamera(conf).open()
