@@ -1613,12 +1613,18 @@ class AsiWorkerConsole(threading.Thread):
             if self.setup_mode:
                 self._run_setup_mode()
             elif self._wait_for_start():
-                if self.cfg.schedule.mode == "time":
+                mode = self.cfg.schedule.mode
+                if mode == "time":
                     self._run_time_mode()
-                elif self.cfg.schedule.mode == "sun_cycle":
-                    self._run_sun_cycle_mode()
                 else:
-                    self._run_sun_mode()
+                    # A night's window closing at sunrise is not a reason to end
+                    # the run: sun/sun_cycle mode functions return once their
+                    # session is over, so this is what keeps the worker going
+                    # into the next night instead of exiting the whole program.
+                    run_night = (self._run_sun_cycle_mode if mode == "sun_cycle"
+                                else self._run_sun_mode)
+                    while not self._stop_event.is_set():
+                        run_night()
         except Exception as exc:
             self._errors += 1
             console_ui.error(f"Measurement loop failed: {exc}")
