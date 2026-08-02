@@ -1005,60 +1005,70 @@ class InfraWorkerConsole(threading.Thread):
             self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
-            if self._pending_capture_event.is_set():
-                self._handle_pending_capture(stream)
+            # A schedule spans many nights in one run (see schedule_generator.py),
+            # so this loop has to outlive each night's window rather than exit
+            # once it closes. An exception loose from any single pass used to
+            # kill the thread outright — silently ending the whole program at
+            # whatever point in the night it happened to strike — so every pass
+            # is caught here and logged instead of left to propagate.
+            try:
+                if self._pending_capture_event.is_set():
+                    self._handle_pending_capture(stream)
 
-            now = dt.now()
+                now = dt.now()
 
-            active_end = None
-            for entry in self.schedule:
-                if entry.start <= now <= entry.end:
-                    active_end = entry.end
-                    break
-
-            holding = self._focus_holding()
-            if holding and not self._held:
-                console_ui.log("Focus session took the camera — scheduled "
-                               "captures are paused until it ends.")
-            elif self._held and not holding:
-                console_ui.log("Focus session ended — the schedule resumes.")
-                last_fired = (-1, -1)   # the second we stopped in is not owed a frame
-            self._held = holding
-            serving_focus_hold(self._service, holding)
-            publish_schedule_state(
-                self._service,
-                bool(active_end) and not self.setup_mode and not holding)
-
-            if active_end is None or holding:
-                self._save_status(SETUP_STATUS
-                                  if (self.setup_mode or holding) else "waiting")
-                self._handle_focus(now, stream)
-                self._stop_event.wait(0.5)
-                continue
-
-            self._active_until = active_end
-
-            fire_key = (now.minute, now.second)
-            if now.second in self.capture_seconds and fire_key != last_fired:
-                last_fired = fire_key
-                ok = self._capture_one_stream(now, stream, frame_timeout)
-                if ok:
-                    consecutive_errors = 0
-                    self._shots += 1
-                    self._last_shot = now
-                    self._save_status("running", force=True)
-                else:
-                    consecutive_errors += 1
-                    self._errors += 1
-                    self._save_status("error", force=True)
-                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
+                active_end = None
+                for entry in self.schedule:
+                    if entry.start <= now <= entry.end:
+                        active_end = entry.end
                         break
-            elif now.second not in self.capture_seconds:
-                last_fired = (-1, -1)
-                self._handle_focus(now, stream)
 
-            self._stop_event.wait(0.1)
+                holding = self._focus_holding()
+                if holding and not self._held:
+                    console_ui.log("Focus session took the camera — scheduled "
+                                   "captures are paused until it ends.")
+                elif self._held and not holding:
+                    console_ui.log("Focus session ended — the schedule resumes.")
+                    last_fired = (-1, -1)   # the second we stopped in is not owed a frame
+                self._held = holding
+                serving_focus_hold(self._service, holding)
+                publish_schedule_state(
+                    self._service,
+                    bool(active_end) and not self.setup_mode and not holding)
+
+                if active_end is None or holding:
+                    self._save_status(SETUP_STATUS
+                                      if (self.setup_mode or holding) else "waiting")
+                    self._handle_focus(now, stream)
+                    self._stop_event.wait(0.5)
+                    continue
+
+                self._active_until = active_end
+
+                fire_key = (now.minute, now.second)
+                if now.second in self.capture_seconds and fire_key != last_fired:
+                    last_fired = fire_key
+                    ok = self._capture_one_stream(now, stream, frame_timeout)
+                    if ok:
+                        consecutive_errors = 0
+                        self._shots += 1
+                        self._last_shot = now
+                        self._save_status("running", force=True)
+                    else:
+                        consecutive_errors += 1
+                        self._errors += 1
+                        self._save_status("error", force=True)
+                        if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                            console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
+                            break
+                elif now.second not in self.capture_seconds:
+                    last_fired = (-1, -1)
+                    self._handle_focus(now, stream)
+
+                self._stop_event.wait(0.1)
+            except Exception as exc:
+                console_ui.error(f"Unexpected error in the capture loop: {exc}")
+                self._stop_event.wait(0.5)
 
         stream.stop()
         stream.join(timeout=frame_timeout)

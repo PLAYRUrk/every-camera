@@ -255,19 +255,22 @@ class AsiCamera:
     def capture(self):
         return self.cam.capture()
 
-    def prepare(self, entry, exposure=None):
+    def prepare(self, entry, exposure=None, binning=None):
         """Apply one schedule entry's exposure, binning, gain and filter.
 
         ``exposure`` overrides the entry's own. The preflight stage and the
         overexposure guard both choose the exposure themselves, and the camera
         has to hold exactly what the file name and ``EXPTIME`` will claim — so
         there is one value, applied here, rather than two that could drift apart.
+        ``binning`` likewise overrides the entry's own, for the preflight
+        stage, which holds one binning from config across every slot.
         """
         wanted = entry.exposure if exposure is None else float(exposure)
         if wanted is not None and self.current_exposure != wanted:
             self.set_exposure(wanted)
-        if entry.binning and self.current_binning != entry.binning:
-            self.set_binning(entry.binning)
+        wanted_binning = entry.binning if binning is None else int(binning)
+        if wanted_binning and self.current_binning != wanted_binning:
+            self.set_binning(wanted_binning)
         if entry.gain and self.current_gain != entry.gain:
             self.set_gain(entry.gain)
         if entry.filter and self.current_filter != entry.filter:
@@ -1386,7 +1389,7 @@ class AsiWorkerConsole(threading.Thread):
                          f"{'  ·  preflight' if self._stage == 'preflight' else ''}")
 
             try:
-                self.cam.prepare(entry, exposure=exposure)
+                self.cam.prepare(entry, exposure=exposure, binning=self._slot_binning())
             except Exception as exc:
                 console_ui.error(f"Could not prepare the cycle: {exc}")
                 self._errors += 1
@@ -1434,6 +1437,17 @@ class AsiWorkerConsole(threading.Thread):
         auto.reset()
         console_ui.log(f"Sun at {sched.sun_max_angle:g}° — main cycle, "
                        f"scheduled exposures.")
+
+    def _slot_binning(self):
+        """The binning to force on this slot, or ``None`` to keep the entry's own.
+
+        Every preflight slot holds one binning from config, whatever filter or
+        exposure the schedule entry itself carries, right up to the handover
+        to the main programme.
+        """
+        if self._stage == "preflight" and self.cfg.preflight.binning:
+            return self.cfg.preflight.binning
+        return None
 
     def _plan_slot(self, entry, auto, guard):
         """``(exposure, frames)`` for this visit to ``entry``.

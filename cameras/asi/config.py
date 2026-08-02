@@ -156,6 +156,7 @@ class PreflightCfg:
     max_exposure: float = None        # None: no longer than the slot's own
     max_step: float = 4.0             # largest exposure change per measurement
     bias: float = 0.0                 # pedestal, ADU; used when there are no darks
+    binning: int = None                # None: each slot keeps its own schedule binning
 
 
 @dataclass
@@ -400,10 +401,14 @@ def _preflight(raw, sched, errors):
         max_exposure=None,
         max_step=_float(raw, "max_step", 4.0),
         bias=_float(raw, "bias", 0.0),
+        binning=None,
     )
     raw_max = raw.get("max_exposure")
     if raw_max not in (None, "", 0, 0.0):
         cfg.max_exposure = _float(raw, "max_exposure", 0.0) or None
+    raw_binning = raw.get("binning")
+    if raw_binning not in (None, "", 0):
+        cfg.binning = _int(raw, "binning", 0) or None
 
     if cfg.enabled and sched.mode != "sun_cycle":
         errors.append(f"asi.preflight works only in 'sun_cycle' mode (mode is "
