@@ -1636,7 +1636,11 @@ class AsiWorkerConsole(threading.Thread):
                 pass
             # Darks bracket a measurement run; in setup mode there was none, and
             # the exposure combinations they are built from are empty anyway.
-            if not self._force_quit and not self.setup_mode:
+            # And if no light frame was ever taken — stopped while still waiting
+            # for the start signal, the pre-darks, the sun, or the cycle anchor —
+            # there is no run to bracket either, so a Ctrl+C or systemctl stop
+            # there must not cost a set of darks for measurements that never ran.
+            if not self._force_quit and not self.setup_mode and self._shots > 0:
                 self._set_phase("closing darks")
                 try:
                     self._capture_darks("final")
