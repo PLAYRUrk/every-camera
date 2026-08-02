@@ -33,11 +33,14 @@ NO_FILTER_TAG = "none"
 
 
 def frame_name(timestamp, *, site_id, device_id, wavelength, exposure_sec,
-               dark=False) -> str:
-    """The legacy file name: ``YYYYMMDD_hhmmss_SITE_DEV_WAVE_EEEEEEms[_DARK].fits``.
+               dark=False, preflight=False) -> str:
+    """The legacy file name: ``YYYYMMDD_hhmmss_SITE_DEV_WAVE_EEEEEEms[_DARK][_pf].fits``.
 
     The exposure is milliseconds zero-padded to six digits, as the original
     wrote it — 55 s becomes ``055000ms`` and 7 s becomes ``007000ms``.
+
+    ``preflight`` tags a frame shot during the automatic twilight stage, so it
+    can be told apart from the main programme's frames without opening it.
     """
     utc = to_utc(timestamp)
     exposure_ms = int(round(float(exposure_sec) * 1000))
@@ -45,12 +48,14 @@ def frame_name(timestamp, *, site_id, device_id, wavelength, exposure_sec,
             f"{wavelength or NO_FILTER_TAG}_{exposure_ms:06d}ms")
     if dark:
         name += "_DARK"
+    if preflight:
+        name += "_pf"
     return name + ".fits"
 
 
 def frame_path(root, timestamp, *, site_id, device_id, wavelength,
-               exposure_sec, dark=False) -> Path:
+               exposure_sec, dark=False, preflight=False) -> Path:
     """Full path of one frame; the directory is not created here."""
     return day_dir(root, timestamp) / frame_name(
         timestamp, site_id=site_id, device_id=device_id, wavelength=wavelength,
-        exposure_sec=exposure_sec, dark=dark)
+        exposure_sec=exposure_sec, dark=dark, preflight=preflight)

@@ -885,6 +885,7 @@ class AsiWorkerConsole(threading.Thread):
             wavelength=self.cfg.filter_info(self.cam.filter_number).wavelength,
             exposure_sec=exposure,
             dark=(image_type == "DARK"),
+            preflight=(obs_mode == "sun_cycle_auto"),
         )
         if path is None:
             self._errors += 1
