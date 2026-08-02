@@ -61,11 +61,34 @@ def _matches_day(name, mtime, day_prefix):
     return _time.strftime("%Y%m%d", _time.localtime(mtime)) == day_prefix
 
 
+def _scan_frame_files(output_dir):
+    """Yield ``{name, size, mtime, ext}`` for every captured file, at any depth.
+
+    Most cameras write straight into ``output_dir``; the ASI driver files each
+    frame under a ``YYYY/MM/DD`` tree beneath it instead (see
+    ``cameras/asi/paths.py``). Walking recursively covers both layouts, and
+    costs nothing extra for a flat one — ``os.walk`` on a directory with no
+    subdirectories visits it once, same as ``os.scandir`` did. Unreadable
+    subdirectories are skipped rather than failing the whole scan.
+    """
+    for dirpath, _dirnames, filenames in os.walk(output_dir):
+        for fname in filenames:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in FRAME_EXTENSIONS:
+                continue
+            try:
+                st = os.stat(os.path.join(dirpath, fname))
+            except OSError:
+                continue
+            yield {"name": fname, "size": st.st_size, "mtime": st.st_mtime,
+                  "ext": ext}
+
+
 def list_frames(output_dir, date=None, limit=500, offset=0, newest_first=True):
-    """List captured frames in ``output_dir``.
+    """List captured frames in ``output_dir``, however deep the camera files them.
 
     Args:
-        output_dir: directory holding the captured files (not recursive).
+        output_dir: directory holding the captured files.
         date: optional ``YYYY-MM-DD`` filter. Matched against the filename
             prefix first (files are named ``%Y%m%dT%H%M%S``), then mtime.
         limit / offset: pagination over the sorted result.
@@ -84,26 +107,11 @@ def list_frames(output_dir, date=None, limit=500, offset=0, newest_first=True):
     day_prefix = date.replace("-", "") if date else None
     entries = []
     try:
-        with os.scandir(output_dir) as it:
-            for entry in it:
-                try:
-                    if not entry.is_file():
-                        continue
-                    ext = os.path.splitext(entry.name)[1].lower()
-                    if ext not in FRAME_EXTENSIONS:
-                        continue
-                    st = entry.stat()
-                    if day_prefix and not _matches_day(entry.name, st.st_mtime,
-                                                       day_prefix):
-                        continue
-                    entries.append({
-                        "name": entry.name,
-                        "size": st.st_size,
-                        "mtime": st.st_mtime,
-                        "ext": ext,
-                    })
-                except OSError:
-                    continue
+        for entry in _scan_frame_files(output_dir):
+            if day_prefix and not _matches_day(entry["name"], entry["mtime"],
+                                               day_prefix):
+                continue
+            entries.append(entry)
     except OSError:
         return result
 
@@ -122,28 +130,40 @@ def list_dates(output_dir, max_days=400):
     if not output_dir or not os.path.isdir(output_dir):
         return []
     try:
-        with os.scandir(output_dir) as it:
-            for entry in it:
-                try:
-                    if not entry.is_file():
-                        continue
-                    if os.path.splitext(entry.name)[1].lower() not in FRAME_EXTENSIONS:
-                        continue
-                    name = entry.name
-                    if len(name) >= 8 and name[:8].isdigit():
-                        days.add(f"{name[:4]}-{name[4:6]}-{name[6:8]}")
-                    else:
-                        days.add(_time.strftime("%Y-%m-%d",
-                                                _time.localtime(entry.stat().st_mtime)))
-                except OSError:
-                    continue
+        for entry in _scan_frame_files(output_dir):
+            name = entry["name"]
+            if len(name) >= 8 and name[:8].isdigit():
+                days.add(f"{name[:4]}-{name[4:6]}-{name[6:8]}")
+            else:
+                days.add(_time.strftime("%Y-%m-%d",
+                                        _time.localtime(entry["mtime"])))
     except OSError:
         return []
     return sorted(days, reverse=True)[:max_days]
 
 
+def _dated_subpath(output_dir, name):
+    """The ``YYYY/MM/DD/name`` path a dated name would sit at, if it looks dated.
+
+    Mirrors ``cameras.asi.paths.day_dir``, without importing it: every frame
+    name here starts with its capture date (the convention every driver
+    uses), which is enough to find the file without listing directories —
+    this is the fallback ``resolve_frame_path`` needs because the ASI archive
+    is a date tree, not a flat directory.
+    """
+    if len(name) < 8 or not name[:8].isdigit():
+        return None
+    year, month, day = name[0:4], name[4:6], name[6:8]
+    return os.path.join(output_dir, year, month, day, name)
+
+
 def resolve_frame_path(output_dir, name):
     """Resolve ``name`` inside ``output_dir``, refusing any path traversal.
+
+    ``name`` is always a bare file name, never a path — the client never sends
+    the ASI archive's ``YYYY/MM/DD`` layout, only the name a listing gave it —
+    so a dated name that is not directly in ``output_dir`` is looked for at the
+    date subpath its own timestamp implies.
 
     Returns the absolute path, or None if the name escapes the directory,
     does not exist or is not a frame file.
@@ -154,11 +174,21 @@ def resolve_frame_path(output_dir, name):
     if os.path.basename(name) != name:
         return None
     base = os.path.realpath(output_dir)
-    candidate = os.path.realpath(os.path.join(base, name))
-    if candidate != base and os.path.commonpath([base, candidate]) != base:
+
+    def _within_base(path):
+        real = os.path.realpath(path)
+        if real != base and os.path.commonpath([base, real]) != base:
+            return None
+        return real
+
+    candidate = _within_base(os.path.join(base, name))
+    if candidate is None:
         return None
     if not os.path.isfile(candidate):
-        return None
+        dated = _dated_subpath(output_dir, name)
+        candidate = _within_base(dated) if dated else None
+        if candidate is None or not os.path.isfile(candidate):
+            return None
     if os.path.splitext(candidate)[1].lower() not in FRAME_EXTENSIONS:
         return None
     return candidate
