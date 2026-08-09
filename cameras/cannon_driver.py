@@ -159,12 +159,22 @@ def detect_model(config):
 # ---------------------------------------------------------------------------
 # Camera config helpers
 # ---------------------------------------------------------------------------
-def camcfg_path(model_name):
+def camcfg_path(model_name, camcfg_file=None):
+    """Path of the camera settings .ini.
+
+    ``cannon.camcfg_file`` from config.json wins when it is set; a relative
+    path there is resolved next to the app, like the per-model default it
+    replaces. Without it the name is derived from the model, so two cameras
+    sharing one checkout keep their own settings.
+    """
+    if camcfg_file:
+        path = os.path.expanduser(camcfg_file)
+        return path if os.path.isabs(path) else os.path.join(APP_DIR, path)
     safe_name = model_name.replace(" ", "_")
     return os.path.join(APP_DIR, f"camcfg_{safe_name}.ini")
 
 
-def generate_camcfg(config, model_name):
+def generate_camcfg(config, model_name, camcfg_file=None):
     lines = [
         f"# Auto-generated config for {model_name}",
         "# Change this config only if you know what you do!",
@@ -189,18 +199,19 @@ def generate_camcfg(config, model_name):
             lines.append(f"[{section}]")
             lines.extend(section_lines)
             lines.append("")
-    filepath = camcfg_path(model_name)
+    filepath = camcfg_path(model_name, camcfg_file)
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
     with open(filepath, "w") as f:
         f.write("\n".join(lines))
     console_ui.log(f"Generated {filepath}")
 
 
-def apply_camcfg(config, model_name):
+def apply_camcfg(config, model_name, camcfg_file=None):
     """Apply camera config from .ini file. Generate if missing."""
-    cfg_path = camcfg_path(model_name)
+    cfg_path = camcfg_path(model_name, camcfg_file)
     if not os.path.exists(cfg_path):
         console_ui.log(f"Generating {os.path.basename(cfg_path)}...")
-        generate_camcfg(config, model_name)
+        generate_camcfg(config, model_name, camcfg_file)
     camcfg = cp.ConfigParser()
     camcfg.read(cfg_path)
     for section in camcfg.sections():
@@ -211,6 +222,76 @@ def apply_camcfg(config, model_name):
                 config[section][key].set(camcfg[section][key])
             except Exception:
                 pass
+
+
+def find_widget(config, key):
+    """The camera setting named `key`, whichever section holds it.
+
+    gphoto2 groups settings differently on every model — `shutterspeed` sits
+    under `capturesettings` on a 6D and under `settings` on a 300D — so callers
+    ask by name and let this find the section.
+    """
+    for section in config:
+        if section in SKIP_SECTIONS:
+            continue
+        if key in config[section]:
+            return config[section][key]
+    return None
+
+
+def apply_shutterspeed(config, shutterspeed):
+    """Set the exposure time from config.json, over whatever camcfg_*.ini left.
+
+    Unlike :func:`apply_camcfg`, a value that does not fit is reported instead
+    of swallowed: the .ini is generated and gitignored, so a typo there used to
+    mean the camera silently kept shooting at its old exposure. An empty value
+    means "leave the exposure alone". Returns whether it was applied.
+    """
+    value = str(shutterspeed or "").strip()
+    if not value:
+        return False
+
+    widget = find_widget(config, "shutterspeed")
+    if widget is None:
+        console_ui.warn("shutterspeed is set in config.json, but this camera "
+                        "exposes no shutterspeed setting — ignored")
+        return False
+
+    try:
+        choices = widget._read_choices()
+    except Exception:
+        choices = []
+    if choices and value not in choices:
+        console_ui.error(f"shutterspeed '{value}' is not supported by this "
+                         f"camera — exposure left unchanged. "
+                         f"Supported: {', '.join(choices)}")
+        return False
+
+    try:
+        widget.set(value)
+    except Exception as exc:
+        console_ui.error(f"Could not set shutterspeed '{value}': {exc}")
+        return False
+
+    console_ui.log(f"Exposure from config.json: shutterspeed = {value}")
+
+    # In P/Av/Tv the camera picks the exposure itself and quietly ignores the
+    # value just written — the usual reason "I set the exposure and nothing
+    # changed". Only warned about: the shooting mode stays the operator's call.
+    for key in ("autoexposuremode", "shootingmode"):
+        mode_widget = find_widget(config, key)
+        if mode_widget is None:
+            continue
+        try:
+            mode = str(mode_widget.value)
+        except Exception:
+            break
+        if mode not in ("Manual", "M", "Bulb", "B"):
+            console_ui.warn(f"{key} is '{mode}', not Manual — the camera will "
+                            f"choose its own exposure and ignore shutterspeed")
+        break
+
+    return True
 
 
 def get_adjustable_params(config):
@@ -239,15 +320,13 @@ def get_camera_settings_info(config):
     info = {}
     for key in ("iso", "shutterspeed", "aperture", "imageformat",
                 "whitebalance", "autoexposuremode"):
-        for section in config:
-            if section in SKIP_SECTIONS:
-                continue
-            if key in config[section]:
-                try:
-                    info[key] = str(config[section][key].value)
-                except Exception:
-                    pass
-                break
+        widget = find_widget(config, key)
+        if widget is None:
+            continue
+        try:
+            info[key] = str(widget.value)
+        except Exception:
+            pass
     return info
 
 
@@ -350,19 +429,14 @@ class CannonWorkerConsole(threading.Thread):
     def _apply_cannon_params(self, params):
         failures = []
         for key, value in params.items():
-            applied = False
-            for section in self.config:
-                if section in SKIP_SECTIONS:
-                    continue
-                if key in self.config[section]:
-                    try:
-                        self.config[section][key].set(str(value))
-                        applied = True
-                    except Exception as e:
-                        failures.append((key, str(e)))
-                    break
-            if not applied and key not in [f[0] for f in failures]:
+            widget = find_widget(self.config, key)
+            if widget is None:
                 failures.append((key, "param not found in camera config"))
+                continue
+            try:
+                widget.set(str(value))
+            except Exception as e:
+                failures.append((key, str(e)))
         return failures
 
     def _handle_pending_capture(self):
@@ -664,7 +738,8 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
         config = cam._get_config()
         model_name = detect_model(config)
         console_ui.log(f"Connected: {model_name}")
-        apply_camcfg(config, model_name)
+        apply_camcfg(config, model_name, cannon_cfg.get("camcfg_file", ""))
+        apply_shutterspeed(config, cannon_cfg.get("shutterspeed", ""))
         run_preview_cannon(cam, instance_name)
         console_ui.log("Done.")
         return
@@ -720,8 +795,11 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     console_ui.log(f"Connected: {model_name}")
     dash.set_section("device", [("Model:", model_name)])
 
-    # Apply camera config
-    apply_camcfg(config, model_name)
+    # Apply camera config — the .ini first, then the exposure from config.json
+    # on top of it, so the one setting the operator keeps in version control
+    # wins over the generated file.
+    apply_camcfg(config, model_name, cannon_cfg.get("camcfg_file", ""))
+    apply_shutterspeed(config, cannon_cfg.get("shutterspeed", ""))
 
     # MQTT
     mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "cannon")

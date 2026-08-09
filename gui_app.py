@@ -103,15 +103,22 @@ class CannonConnectThread(QThread):
     connected = pyqtSignal(object, object, str)  # cam, config, model_name
     failed = pyqtSignal(str)
 
+    def __init__(self, cannon_cfg=None):
+        super().__init__()
+        self._cannon_cfg = cannon_cfg or {}
+
     def run(self):
         try:
-            from cannon_driver import release_camera_usb, detect_model, apply_camcfg
+            from cannon_driver import (release_camera_usb, detect_model,
+                                       apply_camcfg, apply_shutterspeed)
             import gphoto2cffi as gp
             release_camera_usb()
             cam = gp.Camera()
             config = cam._get_config()
             model_name = detect_model(config)
-            apply_camcfg(config, model_name)
+            apply_camcfg(config, model_name,
+                         self._cannon_cfg.get("camcfg_file", ""))
+            apply_shutterspeed(config, self._cannon_cfg.get("shutterspeed", ""))
             self.connected.emit(cam, config, model_name)
         except Exception as e:
             self.failed.emit(str(e))
@@ -610,7 +617,7 @@ class CannonTab(QWidget):
         self.lbl_model.setText("Connecting...")
         self.lbl_model.setStyleSheet("color:#888; font-weight:bold;")
         self._log("Connecting to Canon camera...", "info")
-        self.connect_thread = CannonConnectThread()
+        self.connect_thread = CannonConnectThread(self._cfg.get("cannon", {}))
         self.connect_thread.connected.connect(self._on_connected)
         self.connect_thread.failed.connect(self._on_failed)
         self.connect_thread.start()

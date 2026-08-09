@@ -200,6 +200,7 @@ DEFAULT_CONFIG = {
         "schedule_file": "",
         "capture_seconds": [0, 30],
         "camcfg_file": "",
+        "shutterspeed": "",
     },
     "sptt": {
         "instance_name": "",
@@ -692,6 +693,16 @@ def configure_console_cannon(cfg, config_path=None):
         cannon["capture_seconds"] = [int(s.strip()) for s in secs_str.split(",") if s.strip()]
     except ValueError:
         cannon["capture_seconds"] = [0, 30]
+
+    print("\n  Exposure is written exactly as the camera names it — '1/125',")
+    print("  '10.3', '30'. Leave it empty to keep whatever the camera settings")
+    print("  .ini holds; a value the camera does not offer is reported at")
+    print("  startup together with the list it does offer.")
+    cannon["shutterspeed"] = _ask("Shutter speed (empty = from camera cfg file)",
+                                   cannon.get("shutterspeed", ""))
+    cannon["camcfg_file"] = _ask("Camera cfg file (empty = camcfg_<Model>.ini "
+                                 "next to the app)",
+                                 cannon.get("camcfg_file", ""))
 
     cfg["cannon"] = cannon
     _configure_mqtt(cfg)

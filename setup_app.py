@@ -178,6 +178,16 @@ class CannonConfigTab:
         _add_file_row(grid, row, "Camera cfg file:", self.le_camcfg,
                       "Camera config", "All (*)"); row += 1
 
+        self.le_shutter = QLineEdit(c.get("shutterspeed", ""))
+        self.le_shutter.setPlaceholderText("from camera cfg file")
+        self.le_shutter.setToolTip(
+            "Exposure exactly as the camera names it: 1/125, 10.3, 30.\n"
+            "Empty = keep whatever the camera cfg file holds.\n"
+            "Applied on top of that file; an unsupported value is reported\n"
+            "at startup along with the list the camera does offer."
+        )
+        _add_label_row(grid, row, "Shutter speed:", self.le_shutter); row += 1
+
         self.le_instance = QLineEdit(c.get("instance_name", ""))
         self.le_instance.setPlaceholderText("auto (hostname_IP)")
         _add_label_row(grid, row, "Instance name:", self.le_instance); row += 1
@@ -200,6 +210,7 @@ class CannonConfigTab:
             "output_dir":      self.le_output.text().strip(),
             "schedule_file":   self.le_schedule.text().strip(),
             "camcfg_file":     self.le_camcfg.text().strip(),
+            "shutterspeed":    self.le_shutter.text().strip(),
             "instance_name":   self.le_instance.text().strip(),
             "capture_seconds": secs,
         }

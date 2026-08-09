@@ -4,7 +4,8 @@
     "output_dir": "/path/to/output",
     "schedule_file": "/path/to/schedule.txt",
     "capture_seconds": [0, 30],
-    "camcfg_file": ""
+    "camcfg_file": "",
+    "shutterspeed": ""
   },
   "sptt": {
     "instance_name": "",
