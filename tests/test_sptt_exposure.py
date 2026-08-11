@@ -411,6 +411,45 @@ def test_a_refused_change_does_not_leave_the_camera_stopped():
     assert cam._running
 
 
+def test_the_fifo_is_polled_as_finely_as_the_vendor_polls_it():
+    """Poll granularity is dead time, and it varies frame to frame.
+
+    The next integration only starts once the frame has been read and the FIFO
+    re-armed, so a coarse poll postpones it by however much of the interval is
+    left — a different amount every time, at one unchanging exposure.
+    """
+    from cameras.sptt_driver import FIFO_POLL_INTERVAL
+
+    assert FIFO_POLL_INTERVAL <= 0.005          # SPTT-CAM/capture.py:333
+
+
+def test_the_camera_is_not_polled_on_every_pass_of_the_loop():
+    """Ten control transfers a second collided with the frame readout."""
+    from cameras.sptt_driver import SpttWorkerConsole
+
+    fw = FakeFirmware()
+    cam = make_camera(fw)
+    cam.configure(exposure=0.01)
+
+    worker = SpttWorkerConsole.__new__(SpttWorkerConsole)
+    worker.cam = cam
+    worker.output_dir = ""
+    worker._cam_status = {}
+    worker._cam_status_at = None
+    worker._system_info = None
+
+    first = worker._camera_status()
+    assert first                                # the first call does ask
+
+    fw.commands.clear()
+    for _ in range(10):                         # a second of the 0.1 s loop
+        worker._camera_status()
+    assert not fw.commands                      # and the rest do not
+
+    worker._camera_status(force=True)           # a capture still refreshes it
+    assert fw.commands
+
+
 def test_the_gui_copy_does_not_reimplement_the_timing():
     """One source of truth: gui_app drives the driver, it does not re-derive.
 

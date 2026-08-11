@@ -24,6 +24,8 @@ import usb.core
 import usb.util
 import usb.backend.libusb1
 
+from utils import APP_DIR
+
 # Camera USB IDs
 VID = 0xDCDC
 PID_RAW = 0xF429        # FX2 before firmware load
@@ -61,21 +63,38 @@ def find_libusb_backend():
     return usb.backend.libusb1.get_backend()
 
 
-def load_firmware_files(script_dir=None):
-    """Load firmware binary files from firmware/ directory."""
-    if script_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-    firmware_dir = os.path.join(script_dir, "firmware")
+def firmware_path(firmware_dir=None):
+    """Where the two firmware blobs live.
 
-    fx2_path = os.path.join(firmware_dir, "fx2_firmware.bin")
-    fpga_path = os.path.join(firmware_dir, "fpga_bitstream.bin")
+    ``firmware_dir`` is the ``sptt.firmware_dir`` config key; empty means the
+    ``firmware/`` directory shipped with the program. That default is anchored
+    to :data:`utils.APP_DIR` — the program root — and not to this file, which
+    lives one level down in ``cameras/``. Deriving it from ``__file__`` is what
+    made the loader look for ``cameras/firmware/``, a directory that has never
+    existed, so no firmware could be found and the camera never came up.
+    """
+    if firmware_dir:
+        return (firmware_dir if os.path.isabs(firmware_dir)
+                else os.path.join(APP_DIR, firmware_dir))
+    return os.path.join(APP_DIR, "firmware")
 
-    if not os.path.exists(fx2_path):
-        print(f"ERROR: FX2 firmware not found: {fx2_path}")
-        sys.exit(1)
-    if not os.path.exists(fpga_path):
-        print(f"ERROR: FPGA bitstream not found: {fpga_path}")
-        sys.exit(1)
+
+def load_firmware_files(firmware_dir=None):
+    """Read the FX2 firmware and the FPGA bitstream."""
+    directory = firmware_path(firmware_dir)
+
+    fx2_path = os.path.join(directory, "fx2_firmware.bin")
+    fpga_path = os.path.join(directory, "fpga_bitstream.bin")
+
+    # Raised, not sys.exit: this is called from the GUI's connect button and
+    # from the console worker, and both need to report it rather than take the
+    # whole program down. SystemExit would not even be caught by their
+    # ``except Exception`` handlers.
+    missing = [p for p in (fx2_path, fpga_path) if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            "SPTT firmware not found: " + ", ".join(missing) +
+            ". Set sptt.firmware_dir in config.json if the files live elsewhere.")
 
     with open(fx2_path, 'rb') as f:
         fx2_data = f.read()
@@ -86,6 +105,7 @@ def load_firmware_files(script_dir=None):
     if len(fx2_data) != expected_fx2:
         print(f"WARNING: FX2 firmware size {len(fx2_data)} != expected {expected_fx2}")
 
+    print(f"  Firmware directory: {directory}")
     print(f"  FX2 firmware:    {len(fx2_data)} bytes")
     print(f"  FPGA bitstream:  {len(fpga_data)} bytes")
 

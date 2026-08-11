@@ -1382,6 +1382,7 @@ class SpttTab(QWidget):
         # overrides it, and this tab is not where that decision is made.
         self._period_us = c.get("period_us")
         self._trigmode = c.get("trigmode")
+        self._firmware_dir = c.get("firmware_dir", "")
         self.spin_gain.setValue(c.get("gain", 100))
         self.combo_binning.setCurrentIndex(c.get("binning", 0))
         self.combo_encoding.setCurrentIndex(c.get("encoding", 1))
@@ -1401,7 +1402,10 @@ class SpttTab(QWidget):
         try:
             from sptt_driver import SpttCamera, ensure_firmware_loaded, find_libusb_backend
             backend = find_libusb_backend()
-            ensure_firmware_loaded(backend)
+            if not ensure_firmware_loaded(backend, self._firmware_dir):
+                raise RuntimeError(
+                    "Firmware could not be loaded — see the log for the paths "
+                    "that were searched.")
             time.sleep(1.5)
             self.cam = SpttCamera(backend)
             self.cam.open()

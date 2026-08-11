@@ -22,7 +22,7 @@ import intensity
 
 from utils import (
     claim_instance_name, get_instance_name, get_local_ip, get_system_info,
-    APP_DIR,
+    APP_DIR, STATUS_MIN_INTERVAL,
 )
 from worker_common import (
     WorkerMqtt, parse_command_params, publish_current_params,
@@ -70,6 +70,13 @@ ENCODING_12BPP = 1
 
 USB_CMD_TIMEOUT = 10000
 USB_READ_TIMEOUT = 10000
+
+# How often to ask whether a frame has landed. The next integration only starts
+# when the read is finished and the FIFO is re-armed, so this interval is dead
+# time added to every frame — and because it lands wherever the poll happens to
+# fall, it makes the dead time differ from frame to frame at one exposure. The
+# vendor's own program polls at 5 ms; this driver used to poll at 50 ms.
+FIFO_POLL_INTERVAL = 0.005
 
 # Default capture seconds (can be overridden in config)
 SPTT_CAPTURE_SECONDS = [0, 30]
@@ -440,7 +447,7 @@ class SpttCamera:
                 continue
             if not (sb & 0x08):
                 return
-            time.sleep(0.05)
+            time.sleep(FIFO_POLL_INTERVAL)
         raise RuntimeError("FIFO timeout — no frame data")
 
     def _read_one_frame(self):
@@ -528,8 +535,12 @@ class SpttCamera:
 # ---------------------------------------------------------------------------
 # Firmware loading
 # ---------------------------------------------------------------------------
-def ensure_firmware_loaded(backend):
-    """Load firmware if device is not yet configured."""
+def ensure_firmware_loaded(backend, firmware_dir=None):
+    """Load firmware if device is not yet configured.
+
+    ``firmware_dir`` is ``sptt.firmware_dir`` from the config; empty or absent
+    means the ``firmware/`` directory next to the program.
+    """
     dev = usb.core.find(idVendor=VID, idProduct=PID_CONFIGURED, backend=backend)
     if dev:
         console_ui.log(f"Camera already configured (PID=0x{PID_CONFIGURED:04x}), skipping firmware load.")
@@ -542,7 +553,13 @@ def ensure_firmware_loaded(backend):
         return False
 
     console_ui.log("Loading firmware files…")
-    fx2_data, fpga_data = load_firmware_files()
+    try:
+        fx2_data, fpga_data = load_firmware_files(firmware_dir)
+    except FileNotFoundError as exc:
+        # Same shape as "no camera found" above: the caller decides what to do,
+        # and the operator gets the path that was actually searched.
+        console_ui.error(str(exc))
+        return False
 
     console_ui.log(f"Found raw FX2 device: {VID:04x}:{PID_RAW:04x}")
     detach_kernel_driver(dev_raw)
@@ -739,6 +756,11 @@ class SpttWorkerConsole(threading.Thread):
         self._pending_capture = None
         self._pending_capture_lock = threading.Lock()
         self._pending_capture_event = threading.Event()
+        # Camera and filesystem status, refreshed on the status cadence rather
+        # than on every pass of the measurement loop — see _camera_status.
+        self._cam_status = {}
+        self._cam_status_at = None
+        self._system_info = None
 
     def request_stop(self):
         self._stop_event.set()
@@ -1009,16 +1031,39 @@ class SpttWorkerConsole(threading.Thread):
             console_ui.error(f"Capture error: {exc}")
             return False
 
+    def _camera_status(self, force=False):
+        """The camera's own status block, at the cadence the status goes out.
+
+        The measurement loop calls _save_status ten times a second, but a
+        status only leaves every ``STATUS_MIN_INTERVAL``. Asking the camera on
+        every pass put ten control transfers a second on the very endpoint the
+        frame readout uses, so the gap between frames grew by however much USB
+        traffic happened to collide with it — visible as dead time that varies
+        while the exposure does not.
+        """
+        now = time.monotonic()
+        if (not force and self._cam_status_at is not None
+                and now - self._cam_status_at < STATUS_MIN_INTERVAL):
+            return self._cam_status
+        try:
+            self._cam_status = self.cam.get_status_info()
+        except Exception:
+            self._cam_status = {}
+        try:
+            self._system_info = get_system_info(self.output_dir)
+            console_ui.update(
+                disk_free_mb=self._system_info.get("disk_free_mb"))
+        except Exception:
+            pass
+        self._cam_status_at = now
+        return self._cam_status
+
     def _save_status(self, status, force=False):
         # focus_app only sees the values published from here, so they are
         # refreshed on the status cadence rather than left as they were at
         # startup — see worker_common.publish_current_params.
         publish_current_params(self._service, self._current_params)
-        cam_status = {}
-        try:
-            cam_status = self.cam.get_status_info()
-        except Exception:
-            pass
+        cam_status = self._camera_status(force)
 
         payload = {
             "instance_name": self.instance_name,
@@ -1042,12 +1087,12 @@ class SpttWorkerConsole(threading.Thread):
             "last_update": dt.now().isoformat(),
         }
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
-        try:
-            system = get_system_info(self.output_dir)
-            payload["system"] = system
-            console_ui.update(disk_free_mb=system.get("disk_free_mb"))
-        except Exception:
-            pass
+        # Cached on the same cadence and for the same reason as the camera
+        # status: this stats the output filesystem, which on a network share is
+        # not a free call to make ten times a second between frames.
+        if self._system_info is not None:
+            payload["system"] = self._system_info
+
         console_ui.update(status=status, frames=self._shots, errors=self._errors,
                           output_dir=self.output_dir)
         console_ui.set_section("camera", [
@@ -1134,6 +1179,7 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
     target_temp = sptt_cfg.get("target_temp")
     period_us = sptt_cfg.get("period_us")
     trigmode = sptt_cfg.get("trigmode")
+    firmware_dir = sptt_cfg.get("firmware_dir", "")
     capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
     dash = console_ui.start_dashboard("sptt", instance_name, verbose=verbose)
@@ -1152,7 +1198,8 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
         _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
                           instance_name, node_name, output_dir, status_dir,
                           exposure, gain, binning, encoding, target_temp,
-                          capture_seconds, setup_mode, period_us, trigmode)
+                          capture_seconds, setup_mode, period_us, trigmode,
+                          firmware_dir)
     finally:
         dash.stop()
         claim.release()
@@ -1162,7 +1209,7 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
                       instance_name, node_name, output_dir, status_dir,
                       exposure, gain, binning, encoding, target_temp,
                       capture_seconds, setup_mode=False, period_us=None,
-                      trigmode=None):
+                      trigmode=None, firmware_dir=""):
     """Body of :func:`run_console_sptt`, with the dashboard already running."""
     from mqtt_client import create_console_publisher
 
@@ -1204,6 +1251,7 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         target_temp = sptt_cfg.get("target_temp")
         period_us = sptt_cfg.get("period_us")
         trigmode = sptt_cfg.get("trigmode")
+        firmware_dir = sptt_cfg.get("firmware_dir", "")
         capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
         dash.update(output_dir=output_dir,
                     schedule=f"capture at {capture_seconds} s of each minute")
@@ -1222,7 +1270,7 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
     # Load firmware and connect
     console_ui.log("Initializing SPTT camera...")
     backend = find_libusb_backend()
-    if not ensure_firmware_loaded(backend):
+    if not ensure_firmware_loaded(backend, firmware_dir):
         console_ui.error("Failed to initialize camera.")
         sys.exit(1)
     time.sleep(1)
