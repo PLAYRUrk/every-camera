@@ -1021,13 +1021,16 @@ class SpttScheduledWorkerQt(QThread):
                 else:
                     encoding = self.cam.encoding
                 self.cam.stop()
-                self.cam.configure(
-                    exposure=self.cam.exposure,
-                    gain=self.cam.gain,
-                    binning=binning,
-                    encoding=encoding,
-                )
-                self.cam.start()
+                try:
+                    self.cam.configure(
+                        exposure=self.cam.exposure,
+                        gain=self.cam.gain,
+                        binning=binning,
+                        encoding=encoding,
+                    )
+                finally:
+                    # A refused timing must not leave the camera stopped.
+                    self.cam.start()
                 applied["binning"] = binning
                 applied["encoding"] = "12bit" if encoding == ENCODING_12BPP else "8bit"
         except Exception as e:
@@ -1050,7 +1053,8 @@ class SpttScheduledWorkerQt(QThread):
                 self.log_msg.emit(f"Param apply warning: {err}", "warn")
                 print(f"[sptt:{self.instance_name}] Param apply warning: {err}",
                       flush=True)
-            frame = self.cam.grab_frame()
+            # The requester is waiting for a frame that reflects their params.
+            frame = self.cam.grab_fresh_frame()
             now = dt.now()
             jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
             self._publish_sptt_frame(
@@ -1066,7 +1070,8 @@ class SpttScheduledWorkerQt(QThread):
                   flush=True)
 
     def run(self):
-        from sptt_driver import save_fits, ENCODING_12BPP, SPTT_CAPTURE_SECONDS
+        from sptt_driver import (save_fits, frame_metadata, ENCODING_12BPP,
+                                 SPTT_CAPTURE_SECONDS)
 
         last_fired = (-1, -1)
         consecutive_errors = 0
@@ -1104,20 +1109,10 @@ class SpttScheduledWorkerQt(QThread):
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
                 filepath = os.path.join(self.output_dir, f"{timestamp}.fit")
                 try:
-                    frame = self.cam.grab_frame()
-                    cam_status = self.cam.get_status_info()
-                    metadata = {
-                        "DATE-OBS": now.isoformat(),
-                        "INSTRUME": "CSDU-429",
-                        "EXPTIME": self.cam.exposure,
-                        "GAIN": self.cam.gain,
-                        "BINNING": self.cam.binning,
-                        "ENCODING": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
-                    }
-                    if cam_status:
-                        metadata["CCDTEMP"] = cam_status.get("temp_ccd", 0)
-                        metadata["SINKTEMP"] = cam_status.get("temp_sink", 0)
-                        metadata["TRGTEMP"] = cam_status.get("temp_target", 0)
+                    # A frame started at the tick, not one that has been
+                    # sitting in the FIFO since the last capture.
+                    frame = self.cam.grab_fresh_frame()
+                    metadata = frame_metadata(self.cam, now)
                     save_fits(filepath, frame, metadata)
                     self._last_frame = frame
                     self._push_live(frame, now)
@@ -1171,8 +1166,11 @@ class SpttScheduledWorkerQt(QThread):
             applied, errors = self._apply_sptt_params(params)
             self._service.complete_param_request(req_id, applied, errors)
             publish_current_params(self._service, self._current_params)
+        # Only the frame right after a change is worth a full period's wait;
+        # grab_frame drops the contaminated one either way.
+        grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: self.cam.grab_frame(),
+            self._service, lambda: grab(),
             on_error=lambda exc, stopped: self.log_msg.emit(
                 f"Focus frame failed: {exc}"
                 + (" — focus mode disabled" if stopped else ""), "warn"))
@@ -1380,6 +1378,10 @@ class SpttTab(QWidget):
                                  or get_instance_name("SPTT", self._cfg))
         self.le_output.setText(c.get("output_dir", ""))
         self.spin_exp.setValue(c.get("exposure", 0.88))
+        # Not on the form: the period follows the exposure unless config.json
+        # overrides it, and this tab is not where that decision is made.
+        self._period_us = c.get("period_us")
+        self._trigmode = c.get("trigmode")
         self.spin_gain.setValue(c.get("gain", 100))
         self.combo_binning.setCurrentIndex(c.get("binning", 0))
         self.combo_encoding.setCurrentIndex(c.get("encoding", 1))
@@ -1409,6 +1411,8 @@ class SpttTab(QWidget):
                 binning=self.combo_binning.currentIndex(),
                 encoding=self.combo_encoding.currentIndex(),
                 target_temp=self.spin_temp.value() if self.spin_temp.value() != 0 else None,
+                period_us=self._period_us,
+                trigmode=self._trigmode,
             )
             self.btn_reconnect.setEnabled(True)
             self.btn_preview_start.setEnabled(True)
@@ -1497,6 +1501,8 @@ class SpttTab(QWidget):
                 binning=self.combo_binning.currentIndex(),
                 encoding=self.combo_encoding.currentIndex(),
                 target_temp=self.spin_temp.value() if self.spin_temp.value() != 0 else None,
+                period_us=self._period_us,
+                trigmode=self._trigmode,
             )
             self._log(f"SPTT settings applied: {self.cam.w}x{self.cam.h}", "info")
         except Exception as e:
@@ -1509,8 +1515,10 @@ class SpttTab(QWidget):
         if self.cam:
             try:
                 self.cam.set_exposure(self.spin_exp.value())
-            except Exception:
-                pass
+            except Exception as e:
+                # An exposure the camera refuses used to vanish here, leaving
+                # the GUI the one place where a truncated exposure was silent.
+                self._log(f"Exposure not applied: {e}", "warn")
 
     def _on_gain_changed(self):
         if self.cam:

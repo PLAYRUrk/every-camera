@@ -283,6 +283,11 @@ def _extra_info(rec):
     elif cam_type == "sptt":
         if rec.get("exposure_s") is not None:
             parts.append(f"Exp:{rec['exposure_s']}s")
+        # Only when the camera disagrees with the request — that divergence is
+        # the whole story of the truncated-exposure bug.
+        cam_exp = rec.get("cam_exposure_s")
+        if cam_exp is not None and cam_exp != rec.get("exposure_s"):
+            parts.append(f"hw:{cam_exp}s")
         if rec.get("gain") is not None:
             parts.append(f"G:{rec['gain']}")
         if rec.get("frame_size"):

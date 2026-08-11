@@ -252,6 +252,45 @@ class SpttConfigTab:
         self.sb_exposure.setValue(c.get("exposure", 0.88))
         _add_label_row(grid, row, "Exposure:", self.sb_exposure); row += 1
 
+        # Frame period: the register that used to be pinned at 75 ms whatever
+        # the exposure was, quietly cutting every integration short. Auto keeps
+        # it above the exposure; the manual value is for trigger modes where
+        # the period does not gate the integration.
+        from PyQt5.QtWidgets import QHBoxLayout
+        period_w = QWidget()
+        period_lay = QHBoxLayout(period_w)
+        period_lay.setContentsMargins(0, 0, 0, 0)
+        self.cb_period_auto = QCheckBox("Auto (follows exposure)")
+        self.sb_period = QSpinBox()
+        self.sb_period.setRange(0, 2_000_000_000)
+        self.sb_period.setSingleStep(1000)
+        self.sb_period.setSuffix(" us")
+        period = c.get("period_us")
+        if period is None:
+            self.cb_period_auto.setChecked(True)
+            self.sb_period.setEnabled(False)
+            self.sb_period.setValue(self._auto_period())
+        else:
+            self.sb_period.setValue(int(period))
+        self.cb_period_auto.stateChanged.connect(self._on_period_auto)
+        self.sb_exposure.valueChanged.connect(self._on_exposure_changed)
+        period_lay.addWidget(self.cb_period_auto)
+        period_lay.addWidget(self.sb_period)
+        period_lay.addStretch()
+        _add_label_row(grid, row, "Frame period:", period_w); row += 1
+
+        self.cb_trigmode = QComboBox()
+        # Vendor's list, see SPTT-CAM/capture.py --trigmode.
+        self._trigmodes = [None, 0, 1, 2, 3, 5, 7]
+        self.cb_trigmode.addItems([
+            "default (0 — continuous)", "0 — continuous", "1 — external",
+            "2 — software", "3 — bulb", "5 — external single", "7 — bulb single",
+        ])
+        trigmode = c.get("trigmode")
+        self.cb_trigmode.setCurrentIndex(
+            self._trigmodes.index(trigmode) if trigmode in self._trigmodes else 0)
+        _add_label_row(grid, row, "Trigger mode:", self.cb_trigmode); row += 1
+
         self.sb_gain = QSpinBox()
         self.sb_gain.setRange(0, 1023)
         self.sb_gain.setValue(c.get("gain", 100))
@@ -300,6 +339,24 @@ class SpttConfigTab:
         root.addWidget(box)
         root.addStretch()
 
+    def _auto_period(self):
+        """The period the driver would derive for the exposure now in the form.
+
+        Imported lazily and from cameras.sptt_timing rather than the driver:
+        this dialog has to open on machines with no libusb.
+        """
+        from cameras.sptt_timing import derive_period_us
+        return derive_period_us(self.sb_exposure.value())
+
+    def _on_period_auto(self, state):
+        self.sb_period.setEnabled(not bool(state))
+        if state:
+            self.sb_period.setValue(self._auto_period())
+
+    def _on_exposure_changed(self, _value):
+        if self.cb_period_auto.isChecked():
+            self.sb_period.setValue(self._auto_period())
+
     def get_config(self) -> dict:
         binning_vals = [0, 1, 3]
         try:
@@ -311,6 +368,8 @@ class SpttConfigTab:
             "firmware_dir":  self.le_firmware.text().strip(),
             "instance_name": self.le_instance.text().strip(),
             "exposure":      self.sb_exposure.value(),
+            "period_us":     None if self.cb_period_auto.isChecked() else self.sb_period.value(),
+            "trigmode":      self._trigmodes[self.cb_trigmode.currentIndex()],
             "gain":          self.sb_gain.value(),
             "binning":       binning_vals[self.cb_binning.currentIndex()],
             "encoding":      self.cb_encoding.currentIndex(),

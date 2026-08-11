@@ -207,6 +207,10 @@ DEFAULT_CONFIG = {
         "output_dir": "",
         "capture_seconds": [0, 30],
         "exposure": 0.88,
+        # None: the frame period follows the exposure. A period shorter than
+        # the exposure truncates the integration instead of slowing the camera.
+        "period_us": None,
+        "trigmode": None,
         "gain": 100,
         "binning": 0,
         "encoding": 1,
@@ -247,6 +251,7 @@ DEFAULT_CONFIG = {
             "max_exposure": None,       # None = no longer than the slot's own
             "max_step": 4.0,            # largest exposure change per measurement
             "bias": 0.0,                # pedestal, ADU; used when there are no darks
+            "binning": None,            # None: each slot keeps its schedule binning
         },
         # Cycle modes: divide a slot's frame into shorter sub-frames when it
         # comes back over the threshold, so a filter cannot saturate. Off by
@@ -678,6 +683,22 @@ def _ask_float(prompt, default=0.0):
         return default
 
 
+def _ask_optional_int(prompt, default=None):
+    """Ask for an integer that may be left unset.
+
+    ``_ask_int`` cannot express this: an empty answer there means "keep the
+    default", while here it has to mean "let the program work it out", which is
+    a value in its own right.
+    """
+    val = _ask(prompt, "" if default is None else str(default)).strip()
+    if not val:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
 def configure_console_cannon(cfg, config_path=None):
     """Interactive configuration for Canon camera console mode."""
     cannon = cfg.get("cannon", {})
@@ -720,6 +741,15 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["instance_name"] = _ask("Instance name (auto if empty)",
                                   sptt.get("instance_name", ""))
     sptt["exposure"] = _ask_float("Exposure (seconds)", sptt.get("exposure", 0.88))
+
+    print("\n  The frame period is a separate register, and one shorter than")
+    print("  the exposure truncates the integration instead of slowing the")
+    print("  camera down. Leave it empty and it follows the exposure.")
+    sptt["period_us"] = _ask_optional_int(
+        "Frame period, us (empty = auto)", sptt.get("period_us"))
+    sptt["trigmode"] = _ask_optional_int(
+        "Trigger mode (empty = 0, continuous)", sptt.get("trigmode"))
+
     sptt["gain"] = _ask_int("Gain (0-1023)", sptt.get("gain", 100))
     sptt["binning"] = _ask_int("Binning (0=1x1, 1=2x2, 3=4x4)", sptt.get("binning", 0))
     enc = _ask_int("Encoding (0=8bit, 1=12bit)", sptt.get("encoding", 1))

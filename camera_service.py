@@ -46,6 +46,9 @@ PARAM_SCHEMAS = {
          "hint": "Daylight"},
     ],
     "sptt": [
+        # No frame period here on purpose: the driver derives it from the
+        # exposure, and a period settable from a web form is a period someone
+        # can set shorter than the exposure, which silently truncates it.
         {"name": "exposure", "label": "Exposure (s)", "type": "float",
          "min": 0.001, "max": 60.0, "step": 0.01},
         {"name": "gain", "label": "Gain", "type": "int", "min": 0, "max": 1023},

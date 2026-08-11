@@ -102,8 +102,13 @@ def darks(tmp_path):
 
 
 def name_exposure_ms(path):
-    """The exposure the archive file name claims, in milliseconds."""
-    return int(path.name.split("_")[-1].removesuffix("ms.fits"))
+    """The exposure the archive file name claims, in milliseconds.
+
+    Preflight frames carry a ``_pf`` suffix after the exposure field, so the
+    last underscore-separated part is not always the exposure.
+    """
+    stem = path.name.removesuffix(".fits").removesuffix("_pf")
+    return int(stem.split("_")[-1].removesuffix("ms"))
 
 
 # ---------------------------------------------------------------------------

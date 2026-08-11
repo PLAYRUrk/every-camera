@@ -11,6 +11,8 @@
     "instance_name": "",
     "output_dir": "/path/to/output",
     "exposure": 0.88,
+    "period_us": null,
+    "trigmode": null,
     "gain": 100,
     "binning": 0,
     "encoding": 1,
