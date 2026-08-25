@@ -801,8 +801,11 @@ class AsiConfigTab:
         self.sb_move_timeout.setRange(0.5, 120.0)
         self.sb_move_timeout.setDecimals(1)
         self.sb_move_timeout.setSuffix(" s")
-        self.sb_move_timeout.setToolTip("Safety ceiling for a stuck wheel; a "
-                                        "normal move takes about a second")
+        self.sb_move_timeout.setToolTip("Safety ceiling for one attempt at a "
+                                        "stuck wheel; a normal move takes about "
+                                        "a second, and a move that is not "
+                                        "confirmed is retried before the "
+                                        "position is given up")
         self.sb_move_timeout.setValue(float(wheel.get("move_timeout", 8.0)))
         _add_label_row(hgrid, row, "Move timeout:", self.sb_move_timeout); row += 1
 
@@ -1237,8 +1240,11 @@ class JapanConfigTab:
         self.sb_move_timeout.setRange(0.5, 120.0)
         self.sb_move_timeout.setDecimals(1)
         self.sb_move_timeout.setSuffix(" s")
-        self.sb_move_timeout.setToolTip("Safety ceiling for a stuck wheel; a "
-                                        "normal move takes about a second")
+        self.sb_move_timeout.setToolTip("Safety ceiling for one attempt at a "
+                                        "stuck wheel; a normal move takes about "
+                                        "a second, and a move that is not "
+                                        "confirmed is retried before the "
+                                        "position is given up")
         self.sb_move_timeout.setValue(float(wheel.get("move_timeout", 8.0)))
         _add_label_row(hgrid, row, "Move timeout:", self.sb_move_timeout); row += 1
 

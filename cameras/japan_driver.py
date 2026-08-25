@@ -248,13 +248,19 @@ class JapanCamera:
         Unlike the ASI driver there is no exposure override: nothing here chooses
         an exposure, so the entry is the only authority on what the camera should
         hold.
+
+        Returns True when everything asked for is set. A filter that did not
+        arrive gives False, having already said so: the result used to be
+        dropped here, and a wheel that never got where it was sent left no trace
+        anywhere except a frame filed with position 0.
         """
         if entry.exposure is not None and self.current_exposure != entry.exposure:
             self.set_exposure(entry.exposure)
         if entry.binning and self.current_binning != entry.binning:
             self.set_binning(entry.binning)
         if entry.filter and self.current_filter != entry.filter:
-            self.select_filter(entry.filter)
+            return self.select_filter(entry.filter)
+        return True
 
     def temperature_fields(self):
         """The sensor reading for the console, taken on the worker thread only."""
@@ -293,6 +299,12 @@ class JapanWorkerConsole(threading.Thread):
         self._stop_event = threading.Event()
         self._force_quit = False
         self._shots = 0
+        # Lights taken in the session running right now, as opposed to the run
+        # total above. Closing darks bracket a session, and in sun mode one run
+        # spans many nights: without this, a stop at noon — the moment an
+        # operator picks to update the machine — would shoot a set of darks for
+        # a night that ended hours earlier.
+        self._session_shots = 0
         self._darks = 0
         self._errors = 0
         self._last_shot = None
@@ -681,6 +693,46 @@ class JapanWorkerConsole(threading.Thread):
                            "next slot.")
         return True
 
+    def _closing_darks_due(self):
+        """Whether there is a session for closing darks to bracket.
+
+        Darks bracket a measurement session. There is nothing to bracket when
+        none has run — stopped while still waiting for the start signal or the
+        sun — nor between nights, once the session that had lights in it is over
+        and the next one has not begun. The ASI driver says the same thing in
+        the same words; the reasoning is the wheel-independent half of a run.
+        """
+        if self._force_quit or self.setup_mode:
+            return False
+        return self._session_shots > 0
+
+    def _prepare_entry(self, entry):
+        """Apply one schedule entry; False if the preparation itself broke.
+
+        A filter that simply did not arrive is not that: the frame is still
+        worth taking, and it is filed with whatever the wheel reports, so the
+        failure is counted, published and logged rather than costing the slot.
+        The ASI driver says the same thing in the same words — one wheel, one
+        way of failing.
+        """
+        try:
+            arrived = self.cam.prepare(entry)
+        except Exception as exc:
+            console_ui.error(f"Could not prepare filter {entry.filter}: {exc}")
+            self._errors += 1
+            self._dash_update(errors=self._errors)
+            return False
+        if not arrived:
+            self._errors += 1
+            self._dash_update(errors=self._errors)
+            console_ui.error(
+                f"Filter {entry.filter} was not reached — the wheel reports "
+                f"{_filter_text(self.cam.current_filter)}; this frame is filed "
+                f"with what the wheel reports, not with what the schedule asked for")
+            self._bus.publish_error(
+                "error", f"filter wheel did not reach position {entry.filter}")
+        return True
+
     def _take_schedule_dirty(self):
         """True once after a focus hold, so a mode loop plans its next slot again.
 
@@ -817,6 +869,7 @@ class JapanWorkerConsole(threading.Thread):
             self._darks += 1
         else:
             self._shots += 1
+            self._session_shots += 1
         if self._service is not None:
             # ``path`` so the frame server can read this frame's own FITS header
             # back off the disk it was just written to: the observer's info panel
@@ -842,11 +895,21 @@ class JapanWorkerConsole(threading.Thread):
     # ------------------------------------------------------------------
     # Dark frames
     # ------------------------------------------------------------------
-    def _capture_darks(self, phase, sync_to_seconds=False):
-        """Shoot ``dark_frames`` frames per unique exposure with the shutter shut."""
+    def _capture_darks(self, phase, sync_to_seconds=False, abort_on_stop=False):
+        """Shoot ``dark_frames`` frames per unique exposure with the shutter shut.
+
+        ``abort_on_stop`` makes a stop request end the series, which is what the
+        opening darks want and the closing darks must not have: the closing ones
+        exist to be taken *after* a stop, while the opening ones lead into
+        measurements that a stop has just cancelled.
+        """
         entries = self.cfg.schedule.entries
         combos = japan_schedule.unique_exposures(entries)
-        if not combos or self._force_quit or not self.cfg.schedule.dark_frames:
+
+        def cancelled():
+            return self._force_quit or (abort_on_stop and self._stop_event.is_set())
+
+        if not combos or cancelled() or not self.cfg.schedule.dark_frames:
             return
         total = self.cfg.schedule.dark_frames * len(combos)
         self._set_phase(f"dark frames ({phase})", detail=f"0/{total}")
@@ -866,7 +929,7 @@ class JapanWorkerConsole(threading.Thread):
         done = 0
         try:
             for exposure, binning in combos:
-                if self._force_quit:
+                if cancelled():
                     break
                 try:
                     self.cam.set_exposure(exposure)
@@ -876,15 +939,16 @@ class JapanWorkerConsole(threading.Thread):
                     console_ui.error(f"Could not set up darks ({exposure} s): {exc}")
                     continue
                 for _ in range(self.cfg.schedule.dark_frames):
-                    if self._force_quit:
+                    if cancelled():
                         break
                     if sync_to_seconds:
                         seconds = sorted({s for entry in entries
                                           for s in (entry.seconds or [0])})
                         target = japan_schedule.next_second_slot(seconds)
-                        # Darks must still be taken after a stop request, so this wait
-                        # ignores the stop flag and only honours a forced quit.
-                        self._sleep_until(target)
+                        # Closing darks must still be taken after a stop request,
+                        # so this wait ignores the stop flag unless the caller
+                        # asked for the opposite.
+                        self._sleep_until(target, abort_on_stop=abort_on_stop)
                     done += 1
                     self._set_phase(f"dark frames ({phase})", detail=f"{done}/{total}")
                     self._capture_one(dt.now(), exposure, image_type="DARK",
@@ -893,9 +957,13 @@ class JapanWorkerConsole(threading.Thread):
         finally:
             self._darks_running = False
             self._focus_note("")
-        console_ui.log(f"Dark frames ({phase}) complete: {self._darks} total")
+        if cancelled() and phase == "initial":
+            console_ui.log("Stop requested — the opening dark frames are cut short "
+                           "and no measurements will follow")
+        else:
+            console_ui.log(f"Dark frames ({phase}) complete: {self._darks} total")
 
-    def _sleep_until(self, target):
+    def _sleep_until(self, target, abort_on_stop=False):
         """Plain wait that only a forced quit interrupts (used inside dark runs).
 
         Status keeps being published — a dark run is minutes long, and without
@@ -904,7 +972,8 @@ class JapanWorkerConsole(threading.Thread):
         halfway through would leave the run with darks that match nothing.
         """
         last_status = 0.0
-        while not self._force_quit:
+        while not (self._force_quit
+                   or (abort_on_stop and self._stop_event.is_set())):
             remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
                 return True
@@ -945,6 +1014,11 @@ class JapanWorkerConsole(threading.Thread):
                 return
 
     def _run_sun_mode(self):
+        # A new session starts here. In sun mode this function is called once
+        # per night, so resetting the counter as the next night is planned is
+        # also what clears it once the last one is over — from then until lights
+        # are taken again there is nothing for closing darks to bracket.
+        self._session_shots = 0
         sched = self.cfg.schedule
         angle_fn = self._sun_angle_fn()
 
@@ -960,7 +1034,7 @@ class JapanWorkerConsole(threading.Thread):
                                        f"window ~{activation.strftime('%H:%M')}")
             if not self._wait_until(dark_start, phase="waiting for pre-darks"):
                 return
-        self._capture_darks("initial", sync_to_seconds=True)
+        self._capture_darks("initial", sync_to_seconds=True, abort_on_stop=True)
         if self._stop_event.is_set():
             return
 
@@ -992,11 +1066,7 @@ class JapanWorkerConsole(threading.Thread):
             for entry in sched.entries:
                 if self._stop_event.is_set():
                     break
-                try:
-                    self.cam.prepare(entry)
-                except Exception as exc:
-                    console_ui.error(f"Could not prepare filter {entry.filter}: {exc}")
-                    self._errors += 1
+                if not self._prepare_entry(entry):
                     continue
                 self._refresh_camera_section()
                 target = japan_schedule.next_second_slot(entry.seconds or [0])
@@ -1059,6 +1129,11 @@ class JapanWorkerConsole(threading.Thread):
         return not self._stop_event.is_set()
 
     def _run_time_mode(self):
+        # A new session starts here. In sun mode this function is called once
+        # per night, so resetting the counter as the next night is planned is
+        # also what clears it once the last one is over — from then until lights
+        # are taken again there is nothing for closing darks to bracket.
+        self._session_shots = 0
         sched = self.cfg.schedule
         started = dt.now()
         # The occurrence of t_start belonging to the night we are in, which past
@@ -1073,7 +1148,7 @@ class JapanWorkerConsole(threading.Thread):
             console_ui.warn("Late start — the opening dark frames are skipped.")
             self._dash_update(note="Late start: initial darks skipped")
         else:
-            self._capture_darks("initial")
+            self._capture_darks("initial", abort_on_stop=True)
         if self._stop_event.is_set():
             return
 
@@ -1096,11 +1171,7 @@ class JapanWorkerConsole(threading.Thread):
             # takes about a second and there is normally far more room than that.
             # The original used a background thread and joined it before the
             # capture; doing it here is the same guarantee without the thread.
-            try:
-                self.cam.prepare(entry)
-            except Exception as exc:
-                console_ui.error(f"Could not prepare the cycle: {exc}")
-                self._errors += 1
+            self._prepare_entry(entry)
             self._refresh_camera_section()
 
             if not self._wait_until(slot, phase="measuring"):
@@ -1233,9 +1304,8 @@ class JapanWorkerConsole(threading.Thread):
                 self.cam.set_shutter(False)
             except Exception:
                 pass
-            # Darks bracket a measurement run; in setup mode there was none, and
-            # the exposure combinations they are built from are empty anyway.
-            if not self._force_quit and not self.setup_mode:
+            # See :meth:`_closing_darks_due` for when these are owed at all.
+            if self._closing_darks_due():
                 self._set_phase("closing darks")
                 try:
                     self._capture_darks("final")

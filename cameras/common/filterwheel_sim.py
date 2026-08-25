@@ -8,7 +8,7 @@ from time import sleep
 
 import console_ui
 
-from .filterwheel import FILTER_MAX, FILTER_MIN, HOME
+from .filterwheel import FILTER_MAX, FILTER_MIN, HOME, SELECT_ATTEMPTS
 
 MOVE_SECONDS = 1.0
 
@@ -19,6 +19,11 @@ class SimFilterWheel:
         # None until homed, exactly as the real controller — see filterwheel.py.
         self.current_filter: int | None = None
         self.shutter_open: bool = False
+        # Moves to refuse before behaving again. A wheel that does not arrive is
+        # a state the driver has to handle — it costs the frame its filter tag —
+        # and without this hook there is no way to reach that path at all off
+        # hardware. Set it from a test; a run never touches it.
+        self.fail_selects: int = 0
 
     def __enter__(self) -> SimFilterWheel:
         console_ui.log("Filter wheel: SIMULATOR (no serial port in use)")
@@ -28,12 +33,19 @@ class SimFilterWheel:
     def __exit__(self, *args) -> None:
         pass
 
-    def select(self, n: int) -> bool:
+    def read_position(self, timeout: float = 1.0) -> int | None:
+        return self.current_filter
+
+    def select(self, n: int, attempts: int = SELECT_ATTEMPTS) -> bool:
         if not FILTER_MIN <= n <= FILTER_MAX:
             raise ValueError(f"Filter must be {FILTER_MIN}..{FILTER_MAX}, got {n}")
         if n == self.current_filter:
             return True
         sleep(MOVE_SECONDS)
+        if self.fail_selects > 0:
+            self.fail_selects -= 1
+            self.current_filter = None
+            return False
         self.current_filter = n
         return True
 
