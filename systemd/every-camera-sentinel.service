@@ -29,11 +29,16 @@ Type=simple
 User=root
 WorkingDirectory=@APP_DIR@
 
-# No --config: the sentinel is one per machine while the cameras are one
-# per type, so it reads theirs (the checkout's config.json, then
-# @CONFIG_DIR@/*.json) rather than having a copy of the addresses that
-# could disagree with them.
-ExecStart=@PYTHON@ @APP_DIR@/sentinel.py
+# Through run.sh, like the cameras. It sources env.sh and picks the same
+# interpreter they use — which matters here more than anywhere: `python3` on
+# CentOS 7 is 3.6, and this must not be the one service on the machine that
+# quietly fails to start.
+#
+# No --config: the sentinel is one per machine while the cameras are one per
+# type, so it reads theirs (the checkout's config.json, then @CONFIG_DIR@/*.json)
+# rather than keeping a copy of the addresses that could disagree with them.
+ExecStart=@APP_DIR@/run.sh --sentinel
+Environment=PYTHON=@PYTHON@
 Environment=PYTHONUNBUFFERED=1
 
 # Same reason as the camera unit: the status files, logs and the outbox all

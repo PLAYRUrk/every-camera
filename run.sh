@@ -5,6 +5,7 @@
 #   ./run.sh --type asi
 #   ./run.sh --type asi --config /etc/every-camera/asi.json
 #   ./run.sh --gui
+#   ./run.sh --sentinel            # the alert watchdog instead of a camera
 #
 # Everything after the script name is passed straight to main.py, so this is a
 # drop-in replacement for `python3 main.py …` and adds nothing to learn.
@@ -12,7 +13,9 @@
 # What it does for you:
 #   * runs from the program's own directory, so relative paths behave;
 #   * picks the interpreter: $PYTHON, else a venv beside the checkout, else
-#     python3 from PATH;
+#     python3 from PATH. This is why the watchdog is started through here too:
+#     `python3` on CentOS 7 is 3.6, which cannot import dataclasses, and a unit
+#     that named the interpreter itself would find that out at 3 a.m.;
 #   * sources env.sh if it exists, which is where machine-specific settings
 #     belong (the PICAM SDK paths, a conda activation, a proxy). That file is
 #     deliberately untracked: it describes this machine, not the program.
@@ -57,10 +60,18 @@ if [[ ! -x "$PYTHON" ]]; then
     exit 1
 fi
 
+# Which program to run. main.py unless the first argument names the other
+# entry point that has to survive on this machine's terms.
+TARGET="$APP_DIR/main.py"
+if [[ "${1:-}" == "--sentinel" ]]; then
+    TARGET="$APP_DIR/sentinel.py"
+    shift
+fi
+
 # exec, not a plain call: the shell replaces itself with Python instead of
 # sitting between it and the terminal. That matters for stopping. A wrapper left
 # in the middle would take SIGINT and SIGTERM itself and die, and Python would
 # be orphaned or killed without ever running its shutdown — the closing dark
 # frames and, on the ASI, the sensor warm-up from its operating temperature.
 # With exec there is one process, and the signal lands where it is handled.
-exec "$PYTHON" "$APP_DIR/main.py" "$@"
+exec "$PYTHON" "$TARGET" "$@"
