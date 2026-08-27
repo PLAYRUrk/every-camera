@@ -18,21 +18,41 @@ uses — which is what makes several instances per host visible. Broadcast is
 kept alongside it because switches without an IGMP querier drop multicast, and
 because nodes running an older version answer nothing else.
 
+Nodes also announce themselves unasked, every ``ANNOUNCE_EVERY`` seconds:
+
+    hello  -> UDP multicast + broadcast, payload  b"EVERYCAM_HELLO {...}"
+
+Nobody has to be running a probe to hear one. Every camera already keeps a
+responder socket bound to this port for the life of the process, so an
+announcement from one camera reaches every other camera on the segment and is
+written into its peer registry (``peers.py``). Two things follow, and both are
+the point: a camera started later turns up by itself instead of waiting for
+somebody to search again, and — because the registry is also probed by unicast
+on the next run — a camera behind a switch that drops broadcast stays
+reachable once it has been seen once.
+
 The responder runs in a daemon thread with every error swallowed: a firewall
 that blocks UDP, or a port already in use, must never disturb measurements.
 """
 import json
+import os
 import socket
 import struct
 import threading
 import time
 
 import console_ui
+import peers
 
 DISCOVERY_PORT = 45455
 # Administratively scoped IPv4 multicast (RFC 2365), i.e. never routed off-site.
 MCAST_GROUP = "239.255.42.99"
 PROBE = b"EVERYCAM_DISCOVER?"
+# Unsolicited "here I am", carrying the same JSON a reply would.
+ANNOUNCE = b"EVERYCAM_HELLO "
+# Often enough that a camera started mid-evening is known within the minute,
+# rarely enough to be invisible: one datagram per camera per minute.
+ANNOUNCE_EVERY = 60.0
 SERVICE_TAG = "every-camera"
 MAX_REPLY_BYTES = 8192
 
@@ -51,6 +71,7 @@ class DiscoveryResponder(threading.Thread):
         self._joined = False
         self._sock = None
         self._stop = threading.Event()
+        self._announcer = None
 
     def start_safely(self):
         """Bind and start. Returns True on success, False (with a warning) otherwise."""
@@ -69,6 +90,15 @@ class DiscoveryResponder(threading.Thread):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             except OSError:
                 pass
+            # Announcements go out on this same socket, so it needs the
+            # sending options too. TTL 1: an announcement is about this
+            # segment and has no business being routed off it.
+            for option, value in ((socket.IP_MULTICAST_TTL, 1),
+                                  (socket.IP_MULTICAST_LOOP, 1)):
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, option, value)
+                except OSError:
+                    pass
             sock.settimeout(0.5)
             sock.bind(("", self._port))
             self._sock = sock
@@ -88,6 +118,10 @@ class DiscoveryResponder(threading.Thread):
                             f"({exc}); falling back to broadcast only.")
 
         self.start()
+        self._announcer = threading.Thread(target=self._announce_loop,
+                                          daemon=True,
+                                          name="everycam-announce")
+        self._announcer.start()
         console_ui.log(f"Discovery responder listening on UDP :{self._port}"
                        f"{f' (+{self._group})' if self._joined else ''}")
         return True
@@ -100,19 +134,73 @@ class DiscoveryResponder(threading.Thread):
                 continue
             except OSError:
                 break
+            if data.startswith(ANNOUNCE):
+                self._note_announcement(data[len(ANNOUNCE):], addr)
+                continue
             if not data.startswith(PROBE):
                 continue
+            payload = self._describe()
             try:
-                info = dict(self._info_provider() or {})
-            except Exception:
-                info = {}
-            info["service"] = SERVICE_TAG
-            try:
-                payload = json.dumps(info).encode("utf-8")
-                if len(payload) <= MAX_REPLY_BYTES:
+                if payload and len(payload) <= MAX_REPLY_BYTES:
                     self._sock.sendto(payload, addr)
             except Exception:
                 continue
+
+    def _describe(self):
+        """This node as a JSON datagram, or None if it will not say."""
+        try:
+            info = dict(self._info_provider() or {})
+        except Exception:
+            info = {}
+        info["service"] = SERVICE_TAG
+        try:
+            return json.dumps(info).encode("utf-8")
+        except Exception:
+            return None
+
+    def _note_announcement(self, payload, addr):
+        """Write a neighbour into the peer registry.
+
+        The address is taken from the packet rather than from what the sender
+        claimed: a node behind NAT does not know how it is reached, and the
+        one thing this must never record is an address that does not work.
+        Its own announcement comes back through multicast loopback and is
+        dropped by the pid check.
+        """
+        try:
+            info = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(info, dict) or info.get("service") != SERVICE_TAG:
+            return
+        try:
+            if int(info.get("pid") or -1) == os.getpid():
+                return
+        except (TypeError, ValueError):
+            pass
+        info["host"] = addr[0]
+        try:
+            peers.remember([info])
+        except Exception:
+            pass
+
+    def _announce_loop(self):
+        """Say "here I am" on a timer, so nobody has to ask."""
+        # A short first wait, so a camera just started is known within seconds
+        # rather than at the end of the first full interval.
+        if self._stop.wait(2.0):
+            return
+        while True:
+            payload = self._describe()
+            if payload and len(payload) <= MAX_REPLY_BYTES:
+                for target in [self._group] + _broadcast_addresses():
+                    try:
+                        self._sock.sendto(ANNOUNCE + payload,
+                                          (target, self._port))
+                    except OSError:
+                        continue
+            if self._stop.wait(ANNOUNCE_EVERY):
+                return
 
     def stop(self):
         self._stop.set()
@@ -163,13 +251,19 @@ def _broadcast_addresses():
 
 
 def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None,
-             group=MCAST_GROUP):
+             group=MCAST_GROUP, use_peers=True):
     """Probe the LAN and collect replies for ``timeout`` seconds.
 
     Returns a list of dicts, each carrying at least ``host``, ``http_port``,
     ``instance_name`` and ``camera_type``. Duplicates (a node answering both the
     multicast and the broadcast probe) are collapsed by ``host:http_port``;
     two instances on one machine differ by port and are both listed.
+
+    With ``use_peers``, every address seen on a previous run is probed by
+    unicast as well, and whatever answers is written back. This is what makes
+    a camera behind a switch that drops broadcast findable at all: it has to
+    be seen once — by broadcast, by an announcement, or by being typed in —
+    and after that it is remembered.
     """
     found = {}
     try:
@@ -188,6 +282,11 @@ def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None,
     targets += _broadcast_addresses()
     for host in (extra_hosts or []):
         targets.append(host)
+    if use_peers:
+        try:
+            targets += peers.addresses()
+        except Exception:
+            pass
     targets = list(dict.fromkeys(targets))
 
     try:
@@ -221,7 +320,13 @@ def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None,
             sock.close()
         except OSError:
             pass
-    return list(found.values())
+    nodes = list(found.values())
+    if use_peers and nodes:
+        try:
+            peers.remember(nodes)
+        except Exception:
+            pass
+    return nodes
 
 
 if __name__ == "__main__":

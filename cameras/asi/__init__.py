@@ -2,7 +2,7 @@
 ASI all-sky imager support: Princeton Instruments PIXIS + SmartMotor filter wheel.
 
 This package is the hardware half of the ``asi`` camera type; the every-camera
-worker that wraps it (MQTT, status files, LAN frame server, focus) lives in
+worker that wraps it (status files, LAN frame server, focus) lives in
 ``cameras/asi_driver.py``.
 
 What is specific to this instrument:

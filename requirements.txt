@@ -27,8 +27,6 @@
 
 numpy>=1.23.5,<2.0     # <2.0: astropy 5.x/6.x и opencv собраны под ABI numpy 1.x
 Pillow>=9.5,<11.0      # JPEG/PNG/TIFF; в 11.x меняется базовый образ manylinux
-paho-mqtt>=1.6.1       # верхней границы нет: mqtt_client._make_mqtt_client
-                       # поддерживает и v1, и v2 (CallbackAPIVersion.VERSION2)
 
-# LAN-сервер кадров, discovery и live view работают на одной стандартной
-# библиотеке — ничего ставить не нужно.
+# LAN-сервер кадров, обнаружение, шлюз, live view и почтовые оповещения
+# работают на одной стандартной библиотеке — ставить нечего.

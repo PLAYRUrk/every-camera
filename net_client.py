@@ -52,19 +52,40 @@ def node_label(node, default_port=8765):
 
 
 class CameraClient:
-    """Thin client for one camera's frame server."""
+    """Thin client for one camera's frame server.
 
-    def __init__(self, host, port=8765, timeout=DEFAULT_TIMEOUT):
+    ``via`` makes the same client talk to a camera it cannot reach directly, by
+    asking one that can: every camera forwards ``/api/node/<host:port>/...`` to
+    a neighbour it has seen (``gateway.py``). Nothing else changes — the calls
+    below, the archive, the live stream and the parameter editing all work the
+    same way through it, which is the difference between this and the broker it
+    replaced.
+
+        CameraClient("192.168.2.36", 8765)                    # straight there
+        CameraClient("10.0.0.5", 8765, via="192.168.2.40:8765")   # forwarded
+    """
+
+    def __init__(self, host, port=8765, timeout=DEFAULT_TIMEOUT, via=None):
         self.host = host
         self.port = int(port)
         self.timeout = timeout
+        # host:port of the node that will do the fetching, or None for direct.
+        self.via = str(via) if via else None
 
     @property
     def base_url(self):
+        if self.via:
+            return f"http://{self.via}/api/node/{self.host}:{self.port}"
         return f"http://{self.host}:{self.port}"
 
     def __str__(self):
+        if self.via:
+            return f"{self.host}:{self.port} via {self.via}"
         return f"{self.host}:{self.port}"
+
+    def nodes(self):
+        """Every camera this node knows about — see ``gateway.Gateway.nodes``."""
+        return self.get_json("/api/nodes").get("nodes", [])
 
     # ------------------------------------------------------------------
     def url_for(self, path, **params):

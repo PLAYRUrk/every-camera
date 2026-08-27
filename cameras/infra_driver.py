@@ -17,6 +17,8 @@ import ctypes
 import threading
 import time
 
+import alerts
+
 import console_ui
 
 import numpy as np
@@ -32,7 +34,7 @@ from utils import (
     get_local_ip, get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, publish_current_params,
+    WorkerBus, publish_current_params,
     publish_schedule_state, serving_focus_hold,
     announce_setup_mode, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
@@ -731,7 +733,7 @@ def save_png(filepath, frame_16):
 
 
 def frame_to_jpeg_bytes(frame):
-    """Convert 16-bit or stacked uint32 frame to 8-bit JPEG for MQTT.
+    """Convert a 16-bit or stacked uint32 frame to 8-bit JPEG.
 
     Kept as a thin wrapper for backwards compatibility — the implementation now
     lives in ``frame_archive`` and is shared by every camera driver.
@@ -749,8 +751,7 @@ class InfraWorkerConsole(threading.Thread):
 
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
-                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None,
-                 node_name="", setup_mode=False):
+                 service=None, node_name="", setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.schedule = schedule
@@ -761,9 +762,8 @@ class InfraWorkerConsole(threading.Thread):
         self.save_format = save_format
         self.setup_mode = bool(setup_mode)
         self._service = service
-        self._bus = WorkerMqtt("infra", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               node_name=node_name)
+        self._bus = WorkerBus("infra", instance_name, status_dir,
+                              service=service, node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
@@ -774,20 +774,12 @@ class InfraWorkerConsole(threading.Thread):
         # Whether the last loop pass ran under a focus hold, so entering and
         # leaving it is logged once instead of twice a second.
         self._held = False
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
-        self._pending_capture_event = threading.Event()
 
     def request_stop(self):
         self._stop_event.set()
 
-    def _publish_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
-        self._bus.publish_frame_jpeg(jpeg_bytes, ts_iso, on_demand=on_demand,
-                                     params=params)
-
-    def _publish_error(self, status, error, ts_iso=None, on_demand=False):
-        self._bus.publish_error(status, error, ts_iso=ts_iso,
-                                on_demand=on_demand)
+    def _publish_error(self, status, error, ts_iso=None):
+        self._bus.publish_error(status, error, ts_iso=ts_iso)
 
     def _apply_params(self, params, stream: "_CameraStreamThread"):
         """Применяет параметры камеры, ставя stream-поток на паузу.
@@ -866,85 +858,6 @@ class InfraWorkerConsole(threading.Thread):
                        f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
                        f"(exposure={self.cam.exposure_us/1000:.1f}ms)")
 
-    def _handle_pending_capture(self, stream: "_CameraStreamThread"):
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        self._pending_capture_event.clear()
-        if params is None:
-            return
-        console_ui.log("On-demand Infra capture starting")
-        self._bus.publish_note("capturing", f"Applying params: {params}")
-
-        applied, errors = self._apply_params(params, stream)
-        for err in errors:
-            console_ui.warn(f"Param apply: {err}")
-
-        exp_s = self.cam.exposure_us / 1e6
-        timeout = max(exp_s * 2 + 10.0, 30.0)
-        skip_n = 3 if exp_s < 1.0 else 1
-
-        # Пропускаем переходные кадры после смены параметров
-        for i in range(skip_n):
-            f, _ = stream.wait_for_frame(timeout=timeout,
-                                         stop_event=self._stop_event)
-            if f is None:
-                self._publish_error("error", "Timeout during warm-up",
-                                    on_demand=True)
-                console_ui.error("On-demand warm-up timeout")
-                return
-
-        console_ui.log(f"=== on-demand capture ===")
-        frame, frame_ts = stream.wait_for_frame(timeout=timeout,
-                                                stop_event=self._stop_event)
-        if frame is None:
-            self._publish_error("error", "Timeout waiting for frame",
-                                on_demand=True)
-            console_ui.error("On-demand capture timeout")
-            return
-        try:
-            jpeg_bytes = frame_to_jpeg_bytes(frame)
-            self._publish_ok(jpeg_bytes, frame_ts.isoformat(),
-                             on_demand=True, params=applied)
-            console_ui.log("On-demand frame sent via MQTT")
-        except Exception as exc:
-            self._publish_error("error", f"Encode error: {exc}", on_demand=True)
-            console_ui.error(f"On-demand encode: {exc}")
-
-    def _on_mqtt_command(self, topic, payload):
-        console_ui.log(f"MQTT cmd received: {topic} "
-                       f"({len(payload) if payload else 0} bytes)")
-        if not self._bus.enabled:
-            return
-        if topic.endswith("/cmd/get_frame"):
-            if self._last_frame is None:
-                self._publish_error("no_frame", "No frame captured yet")
-                console_ui.warn("Frame requested but no frame available yet")
-                return
-            ts = self._last_shot.isoformat() if self._last_shot else None
-            try:
-                jpeg_data = frame_to_jpeg_bytes(self._last_frame)
-            except Exception as e:
-                self._publish_error("error", str(e), ts)
-                console_ui.error(f"Frame encode error: {e}")
-                return
-            self._publish_ok(jpeg_data, ts)
-            console_ui.log("Frame sent via MQTT")
-            return
-        if topic.endswith("/cmd/capture_frame"):
-            params, err = parse_command_params(payload)
-            if err:
-                self._publish_error("bad_request", err, on_demand=True)
-                return
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._pending_capture_event.set()
-            self._bus.publish_note("accepted",
-                                   f"Request queued with params: {params}")
-            console_ui.log(f"On-demand capture queued with params: {params}")
-            return
-        console_ui.log(f"Unknown command: {topic}")
-
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
     # ------------------------------------------------------------------
@@ -984,7 +897,6 @@ class InfraWorkerConsole(threading.Thread):
         last_fired = (-1, -1)
         consecutive_errors = 0
         self._bus.prepare_status_dir()
-        self._bus.subscribe(self._on_mqtt_command)
         if self._service is not None:
             self._service.set_current_params(self._current_params())
 
@@ -1012,8 +924,6 @@ class InfraWorkerConsole(threading.Thread):
             # whatever point in the night it happened to strike — so every pass
             # is caught here and logged instead of left to propagate.
             try:
-                if self._pending_capture_event.is_set():
-                    self._handle_pending_capture(stream)
 
                 now = dt.now()
 
@@ -1206,11 +1116,9 @@ def run_console_infra(config_path=None, preview=False, verbose=False,
                       setup_mode=False):
     """Run Infra camera measurement in console mode."""
     from utils import load_config, get_node_name
-    from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
     infra_cfg = cfg.get("infra", {})
-    mqtt_cfg = cfg.get("mqtt", {})
 
     node_name = get_node_name(cfg)
     claim = claim_instance_name(infra_cfg.get("instance_name")
@@ -1226,6 +1134,16 @@ def run_console_infra(config_path=None, preview=False, verbose=False,
     save_format = infra_cfg.get("save_format", "tiff")
 
     dash = console_ui.start_dashboard("infra", instance_name, verbose=verbose)
+    # Alert mail, started before the camera is opened so that a camera which
+    # will not open — and a filter controller that answers nothing — is already
+    # something somebody hears about. The crash handler goes first: it is the
+    # only thing that can speak for a process killed outright.
+    alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+    alerts.install_crash_handler(alert_status_path)
+    alerts.start(cfg.get("alerts", {}), node_name, instance_name, "infra",
+                 log_path=console_ui.default_log_path("infra", instance_name),
+                 status_path=alert_status_path)
+
     dash.update(status="starting", node_name=node_name, output_dir=output_dir,
                 frames=0, errors=0,
                 schedule=f"capture at {capture_seconds} s of each minute")
@@ -1236,7 +1154,7 @@ def run_console_infra(config_path=None, preview=False, verbose=False,
         ("Save format:", save_format),
     ])
     try:
-        _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
+        _run_console_infra(cfg, infra_cfg, config_path, preview, dash,
                            instance_name, node_name, output_dir, status_dir,
                            schedule_file, capture_seconds, exposure_us, gain_val,
                            roi, save_format, setup_mode)
@@ -1245,12 +1163,11 @@ def run_console_infra(config_path=None, preview=False, verbose=False,
         claim.release()
 
 
-def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
+def _run_console_infra(cfg, infra_cfg, config_path, preview, dash,
                        instance_name, node_name, output_dir, status_dir,
                        schedule_file, capture_seconds, exposure_us, gain_val,
                        roi, save_format, setup_mode=False):
     """Body of :func:`run_console_infra`, with the dashboard already running."""
-    from mqtt_client import create_console_publisher
 
     if preview:
         console_ui.log("Connecting to Infra camera...")
@@ -1352,10 +1269,6 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
             console_ui.warn(f"Warm-up frame {i} failed: {exc}")
     console_ui.log(f"Warm-up done (settle={settle_s*1000:.0f}ms + {skip_n} skip frames)")
 
-    # MQTT
-    mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "infra")
-    if mqtt_pub:
-        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
@@ -1377,8 +1290,6 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
         status_dir=status_dir,
         capture_seconds=capture_seconds,
         save_format=save_format,
-        mqtt_publisher=mqtt_pub,
-        mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
         node_name=node_name,
         setup_mode=setup_mode,
@@ -1398,8 +1309,3 @@ def _run_console_infra(cfg, infra_cfg, mqtt_cfg, config_path, preview, dash,
         cam.disconnect()
         if server:
             server.stop()
-        if mqtt_pub:
-            try:
-                mqtt_pub.disconnect_broker()
-            except Exception:
-                pass

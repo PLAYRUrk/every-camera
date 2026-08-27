@@ -5,37 +5,33 @@ Every Camera — Frame Viewer (observer tool, Windows and Linux).
 A read-only window onto the cameras. It never changes a setting and never
 triggers a capture; for that there is ``focus_app.py``.
 
-Two sources:
+It talks to a camera's frame server and can open *any* frame it has ever
+captured, plus the newest one. This works even while the camera is busy
+measuring, and even if its worker has stalled, because the archive is served
+straight off disk. The archive is shown a measuring session at a time — a
+night, not a calendar day, so a run through midnight stays whole — and on the
+Hamamatsu it can be split further by measuring cycle and filter.
 
-  * **LAN** — talks to a camera's frame server and can open *any* frame it has
-    ever captured, plus the newest one. This works even while the camera is
-    busy measuring, and even if its worker has stalled, because the archive is
-    served straight off disk. The archive is shown a measuring session at a
-    time — a night, not a calendar day, so a run through midnight stays whole —
-    and on the Hamamatsu it can be split further by measuring cycle and filter.
+A camera this machine cannot reach directly is reached through one that can:
+``--via`` names a camera to do the fetching, and everything below works the
+same way through it. That replaced a broker tab which could carry one frame at
+a time and no archive at all.
 
-  * **HiveMQ (MQTT)** — for cameras reachable only over the internet. To keep
-    traffic down this fetches **only the latest frame** on request; browsing
-    the archive is deliberately LAN-only, since a full archive would mean
-    megabytes of base64 through a public broker.
-
-Requirements on the observer machine: PyQt5, numpy, Pillow, and paho-mqtt for
-the MQTT source. No camera drivers.
+Requirements on the observer machine: PyQt5, numpy and Pillow. No camera
+drivers.
 
 Usage:
     python viewer_app.py                     # discover cameras on the LAN
     python viewer_app.py --host 192.168.1.5  # connect straight to one camera
-    python viewer_app.py --mqtt              # start on the MQTT tab
+    python viewer_app.py --host 10.0.0.5 --via 192.168.1.5:8765
 """
-import base64
-import json
 import os
 import sys
 
 from datetime import datetime as dt, time as time_of_day
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget, QSplitter,
+    QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QDoubleSpinBox,
     QTimeEdit, QTreeWidget, QTreeWidgetItem,
@@ -44,14 +40,14 @@ from PyQt5.QtWidgets import (
     QStatusBar, QScrollArea, QDialog,
 )
 from PyQt5.QtCore import Qt, QTime, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QFont
 
 from net_client import (
     CameraClient, TaskRunner, DiscoveryTask, load_settings, save_settings,
     node_label, node_name_of,
 )
 from frame_grouping import (
-    entry_timestamp, frame_timestamp, group_by_session, group_japan_cycles,
+    entry_timestamp, group_by_session, group_japan_cycles,
     japan_filter_label,
 )
 import cycles as composite
@@ -858,8 +854,8 @@ class LanPanel(QWidget):
         self.connect_to(host.strip(), int(port) if port.strip().isdigit()
                         else DEFAULT_HTTP_PORT)
 
-    def connect_to(self, host, port=DEFAULT_HTTP_PORT):
-        self._client = CameraClient(host, port)
+    def connect_to(self, host, port=DEFAULT_HTTP_PORT, via=None):
+        self._client = CameraClient(host, port, via=via)
         self._remember(host, port)
         self.lbl_camera.setText(f"connecting to {host}:{port}…")
         # The grouping switch belongs to a camera type, not to the window: it must
@@ -1425,292 +1421,21 @@ class LanPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# MQTT source — latest frame only
-# ---------------------------------------------------------------------------
-class MqttPanel(QWidget):
-    """Watch cameras through a public broker; fetches only the latest frame."""
-
-    status = pyqtSignal(str)
-
-    def __init__(self, mqtt_cfg, parent=None):
-        super().__init__(parent)
-        self._cfg = mqtt_cfg or {}
-        self._subscriber = None
-        self._instances = {}
-        self._pending = None
-        self._build_ui()
-
-        self._timeout = QTimer(self)
-        self._timeout.setSingleShot(True)
-        self._timeout.timeout.connect(self._on_timeout)
-
-        self._refresh = QTimer(self)
-        self._refresh.setInterval(5000)
-        self._refresh.timeout.connect(self._refresh_table)
-        self._refresh.start()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-
-        note = QLabel(
-            "Over MQTT the viewer requests <b>only the latest frame</b>, to keep "
-            "traffic small. To browse the whole archive, use the LAN tab.")
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#888; font-size:11px;")
-        root.addWidget(note)
-
-        box = QGroupBox("Broker")
-        grid = QGridLayout(box)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-
-        grid.addWidget(QLabel("Host:"), 0, 0)
-        self.le_host = QLineEdit(self._cfg.get("host", "broker.hivemq.com"))
-        grid.addWidget(self.le_host, 0, 1)
-        grid.addWidget(QLabel("Port:"), 0, 2)
-        self.le_port = QLineEdit(str(self._cfg.get("port", 1883)))
-        self.le_port.setMaximumWidth(70)
-        grid.addWidget(self.le_port, 0, 3)
-
-        grid.addWidget(QLabel("User:"), 1, 0)
-        self.le_user = QLineEdit(self._cfg.get("user", ""))
-        self.le_user.setPlaceholderText("(optional)")
-        grid.addWidget(self.le_user, 1, 1)
-        grid.addWidget(QLabel("Password:"), 1, 2)
-        self.le_pass = QLineEdit(self._cfg.get("password", ""))
-        self.le_pass.setEchoMode(QLineEdit.Password)
-        self.le_pass.setPlaceholderText("(optional)")
-        grid.addWidget(self.le_pass, 1, 3)
-
-        grid.addWidget(QLabel("Prefix:"), 2, 0)
-        self.le_prefix = QLineEdit(self._cfg.get("prefix", "every_camera"))
-        grid.addWidget(self.le_prefix, 2, 1)
-        self.cb_tls = QCheckBox("TLS")
-        self.cb_tls.setChecked(self._cfg.get("tls", False))
-        self.cb_tls.stateChanged.connect(
-            lambda s: self.le_port.setText("8883" if s else "1883"))
-        grid.addWidget(self.cb_tls, 2, 2)
-
-        btns = QHBoxLayout()
-        self.btn_connect = QPushButton("Connect")
-        self.btn_connect.clicked.connect(self._on_connect)
-        self.btn_disconnect = QPushButton("Disconnect")
-        self.btn_disconnect.setEnabled(False)
-        self.btn_disconnect.clicked.connect(self._on_disconnect)
-        self.lbl_conn = QLabel("Disconnected")
-        self.lbl_conn.setStyleSheet("color:#888; font-weight:bold;")
-        btns.addWidget(self.btn_connect)
-        btns.addWidget(self.btn_disconnect)
-        btns.addWidget(self.lbl_conn, 1)
-        grid.addLayout(btns, 2, 3)
-        root.addWidget(box)
-
-        splitter = QSplitter(Qt.Vertical)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["Instance", "Type", "Status", "Shots", "Last update"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.setMaximumHeight(180)
-        splitter.addWidget(self.table)
-
-        lower = QWidget()
-        lower_lay = QVBoxLayout(lower)
-        lower_lay.setContentsMargins(0, 0, 0, 0)
-        bar = QHBoxLayout()
-        self.btn_get = QPushButton("Request latest frame")
-        self.btn_get.setEnabled(False)
-        self.btn_get.clicked.connect(self._on_request)
-        bar.addWidget(self.btn_get)
-        bar.addStretch()
-        self.lbl_frame_info = QLabel("—")
-        self.lbl_frame_info.setStyleSheet("font-size:11px;")
-        bar.addWidget(self.lbl_frame_info)
-        lower_lay.addLayout(bar)
-        self.view = ImageView()
-        lower_lay.addWidget(self.view, 1)
-        splitter.addWidget(lower)
-        splitter.setStretchFactor(1, 1)
-        root.addWidget(splitter, 1)
-
-    # -- broker --------------------------------------------------------
-    def _on_connect(self):
-        from mqtt_client import MQTT_AVAILABLE
-        if not MQTT_AVAILABLE:
-            self.lbl_conn.setText("paho-mqtt not installed")
-            self.lbl_conn.setStyleSheet("color:#cc0000; font-weight:bold;")
-            return
-        from mqtt_client import MqttSubscriber
-        prefix = self.le_prefix.text().strip() or "every_camera"
-        try:
-            self._subscriber = MqttSubscriber(
-                self.le_host.text().strip(), self.le_port.text().strip(),
-                self.le_user.text().strip(), self.le_pass.text(),
-                use_tls=self.cb_tls.isChecked())
-        except Exception as exc:
-            self.lbl_conn.setText(f"Error: {exc}")
-            self.lbl_conn.setStyleSheet("color:#cc0000; font-weight:bold;")
-            return
-        self._subscriber.connected.connect(self._on_connected)
-        self._subscriber.disconnected.connect(self._on_disconnected)
-        self._subscriber.message_received.connect(self._on_message)
-        self._subscriber.error.connect(self._on_broker_error)
-        self._subscriber.connect_broker([f"{prefix}/+/status",
-                                         f"{prefix}/+/frame"])
-        self.lbl_conn.setText("Connecting…")
-        self.btn_connect.setEnabled(False)
-
-    def _on_disconnect(self):
-        if self._subscriber:
-            self._subscriber.disconnect_broker()
-            self._subscriber = None
-        self._instances.clear()
-        self._refresh_table()
-        self._on_disconnected()
-
-    def _on_connected(self):
-        self.lbl_conn.setText(f"Connected to {self.le_host.text().strip()}")
-        self.lbl_conn.setStyleSheet("color:#007700; font-weight:bold;")
-        self.btn_disconnect.setEnabled(True)
-        self.btn_get.setEnabled(True)
-
-    def _on_disconnected(self):
-        self.lbl_conn.setText("Disconnected")
-        self.lbl_conn.setStyleSheet("color:#888; font-weight:bold;")
-        self.btn_connect.setEnabled(True)
-        self.btn_disconnect.setEnabled(False)
-        self.btn_get.setEnabled(False)
-
-    def _on_broker_error(self, message):
-        self.lbl_conn.setText(f"Error: {message}")
-        self.lbl_conn.setStyleSheet("color:#cc0000; font-weight:bold;")
-        self.btn_connect.setEnabled(True)
-
-    # -- messages ------------------------------------------------------
-    def _on_message(self, topic, payload):
-        if topic.endswith("/frame"):
-            self._on_frame(payload)
-            return
-        if not payload.strip():
-            # Retained status cleared: the camera shut down cleanly.
-            if self._instances.pop(topic, None) is not None:
-                self._refresh_table()
-            return
-        try:
-            self._instances[topic] = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-        self._refresh_table()
-
-    def _refresh_table(self):
-        records = sorted(self._instances.values(),
-                         key=lambda r: str(r.get("instance_name", "")))
-        selected = self._selected_instance()
-        self.table.setRowCount(len(records))
-        for row, rec in enumerate(records):
-            values = [
-                rec.get("instance_name", "?"),
-                str(rec.get("camera_type", "?")).upper(),
-                str(rec.get("status", "?")).upper(),
-                str(rec.get("shots_taken", 0)),
-                str(rec.get("last_update", ""))[:19].replace("T", " "),
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-                self.table.setItem(row, col, item)
-            if selected and values[0] == selected:
-                self.table.selectRow(row)
-
-    def _selected_instance(self):
-        row = self.table.currentRow()
-        item = self.table.item(row, 0) if row >= 0 else None
-        return item.text() if item else None
-
-    def _on_request(self):
-        instance = self._selected_instance()
-        if not instance:
-            QMessageBox.information(self, "No selection",
-                                    "Select a camera in the table first.")
-            return
-        prefix = self.le_prefix.text().strip() or "every_camera"
-        self._subscriber.publish(f"{prefix}/{instance}/cmd/get_frame", b"",
-                                 retain=False)
-        self._pending = instance
-        self.view.show_message(f"Waiting for the latest frame from {instance}…")
-        self.status.emit(f"Requested the latest frame from {instance}")
-        self._timeout.start(15000)
-
-    def _on_timeout(self):
-        if not self._pending:
-            return
-        message = (f"No answer from {self._pending}. It may be offline, or its "
-                   f"MQTT prefix may differ.")
-        self.view.show_message(message)
-        self.status.emit(message)
-        self._pending = None
-
-    def _on_frame(self, payload):
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-        instance = data.get("instance_name", "?")
-        status = data.get("status", "ok")
-        if status in ("accepted", "capturing"):
-            self.view.show_message(f"{instance}: {status} — {data.get('note', '')}")
-            return
-
-        self._timeout.stop()
-        self._pending = None
-        if status != "ok" or not data.get("data"):
-            message = (f"{instance}: {data.get('error') or status}")
-            self.view.show_message(message)
-            self.status.emit(message)
-            return
-        try:
-            jpeg = base64.b64decode(data["data"])
-        except (ValueError, TypeError) as exc:
-            self.view.show_message(f"Could not decode frame: {exc}")
-            return
-        self.view.set_jpeg(jpeg)
-        self.lbl_frame_info.setText(
-            f"{instance} ({data.get('camera_type', '?')})   ·   "
-            f"{data.get('timestamp', '')}   ·   {len(jpeg) // 1024} KB")
-        self.status.emit(f"Received the latest frame from {instance}")
-
-    def cleanup(self):
-        self._refresh.stop()
-        if self._subscriber:
-            self._subscriber.disconnect_broker()
-            self._subscriber = None
-
-
-# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class ViewerWindow(QMainWindow):
-    def __init__(self, mqtt_cfg, settings, start_tab="lan"):
+    def __init__(self, settings):
         super().__init__()
         self.setWindowTitle("Every Camera — Viewer")
         self.resize(1150, 750)
         self.setMinimumSize(760, 480)
 
         self._settings = settings
-        self.tabs = QTabWidget()
         self.lan = LanPanel(settings)
-        self.mqtt = MqttPanel(mqtt_cfg)
-        self.tabs.addTab(self.lan, "Local network")
-        self.tabs.addTab(self.mqtt, "HiveMQ (latest frame)")
-        self.setCentralWidget(self.tabs)
-        if start_tab == "mqtt":
-            self.tabs.setCurrentWidget(self.mqtt)
+        self.setCentralWidget(self.lan)
 
         self.setStatusBar(QStatusBar())
         self.lan.status.connect(self._show_status)
-        self.mqtt.status.connect(self._show_status)
         self._show_status("Ready")
 
     def _show_status(self, message):
@@ -1718,7 +1443,6 @@ class ViewerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.lan.cleanup()
-        self.mqtt.cleanup()
         save_settings(self._settings)
         event.accept()
 
@@ -1729,10 +1453,8 @@ def main():
         description="Every Camera — frame viewer (read-only)")
     parser.add_argument("--host", help="Connect to this camera straight away")
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
-    parser.add_argument("--mqtt", action="store_true",
-                        help="Start on the MQTT tab")
-    parser.add_argument("--config", default=None,
-                        help="config.json to read MQTT defaults from")
+    parser.add_argument("--via", default="", metavar="HOST:PORT",
+                        help="Reach --host through this camera, which fetches on our behalf")
     args = parser.parse_args()
 
     # Qt/OpenCV plugin clash, same workaround as the other GUIs
@@ -1744,24 +1466,16 @@ def main():
     except Exception:
         os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
-    mqtt_cfg = {}
-    try:
-        from utils import load_config
-        mqtt_cfg = load_config(args.config).get("mqtt", {})
-    except Exception:
-        pass
     settings = load_settings()
-    mqtt_cfg = {**mqtt_cfg, **settings.get("mqtt", {})}
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = ViewerWindow(mqtt_cfg, settings,
-                          start_tab="mqtt" if args.mqtt else "lan")
+    window = ViewerWindow(settings)
     window.show()
 
     if args.host:
-        window.lan.connect_to(args.host, args.port)
-    elif not args.mqtt:
+        window.lan.connect_to(args.host, args.port, via=args.via or None)
+    else:
         QTimer.singleShot(200, window.lan.discover)
 
     sys.exit(app.exec_())

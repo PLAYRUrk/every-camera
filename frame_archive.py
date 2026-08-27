@@ -11,7 +11,6 @@ Provides:
   - read_frame_file()    — decode FITS / TIFF / PNG / JPEG into a numpy array
   - to_jpeg_bytes()      — 8/16/32-bit frame -> JPEG (replaces four copies of
                            this code that used to live in the camera drivers)
-  - to_jpeg_capped()     — same, downscaling until it fits an MQTT payload cap
   - sharpness()          — focus metric used by focus_app.py
 """
 import io
@@ -416,37 +415,6 @@ def to_jpeg_bytes(frame, max_side=None, quality=DEFAULT_JPEG_QUALITY,
     return buf.getvalue()
 
 
-def to_jpeg_capped(frame, max_payload_bytes, quality=DEFAULT_JPEG_QUALITY,
-                   stretch="minmax", min_side=320):
-    """Encode to JPEG, halving the resolution until it fits a payload cap.
-
-    Returns ``(jpeg_bytes, width, height)``. Used for MQTT publishing, where
-    brokers (HiveMQ free tier included) reject oversized messages.
-    """
-    import base64
-
-    img8 = to_uint8(frame, stretch=stretch)
-    from PIL import Image
-    if img8.ndim == 2:
-        pil = Image.fromarray(img8, mode="L")
-    elif img8.ndim == 3 and img8.shape[2] == 3:
-        pil = Image.fromarray(img8, mode="RGB")
-    else:
-        raise ValueError(f"Unsupported frame shape: {img8.shape}")
-
-    while True:
-        buf = io.BytesIO()
-        pil.save(buf, format="JPEG", quality=quality)
-        jpeg_bytes = buf.getvalue()
-        # +512 leaves room for the surrounding JSON envelope.
-        payload_size = len(base64.b64encode(jpeg_bytes)) + 512
-        if payload_size <= max_payload_bytes:
-            return jpeg_bytes, pil.size[0], pil.size[1]
-        if min(pil.size) <= min_side:
-            raise ValueError(
-                f"Frame payload still {payload_size} bytes after downscale "
-                f"to {pil.size[0]}x{pil.size[1]}")
-        pil = pil.resize((max(1, pil.size[0] // 2), max(1, pil.size[1] // 2)))
 
 
 def jpeg_bytes_passthrough(data):

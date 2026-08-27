@@ -22,7 +22,7 @@ SCHEDULE_DT_FMT = "%Y-%m-%d %H:%M:%S"
 
 # Minimum interval between status publications. Outside the schedule the
 # workers loop twice a second; without this they would write the status file
-# and publish a retained MQTT message twice a second, around the clock.
+# twice a second, around the clock.
 STATUS_MIN_INTERVAL = 5.0
 SCHEDULE_LINE_RE = re.compile(
     r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*-\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})$'
@@ -68,7 +68,7 @@ def get_instance_name(camera_name, cfg=None):
     It used to be ``{camera_name}_{last_IP_octet}``, which collided in two
     common cases: two machines whose addresses end in the same octet (.5 in
     192.168.1.x and in 10.0.0.x), and two copies of the program on one machine.
-    Since the name drives the MQTT topics, the log file and the preview file,
+    Since the name drives the log file and the preview file,
     a collision meant two cameras silently overwriting each other. The node
     name (config ``node_name``, hostname otherwise) does not have that problem.
 
@@ -121,7 +121,7 @@ def claim_instance_name(base_name, lock_dir=None):
 
     While another *live* process on this machine holds the name, ``-2``, ``-3``
     … are appended, so several copies of every-camera can run from one
-    identical config.json without sharing MQTT topics, log files or preview
+    identical config.json without sharing log files or preview
     files. The reservation is a ``flock`` on a file in ``~/.every_camera/instances``:
     the kernel drops it when the process dies, so a crashed run frees its name
     without leaving anything to clean up.
@@ -370,14 +370,34 @@ DEFAULT_CONFIG = {
         "capture_seconds": [0, 30],
         "slots": [],
     },
-    "mqtt": {
-        "enabled": False,
-        "host": "broker.hivemq.com",
-        "port": 1883,
-        "user": "",
-        "password": "",
-        "prefix": "every_camera",
-        "tls": False,
+    # Alert mail. The only key a station has to fill in is "to": the sender's
+    # credentials live in ~/.every_camera/mail_account.json, which arrives with
+    # the installation the way env.sh does, so that setting a camera up means
+    # typing the addresses to notify and nothing else. See mailer.py.
+    "alerts": {
+        "enabled": True,
+        # Who hears about it. Empty means nothing is sent — and is said once, in
+        # the log, rather than passed over in silence.
+        "to": [],
+        # Ordinary errors are collected and sent together this often. Faults
+        # that end a night — a camera that stopped itself, a controller that
+        # went quiet — do not wait for it.
+        "digest_minutes": 30,
+        # After a fault is reported, how long before the same fault is worth
+        # reporting again. The filter wheel that failed every forty seconds all
+        # night on 26 Aug 2026 is why this is an hour and not a minute.
+        "cooldown_minutes": 60,
+        "daily_summary": "",           # "09:00" to get a morning report
+        "disk_free_min_mb": 5000,      # 0 disables the check
+        "status_mail_minutes": 0,      # >0 mails a status summary that often
+        # A ceiling per station per day. One mailbox serves every camera, so the
+        # provider's allowance is shared: without this, one station stuck in a
+        # repeating fault would spend everyone's before dawn.
+        "max_per_day": 50,
+        "log_tail_lines": 50,
+        # "smtp": {...} may be added here for a station that needs its own
+        # mailbox; it overrides mail_account.json. Absent by default on purpose
+        # — a password per station is a password in six more places.
     },
     "server": {
         "enabled": True,
@@ -397,6 +417,18 @@ DEFAULT_CONFIG = {
     "node_name": "",
     "status_dir": "",
 }
+
+
+def _drop_retired_keys(cfg):
+    """Remove settings that no longer do anything.
+
+    An installed station's config.json is never overwritten, so the MQTT
+    block would sit there for ever looking like a thing that could be
+    switched on. Dropped on load, and written back the next time anything
+    saves.
+    """
+    cfg.pop("mqtt", None)
+    return cfg
 
 
 def load_config(path=None):
@@ -429,7 +461,7 @@ def load_config(path=None):
                          f"        Falling back to defaults. {hint}")
     except Exception as exc:
         console_ui.error(f"Could not read config {path}: {exc}. Using defaults.")
-    return cfg
+    return _drop_retired_keys(cfg)
 
 
 def save_config(cfg, path=None):
@@ -726,7 +758,7 @@ def configure_console_cannon(cfg, config_path=None):
                                  cannon.get("camcfg_file", ""))
 
     cfg["cannon"] = cannon
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
@@ -756,7 +788,7 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["encoding"] = enc if enc in (0, 1) else 1
 
     cfg["sptt"] = sptt
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
@@ -786,7 +818,7 @@ def configure_console_infra(cfg, config_path=None):
     infra["save_format"] = fmt if fmt in ("tiff", "png", "fits") else "tiff"
 
     cfg["infra"] = infra
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
@@ -825,7 +857,7 @@ def configure_console_sentry(cfg, config_path=None):
     sentry["imaging_mode"] = mode_in if mode_in in ("schedule", "rapid") else "schedule"
 
     secs_str = _ask(
-        "Capture seconds for MQTT publish (comma-separated)",
+        "Capture seconds for the status publish (comma-separated)",
         ", ".join(str(s) for s in sentry.get("capture_seconds", [0, 30])),
     )
     try:
@@ -852,7 +884,7 @@ def configure_console_sentry(cfg, config_path=None):
         sentry["slots"] = slots
 
     cfg["sentry"] = sentry
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
@@ -997,7 +1029,7 @@ def configure_console_asi(cfg, config_path=None):
     asi["filter_wheel"] = wheel
     asi["location"] = location
     cfg["asi"] = asi
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
@@ -1095,27 +1127,10 @@ def configure_console_japan(cfg, config_path=None):
     japan["filter_wheel"] = wheel
     japan["location"] = location
     cfg["japan"] = japan
-    _configure_mqtt(cfg)
+    _configure_server(cfg)
 
     save_config(cfg, config_path)
     print("\nConfiguration saved.\n")
-
-
-def _configure_mqtt(cfg):
-    """Interactive MQTT configuration (shared)."""
-    mqtt = cfg.get("mqtt", {})
-    if _ask_bool("Configure MQTT?", mqtt.get("enabled", False)):
-        mqtt["enabled"] = True
-        mqtt["host"] = _ask("MQTT broker host", mqtt.get("host", "broker.hivemq.com"))
-        mqtt["port"] = _ask_int("MQTT port", mqtt.get("port", 1883))
-        mqtt["user"] = _ask("MQTT username (optional)", mqtt.get("user", ""))
-        mqtt["password"] = _ask("MQTT password (optional)", mqtt.get("password", ""))
-        mqtt["prefix"] = _ask("MQTT topic prefix", mqtt.get("prefix", "every_camera"))
-        mqtt["tls"] = _ask_bool("Use TLS?", mqtt.get("tls", False))
-    else:
-        mqtt["enabled"] = False
-    cfg["mqtt"] = mqtt
-    _configure_server(cfg)
 
 
 def _configure_server(cfg):
@@ -1145,3 +1160,36 @@ def _configure_server(cfg):
     else:
         srv["enabled"] = False
     cfg["server"] = srv
+    _configure_alerts(cfg)
+
+
+def _configure_alerts(cfg):
+    """Interactive alert-mail configuration: the addresses, and nothing else.
+
+    Chained off the end of the server wizard rather than offered separately, so
+    that every camera's setup ends by asking who should be told when that camera
+    stops working. The sender's mailbox is not asked for: it arrives with the
+    installation, in ~/.every_camera/mail_account.json, and this only reports
+    whether it is there.
+    """
+    alerts_cfg = cfg.get("alerts", _deep_copy(DEFAULT_CONFIG["alerts"]))
+    print("\n  Alert mail: a letter when a camera stops, crashes, hangs, loses")
+    print("  its filter controller, or runs out of disk.")
+
+    try:
+        import mailer
+        print(f"  Sender: {mailer.account_summary(mailer.resolve_account(alerts_cfg))}")
+    except Exception:
+        pass
+
+    current = ", ".join(alerts_cfg.get("to") or [])
+    answer = _ask("Who should be told (addresses, comma-separated; blank = nobody)",
+                  current)
+    recipients = [part.strip() for part in answer.replace(";", ",").split(",")
+                  if part.strip()]
+    alerts_cfg["to"] = recipients
+    alerts_cfg["enabled"] = bool(recipients)
+    if not recipients:
+        print("  No addresses — nothing will be sent. Everything still goes to "
+              "the log.")
+    cfg["alerts"] = alerts_cfg

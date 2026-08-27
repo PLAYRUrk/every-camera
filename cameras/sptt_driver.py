@@ -10,6 +10,8 @@ import struct
 import threading
 import argparse
 
+import alerts
+
 import console_ui
 
 import numpy as np
@@ -25,9 +27,9 @@ from utils import (
     APP_DIR, STATUS_MIN_INTERVAL,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, publish_current_params,
+    WorkerBus, publish_current_params,
     publish_schedule_state, serving_focus_hold,
-    run_focus_iteration, MQTT_MAX_PAYLOAD_BYTES, announce_setup_mode,
+    run_focus_iteration, announce_setup_mode,
     SETUP_STATUS, install_stop_handler, stop_signal_name,
 )
 
@@ -731,8 +733,7 @@ class SpttWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 capture_seconds=None, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None, node_name="",
+                 capture_seconds=None, service=None, node_name="",
                  setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
@@ -742,9 +743,8 @@ class SpttWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self.setup_mode = bool(setup_mode)
         self._service = service
-        self._bus = WorkerMqtt("sptt", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               node_name=node_name)
+        self._bus = WorkerBus("sptt", instance_name, status_dir,
+                              service=service, node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
@@ -753,9 +753,6 @@ class SpttWorkerConsole(threading.Thread):
         # Whether the last loop pass ran under a focus hold, so the transitions
         # in and out of it are logged once rather than ten times a second.
         self._held = False
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
-        self._pending_capture_event = threading.Event()
         # Camera and filesystem status, refreshed on the status cadence rather
         # than on every pass of the measurement loop — see _camera_status.
         self._cam_status = {}
@@ -764,22 +761,6 @@ class SpttWorkerConsole(threading.Thread):
 
     def request_stop(self):
         self._stop_event.set()
-
-    def _encode_jpeg(self, frame):
-        """Encode a frame, downscaling until it fits the broker payload cap."""
-        if frame.ndim != 2:
-            raise ValueError(f"Unexpected frame shape: {frame.shape}")
-        return frame_archive.to_jpeg_capped(frame, MQTT_MAX_PAYLOAD_BYTES)
-
-    def _publish_frame_ok(self, jpeg_bytes, w, h, ts_iso,
-                          on_demand=False, params=None):
-        self._bus.publish_frame_jpeg(jpeg_bytes, ts_iso, on_demand=on_demand,
-                                     params=params,
-                                     extra={"width": w, "height": h})
-
-    def _publish_frame_error(self, status, error, ts_iso=None, on_demand=False):
-        self._bus.publish_error(status, error, ts_iso=ts_iso,
-                                on_demand=on_demand)
 
     def _apply_params(self, params):
         applied = {}
@@ -818,71 +799,6 @@ class SpttWorkerConsole(threading.Thread):
         except Exception as e:
             errors.append(str(e))
         return applied, errors
-
-    def _handle_pending_capture(self):
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        self._pending_capture_event.clear()
-        if params is None:
-            return
-        console_ui.log("On-demand SPTT capture starting")
-        self._bus.publish_note("capturing", f"Applying params: {params}")
-        try:
-            applied, errors = self._apply_params(params)
-            for err in errors:
-                console_ui.warn(f"Param apply: {err}")
-            # Whoever asked is waiting for a frame that reflects what they
-            # asked for, not the one already in flight.
-            frame = self.cam.grab_fresh_frame()
-            now = dt.now()
-            self._push_live_frame(frame, now)
-            jpeg_bytes, w, h = self._encode_jpeg(frame)
-            self._publish_frame_ok(
-                jpeg_bytes, w, h, now.isoformat(),
-                on_demand=True, params=applied)
-            console_ui.log("On-demand frame sent via MQTT")
-        except Exception as e:
-            self._publish_frame_error("error", f"Capture failed: {e}",
-                                      on_demand=True)
-            console_ui.error(f"On-demand capture error: {e}")
-
-    def _on_mqtt_command(self, topic, payload):
-        """Handle incoming MQTT commands (get_frame, capture_frame)."""
-        console_ui.log(f"MQTT cmd received: {topic} "
-                       f"({len(payload) if payload else 0} bytes)")
-        if not self._bus.enabled:
-            return
-        if topic.endswith("/cmd/get_frame"):
-            frame = self._last_frame
-            ts_iso = self._last_shot.isoformat() if self._last_shot else None
-            if frame is None:
-                self._publish_frame_error("no_frame", "No frame captured yet")
-                console_ui.warn("Frame requested but no frame available yet")
-                return
-            try:
-                jpeg_bytes, w, h = self._encode_jpeg(frame)
-            except Exception as e:
-                self._publish_frame_error("error", str(e), ts_iso)
-                console_ui.error(f"Frame encode error: {e}")
-                return
-            self._publish_frame_ok(jpeg_bytes, w, h, ts_iso)
-            console_ui.log("Frame sent via MQTT")
-            return
-
-        if topic.endswith("/cmd/capture_frame"):
-            params, err = parse_command_params(payload)
-            if err:
-                self._publish_frame_error("bad_request", err, on_demand=True)
-                return
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._pending_capture_event.set()
-            self._bus.publish_note("accepted",
-                                   f"Request queued with params: {params}")
-            console_ui.log(f"On-demand capture queued with params: {params}")
-            return
-        console_ui.log(f"Unknown command: {topic}")
 
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
@@ -937,7 +853,6 @@ class SpttWorkerConsole(threading.Thread):
         last_fired = (-1, -1)
         consecutive_errors = 0
         self._bus.prepare_status_dir()
-        self._bus.subscribe(self._on_mqtt_command)
         if self._service is not None:
             self._service.set_current_params(self._current_params())
 
@@ -959,8 +874,6 @@ class SpttWorkerConsole(threading.Thread):
 
         while not self._stop_event.is_set():
             # Handle on-demand capture requests (outside schedule)
-            if self._pending_capture_event.is_set():
-                self._handle_pending_capture()
 
             now = dt.now()
 
@@ -1160,11 +1073,9 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
                      setup_mode=False):
     """Run SPTT camera measurement in console mode."""
     from utils import load_config, get_node_name
-    from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
     sptt_cfg = cfg.get("sptt", {})
-    mqtt_cfg = cfg.get("mqtt", {})
 
     node_name = get_node_name(cfg)
     claim = claim_instance_name(sptt_cfg.get("instance_name")
@@ -1183,6 +1094,16 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
     capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
     dash = console_ui.start_dashboard("sptt", instance_name, verbose=verbose)
+    # Alert mail, started before the camera is opened so that a camera which
+    # will not open — and a filter controller that answers nothing — is already
+    # something somebody hears about. The crash handler goes first: it is the
+    # only thing that can speak for a process killed outright.
+    alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+    alerts.install_crash_handler(alert_status_path)
+    alerts.start(cfg.get("alerts", {}), node_name, instance_name, "sptt",
+                 log_path=console_ui.default_log_path("sptt", instance_name),
+                 status_path=alert_status_path)
+
     dash.update(status="starting", node_name=node_name, output_dir=output_dir,
                 frames=0, errors=0,
                 schedule=f"capture at {capture_seconds} s of each minute")
@@ -1195,7 +1116,7 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
         ("Encoding:", "12bit" if encoding == ENCODING_12BPP else "8bit"),
     ])
     try:
-        _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
+        _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
                           instance_name, node_name, output_dir, status_dir,
                           exposure, gain, binning, encoding, target_temp,
                           capture_seconds, setup_mode, period_us, trigmode,
@@ -1205,13 +1126,12 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
         claim.release()
 
 
-def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
+def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
                       instance_name, node_name, output_dir, status_dir,
                       exposure, gain, binning, encoding, target_temp,
                       capture_seconds, setup_mode=False, period_us=None,
                       trigmode=None, firmware_dir=""):
     """Body of :func:`run_console_sptt`, with the dashboard already running."""
-    from mqtt_client import create_console_publisher
 
     if preview:
         console_ui.log("Initializing SPTT camera...")
@@ -1291,10 +1211,6 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         console_ui.error(f"Failed to configure camera: {exc}")
         sys.exit(1)
 
-    # MQTT
-    mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "sptt")
-    if mqtt_pub:
-        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
@@ -1314,8 +1230,6 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         instance_name=instance_name,
         status_dir=status_dir,
         capture_seconds=capture_seconds,
-        mqtt_publisher=mqtt_pub,
-        mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
         node_name=node_name,
     )
@@ -1334,9 +1248,4 @@ def _run_console_sptt(cfg, sptt_cfg, mqtt_cfg, config_path, preview, dash,
         cam.close()
         if server:
             server.stop()
-        if mqtt_pub:
-            try:
-                mqtt_pub.disconnect_broker()
-            except Exception:
-                pass
     console_ui.log("Done.")

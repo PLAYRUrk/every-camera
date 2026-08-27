@@ -5,26 +5,26 @@ Every Camera — monitor.
 Every camera as a tile: what it is, which machine it runs on, what it is doing
 right now, and what has gone wrong.
 
-Two sources, in that order of importance:
+Two ways of finding them, and the second is not a lesser one:
 
-* **The local network** — the main one. Cameras are found by the same UDP
-  discovery ``viewer_app.py`` and ``focus_app.py`` use, and each tile is filled
-  in from that camera's ``GET /api/status``. Nothing has to be configured, the
-  reading is first-hand and it is as fresh as the refresh interval.
-* **MQTT** — secondary, for cameras at another site with no route to their HTTP
-  port. Connect the panel at the bottom and their retained status topics become
-  tiles alongside the rest. A camera visible both ways is shown from the LAN:
-  that reading is direct rather than relayed through a broker.
+* **The local network** — cameras are found by the same UDP discovery
+  ``viewer_app.py`` and ``focus_app.py`` use, and each tile is filled in from
+  that camera's ``GET /api/status``. Nothing has to be configured.
+* **Through a gateway** — every camera knows the others and will fetch from
+  them on your behalf (``gateway.py``). Name one camera you can reach, in the
+  strip at the bottom, and its neighbours appear as tiles too. This replaced a
+  broker, and unlike the broker it carries everything: the tiles it produces
+  have working Frames and Focus buttons, because the route is real.
 
 Watching only. Frames belong to ``viewer_app.py`` and focusing to
-``focus_app.py`` — this program used to fetch frames over MQTT itself, which
-amounted to a second, weaker viewer inside the monitor. The tiles now hand the
-camera over to the right tool instead.
+``focus_app.py`` — this program used to fetch frames itself, which amounted to
+a second, weaker viewer inside the monitor. The tiles now hand the camera over
+to the right tool instead.
 
 Usage:
     python monitor_app.py
     python monitor_app.py --host 192.168.1.5      # one discovery cannot see
-    python monitor_app.py --mqtt                  # connect the broker at once
+    python monitor_app.py --via 192.168.1.5:8765  # and everything it knows
     python monitor_app.py --interval 5            # status refresh, seconds
 """
 import argparse
@@ -122,8 +122,8 @@ def camera_rows(rec):
     """The lines worth showing for one camera, as ``(label, value)`` pairs.
 
     Everything comes from the status payload the worker publishes — the same
-    one for LAN and MQTT — so a camera type that grows a field only has to
-    publish it.
+    one whichever way it was fetched — so a camera type that grows a field only
+    has to publish it.
     """
     rows = []
     kind = (rec.get("camera_type") or "").lower()
@@ -208,23 +208,19 @@ def main():
                         help="Watch this camera too, even if discovery misses it")
     parser.add_argument("--interval", type=float, default=STATUS_EVERY_MS / 1000,
                         help="Seconds between status refreshes (default 3)")
-    parser.add_argument("--mqtt", action="store_true",
-                        help="Also connect to the broker from config.json at once")
+    parser.add_argument("--via", default="",
+                        metavar="HOST[:PORT]",
+                        help="Ask this camera for every camera it knows")
     parser.add_argument("--config", default=None, help="Path to config.json")
     args = parser.parse_args()
 
-    from utils import can_use_gui, load_config
+    from utils import can_use_gui
 
     if not can_use_gui():
         print("Error: no display available. The monitor needs a graphical "
               "environment; `python -m discovery` lists the cameras on the "
               "network from a terminal.")
         sys.exit(1)
-
-    try:
-        cfg = load_config(args.config)
-    except Exception:
-        cfg = {}
 
     # Qt's own plugins, not OpenCV's — the two conflict when both are installed.
     try:
@@ -239,13 +235,12 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = MonitorWindow(mqtt_cfg=cfg.get("mqtt", {}),
-                           interval_ms=max(1000, int(args.interval * 1000)))
+    window = MonitorWindow(interval_ms=max(1000, int(args.interval * 1000)))
     for entry in args.host:
         window.add_manual(entry)
     window.show()
-    if args.mqtt:
-        window.connect_broker()
+    if args.via:
+        window.use_gateway(args.via)
     sys.exit(app.exec_())
 
 
@@ -260,12 +255,15 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal                     # noqa: E402
 from PyQt5.QtGui import QFont                                       # noqa: E402
 
 from monitor import STATUS_COLORS, status_display                   # noqa: E402
-from mqtt_client import MQTT_AVAILABLE                              # noqa: E402
 from net_client import (                                            # noqa: E402
     CameraClient, TaskRunner, DiscoveryTask, node_name_of,
+    load_settings, save_settings,
 )
 
-LAN, MQTT = "lan", "mqtt"
+# A tile's key is (route, host, port). ``route`` is LAN for a camera this
+# machine talks to directly, or the ``host:port`` of the gateway that will
+# fetch for us — which is also exactly what CameraClient(via=...) wants.
+LAN = "lan"
 
 
 class CameraTile(QFrame):
@@ -275,7 +273,7 @@ class CameraTile(QFrame):
 
     def __init__(self, key, node, parent=None):
         super().__init__(parent)
-        self.key = key                  # (LAN, host, port) or (MQTT, instance)
+        self.key = key                  # (route, host, port); see LAN above
         self.node = dict(node or {})
         self.record = {}
         self.misses = 0
@@ -344,8 +342,13 @@ class CameraTile(QFrame):
 
     @property
     def address(self):
-        """``(host, port)`` for a camera on this network, None over MQTT."""
-        return (self.key[1], self.key[2]) if self.source == LAN else None
+        """``(host, port)`` of the camera itself, whichever way we reach it."""
+        return (self.key[1], self.key[2])
+
+    @property
+    def via(self):
+        """The gateway fetching for us, or None when we talk to it directly."""
+        return None if self.source == LAN else self.source
 
     @property
     def instance_name(self):
@@ -364,7 +367,7 @@ class CameraTile(QFrame):
         rec = self.snapshot
         return " ".join(str(x) for x in (
             rec.get("instance_name"), rec.get("camera_type"),
-            node_name_of(rec), self.address[0] if self.address else "mqtt",
+            node_name_of(rec), self.address[0], self.via or "",
             rec.get("status")))
 
     # -- updates ----------------------------------------------------------
@@ -387,8 +390,11 @@ class CameraTile(QFrame):
     def refresh(self):
         rec = self.snapshot
         self.lbl_name.setText(str(rec.get("instance_name") or "?"))
-        where = (f"{self.address[0]}:{self.address[1]}" if self.address
-                 else "via MQTT")
+        where = f"{self.address[0]}:{self.address[1]}"
+        if self.via:
+            # Say which camera is fetching for us: "not answering" then points
+            # at the right one of the two.
+            where += f"  (via {self.via})"
         self.lbl_where.setText(
             f"{str(rec.get('camera_type') or '?').upper()}  ·  "
             f"{node_name_of(rec) or '?'}  ·  {where}")
@@ -442,13 +448,7 @@ class CameraTile(QFrame):
         self._update_buttons(rec)
 
     def _update_buttons(self, rec):
-        """Only a camera we have a route to can be viewed or focused."""
-        if self.address is None:
-            for button in (self.btn_frames, self.btn_focus):
-                button.setEnabled(False)
-                button.setToolTip("Only reachable over MQTT — viewing frames "
-                                  "and focusing need a route to the camera")
-            return
+        """Both work through a gateway too, which is why it replaced the broker."""
         self.btn_frames.setEnabled(not self.unreachable)
         self.btn_frames.setToolTip("Open viewer_app.py for this camera")
         focusable = bool(rec.get("supports_focus", True))
@@ -459,12 +459,13 @@ class CameraTile(QFrame):
 
     def _launch(self, program):
         """Hand this camera over to the program whose job that is."""
-        if self.address is None:
-            return
         host, port = self.address
+        command = [sys.executable, os.path.join(APP_DIR, program),
+                   "--host", str(host), "--port", str(port)]
+        if self.via:
+            command += ["--via", self.via]
         try:
-            subprocess.Popen([sys.executable, os.path.join(APP_DIR, program),
-                              "--host", str(host), "--port", str(port)])
+            subprocess.Popen(command)
         except OSError as exc:
             self.lbl_note.setText(f"Could not start {program}: {exc}")
             self.lbl_note.show()
@@ -485,116 +486,119 @@ class DetailsDialog(QDialog):
         lay.addWidget(text)
 
 
-class MqttPanel(QGroupBox):
-    """The secondary source: retained status topics from a broker.
+class GatewayPanel(QGroupBox):
+    """The second way in: one camera, asked about all the others.
 
-    Deliberately a strip at the bottom rather than a tab of its own. The LAN is
-    where the cameras are; this is for the ones that are somewhere else.
+    Deliberately a strip at the bottom rather than a tab. Most of the time
+    discovery finds everything and this stays collapsed; it earns its place on
+    the network where broadcast does not cross a switch, or from a machine
+    outside the cameras' segment with a route to exactly one of them.
+
+    The address is remembered, so it has to be typed once. The tiles it
+    produces are not second-class: the gateway forwards the archive, the live
+    stream and the parameters, so Frames and Focus work on them.
     """
 
-    record_received = pyqtSignal(str, object)    # instance name, status or None
+    nodes_received = pyqtSignal(str, object)     # gateway address, node list
     state_changed = pyqtSignal(str)
 
-    def __init__(self, mqtt_cfg=None, parent=None):
-        super().__init__("MQTT — cameras outside this network (secondary)", parent)
+    SETTINGS_KEY = "monitor_gateway"
+
+    def __init__(self, parent=None):
+        super().__init__("Through a gateway — ask one camera about the rest", parent)
         self.setCheckable(True)
         self.setChecked(False)          # collapsed until someone wants it
-        self._subscriber = None
-        cfg = mqtt_cfg or {}
+        self._tasks = TaskRunner(self)
+        self._asking = False
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(8, 4, 8, 6)
         lay.setSpacing(6)
-        self.le_host = QLineEdit(str(cfg.get("host", "broker.hivemq.com")))
-        self.le_port = QLineEdit(str(cfg.get("port", 1883)))
-        self.le_port.setMaximumWidth(60)
-        self.le_user = QLineEdit(str(cfg.get("user", "")))
-        self.le_user.setPlaceholderText("user (optional)")
-        self.le_user.setMaximumWidth(130)
-        self.le_pass = QLineEdit(str(cfg.get("password", "")))
-        self.le_pass.setEchoMode(QLineEdit.Password)
-        self.le_pass.setPlaceholderText("password")
-        self.le_pass.setMaximumWidth(130)
-        self.le_prefix = QLineEdit(str(cfg.get("prefix", "every_camera")))
-        self.le_prefix.setMaximumWidth(130)
-        self.chk_tls = QCheckBox("TLS")
-        self.chk_tls.setChecked(bool(cfg.get("tls", False)))
-        self.chk_tls.toggled.connect(
-            lambda on: self.le_port.setText("8883" if on else "1883"))
 
         self._widgets = []
-        for caption, widget in (("Broker:", self.le_host), ("Port:", self.le_port),
-                                ("Prefix:", self.le_prefix)):
-            label = QLabel(caption)
-            lay.addWidget(label)
-            lay.addWidget(widget)
-            self._widgets += [label, widget]
-        for widget in (self.le_user, self.le_pass, self.chk_tls):
-            lay.addWidget(widget)
-            self._widgets.append(widget)
+        label = QLabel("Camera:")
+        self.le_host = QLineEdit(str(load_settings().get(self.SETTINGS_KEY, "")))
+        self.le_host.setPlaceholderText("host or host:port of any camera")
+        self.le_host.setMaximumWidth(260)
+        self.le_host.returnPressed.connect(lambda: self.ask(self.le_host.text()))
+        lay.addWidget(label)
+        lay.addWidget(self.le_host)
+        self._widgets += [label, self.le_host]
 
-        self.btn_connect = QPushButton("Connect")
-        self.btn_connect.clicked.connect(self.connect_broker)
-        lay.addWidget(self.btn_connect)
+        self.btn_ask = QPushButton("Ask")
+        self.btn_ask.setToolTip("Fetch every camera this one knows about, and "
+                                "watch them through it")
+        self.btn_ask.clicked.connect(lambda: self.ask(self.le_host.text()))
+        lay.addWidget(self.btn_ask)
+        self._widgets.append(self.btn_ask)
+
+        self.chk_auto = QCheckBox("Keep asking")
+        self.chk_auto.setToolTip("Ask again every 20 s, so a camera started "
+                                 "later turns up on its own")
+        lay.addWidget(self.chk_auto)
+        self._widgets.append(self.chk_auto)
+
         self.lbl_state = QLabel("not connected")
         self.lbl_state.setStyleSheet("color:#888; font-size:11px;")
         lay.addWidget(self.lbl_state, 1)
-        self._widgets += [self.btn_connect, self.lbl_state]
+        self._widgets.append(self.lbl_state)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(DISCOVERY_EVERY_MS)
+        self._timer.timeout.connect(lambda: self.ask(self.le_host.text()))
+        self.chk_auto.toggled.connect(
+            lambda on: self._timer.start() if on else self._timer.stop())
+
         self.toggled.connect(self._on_toggled)
         self._on_toggled(False)
 
     def _on_toggled(self, on):
         for widget in self._widgets:
             widget.setVisible(on)
-        if not on and self._subscriber is not None:
-            self.disconnect_broker()
+        if not on:
+            self._timer.stop()
 
-    @property
-    def connected(self):
-        return self._subscriber is not None
+    @staticmethod
+    def normalise(address):
+        """``host`` or ``host:port`` to the ``host:port`` a proxy URL needs."""
+        text = str(address or "").strip()
+        if not text:
+            return ""
+        host, _, port = text.partition(":")
+        host = host.strip()
+        if not host:
+            return ""
+        return f"{host}:{int(port) if port.strip().isdigit() else DEFAULT_HTTP_PORT}"
 
-    def connect_broker(self):
-        if not MQTT_AVAILABLE:
-            self._set_state("paho-mqtt is not installed", error=True)
+    def ask(self, address):
+        """Fetch ``/api/nodes`` from ``address`` and hand the result on."""
+        via = self.normalise(address)
+        if not via:
+            self._set_state("type the address of a camera you can reach", error=True)
             return
-        if self._subscriber is not None:
-            self.disconnect_broker()
+        if self._asking:
             return
         self.setChecked(True)
-        from mqtt_client import MqttSubscriber
+        self.le_host.setText(via)
+        save_settings({self.SETTINGS_KEY: via})
+        self._asking = True
+        self._set_state(f"asking {via}…")
 
-        prefix = self.le_prefix.text().strip() or "every_camera"
-        try:
-            self._subscriber = MqttSubscriber(
-                self.le_host.text().strip(), self.le_port.text().strip(),
-                self.le_user.text().strip(), self.le_pass.text(),
-                use_tls=self.chk_tls.isChecked())
-            self._subscriber.connected.connect(
-                lambda: self._set_state(f"connected to "
-                                        f"{self.le_host.text().strip()}"))
-            self._subscriber.disconnected.connect(
-                lambda: self._set_state("disconnected"))
-            self._subscriber.error.connect(
-                lambda msg: self._set_state(str(msg), error=True))
-            self._subscriber.message_received.connect(self._on_message)
-            # Status only: frames are viewer_app's business, and subscribing to
-            # them here would pull megabytes through the broker for nothing.
-            self._subscriber.connect_broker([f"{prefix}/+/status"])
-            self._set_state("connecting…")
-            self.btn_connect.setText("Disconnect")
-        except Exception as exc:
-            self._subscriber = None
-            self._set_state(str(exc), error=True)
+        host, _, port = via.partition(":")
+        client = CameraClient(host, port, timeout=6.0)
+        self._tasks.run(client.nodes,
+                        lambda nodes, v=via: self._on_nodes(v, nodes),
+                        lambda msg, v=via: self._on_failed(v, msg))
 
-    def disconnect_broker(self):
-        if self._subscriber is not None:
-            try:
-                self._subscriber.disconnect_broker()
-            except Exception:
-                pass
-            self._subscriber = None
-        self.btn_connect.setText("Connect")
-        self._set_state("not connected")
+    def _on_nodes(self, via, nodes):
+        self._asking = False
+        nodes = nodes or []
+        self._set_state(f"{via}: {len(nodes)} camera(s)")
+        self.nodes_received.emit(via, nodes)
+
+    def _on_failed(self, via, message):
+        self._asking = False
+        self._set_state(f"{via}: {message}", error=True)
 
     def _set_state(self, text, error=False):
         self.lbl_state.setText(text)
@@ -602,22 +606,9 @@ class MqttPanel(QGroupBox):
             f"color:{'#c0392b' if error else '#888'}; font-size:11px;")
         self.state_changed.emit(text)
 
-    def _on_message(self, topic, payload):
-        if not topic.endswith("/status"):
-            return
-        instance = topic.split("/")[-2] if "/" in topic else topic
-        # An empty retained payload is how a worker erases itself on shutdown.
-        if not (payload or "").strip():
-            self.record_received.emit(instance, None)
-            return
-        try:
-            self.record_received.emit(instance, json.loads(payload))
-        except (ValueError, TypeError):
-            pass
-
 
 class MonitorWindow(QMainWindow):
-    def __init__(self, mqtt_cfg=None, interval_ms=STATUS_EVERY_MS):
+    def __init__(self, interval_ms=STATUS_EVERY_MS):
         super().__init__()
         self.setWindowTitle("Every Camera — monitor")
         self.resize(1080, 760)
@@ -629,7 +620,7 @@ class MonitorWindow(QMainWindow):
         self._columns = 0
         self._last_search = None
 
-        self._build_ui(mqtt_cfg)
+        self._build_ui()
 
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(interval_ms)
@@ -644,7 +635,7 @@ class MonitorWindow(QMainWindow):
         QTimer.singleShot(150, self.discover)
 
     # -- UI ----------------------------------------------------------------
-    def _build_ui(self, mqtt_cfg):
+    def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -693,10 +684,10 @@ class MonitorWindow(QMainWindow):
         self.lbl_empty.setStyleSheet("color:#888;")
         root.addWidget(self.lbl_empty)
 
-        self.mqtt = MqttPanel(mqtt_cfg)
-        self.mqtt.record_received.connect(self._on_mqtt_record)
-        self.mqtt.state_changed.connect(lambda _t: self._update_summary())
-        root.addWidget(self.mqtt)
+        self.gateway = GatewayPanel()
+        self.gateway.nodes_received.connect(self._on_gateway_nodes)
+        self.gateway.state_changed.connect(lambda _t: self._update_summary())
+        root.addWidget(self.gateway)
 
         self.setStatusBar(QStatusBar())
 
@@ -725,15 +716,17 @@ class MonitorWindow(QMainWindow):
             tile = self._tiles.get(key)
             if tile is None:
                 self._add_tile(key, node)
-                # The same camera relayed through the broker is a poorer copy.
-                self._drop_mqtt_twin(node.get("instance_name"))
             else:
                 tile.seen(node)
                 tile.refresh()
+            # Reached first-hand now, so a forwarded tile for it is one hop of
+            # hearsay too many.
+            self._drop_forwarded_twin(key)
         for key, tile in self._tiles.items():
-            # Manually added cameras never answer discovery, and MQTT ones are
-            # not on this network at all: both are judged by their own source.
-            if key in seen or tile.source == MQTT or tile.node.get("manual"):
+            # A camera added by hand never answers discovery, and one reached
+            # through a gateway is not on this network at all: both are
+            # judged by their own route, not by this probe.
+            if key in seen or tile.via or tile.node.get("manual"):
                 continue
             tile.misses += 1
             if tile.misses >= MISSES_BEFORE_GONE and not tile.unreachable:
@@ -776,41 +769,51 @@ class MonitorWindow(QMainWindow):
         tile.deleteLater()
         self._relayout(force=True)
 
-    def _drop_mqtt_twin(self, instance_name):
-        """A camera found on the LAN no longer needs its relayed tile."""
-        if instance_name:
-            self._remove_tile((MQTT, str(instance_name)))
+    def _drop_forwarded_twin(self, lan_key):
+        """A camera we can reach directly does not also need a forwarded tile.
 
-    # -- MQTT ---------------------------------------------------------------
-    def connect_broker(self):
-        self.mqtt.setChecked(True)
-        self.mqtt.connect_broker()
-
-    def _on_mqtt_record(self, instance, record):
-        key = (MQTT, str(instance))
-        if record is None:              # the worker cleared its retained topic
+        Same camera, same address, two routes to it. The direct one is a
+        first-hand reading and one hop shorter, so the forwarded tile goes.
+        """
+        _, host, port = lan_key
+        for key in [k for k in self._tiles
+                    if k[0] != LAN and k[1] == host and k[2] == port]:
             self._remove_tile(key)
-            self._update_summary()
-            return
-        # Anything on this network is already shown first-hand; a broker copy
-        # of it would be a second tile for one camera.
-        if any(tile.source == LAN and tile.instance_name == str(instance)
-               for tile in self._tiles.values()):
-            return
-        tile = self._tiles.get(key)
-        if tile is None:
-            tile = self._add_tile(key, {"instance_name": instance})
-        tile.set_status(record)
+
+    # -- through a gateway ---------------------------------------------------
+    def use_gateway(self, address):
+        """Ask ``address`` for every camera it knows."""
+        self.gateway.setChecked(True)
+        self.gateway.ask(address)
+
+    def _on_gateway_nodes(self, via, nodes):
+        for node in nodes or []:
+            host = node.get("host")
+            port = int(node.get("http_port") or DEFAULT_HTTP_PORT)
+            if not host:
+                continue
+            if (LAN, host, port) in self._tiles:
+                continue        # already reached first-hand
+            key = (via, host, port)
+            tile = self._tiles.get(key)
+            if tile is None:
+                tile = self._add_tile(key, node)
+            else:
+                tile.seen(node)
+            status = node.get("status")
+            if status:
+                tile.set_status(status)
         self._apply_filter(self.le_filter.text())
+        self._poll_all()
         self._update_summary()
 
     # -- reading status -----------------------------------------------------
     def _poll_all(self):
         for key, tile in list(self._tiles.items()):
-            if tile.source != LAN or key in self._polling:
+            if key in self._polling:
                 continue        # a slow camera must not queue up requests
             self._polling.add(key)
-            client = CameraClient(key[1], key[2], timeout=4.0)
+            client = CameraClient(key[1], key[2], timeout=4.0, via=tile.via)
             self._tasks.run(client.status,
                             lambda rec, k=key: self._on_status(k, rec),
                             lambda msg, k=key: self._on_status_failed(k, msg))
@@ -821,7 +824,6 @@ class MonitorWindow(QMainWindow):
         if tile is None:
             return
         tile.set_status(record)
-        self._drop_mqtt_twin(tile.instance_name)
         self._update_summary()
 
     def _on_status_failed(self, key, message):
@@ -862,7 +864,7 @@ class MonitorWindow(QMainWindow):
     def _sorted_tiles(self):
         """LAN first, then by camera type and name — a stable, readable order."""
         return sorted(self._tiles.values(),
-                      key=lambda t: (t.source != LAN,
+                      key=lambda t: (bool(t.via),
                                      str(t.snapshot.get("camera_type") or ""),
                                      t.instance_name, str(t.key)))
 
@@ -878,7 +880,7 @@ class MonitorWindow(QMainWindow):
         running = sum(1 for t in live if t.record.get("status") == "running")
         setup = sum(1 for t in live if t.record.get("setup_mode"))
         errors = sum(int(t.record.get("errors") or 0) for t in live)
-        relayed = sum(1 for t in tiles if t.source == MQTT)
+        relayed = sum(1 for t in tiles if t.via)
         searched = (self._last_search.strftime("%H:%M:%S")
                     if self._last_search else "—")
         parts = [f"{len(tiles)} camera(s)", f"{running} running"]
@@ -889,14 +891,13 @@ class MonitorWindow(QMainWindow):
         if errors:
             parts.append(f"{errors} error(s) reported")
         if relayed:
-            parts.append(f"{relayed} over MQTT")
+            parts.append(f"{relayed} through a gateway")
         parts.append(f"last search {searched}")
         self.statusBar().showMessage("   ·   ".join(parts))
 
     def closeEvent(self, event):
         self._status_timer.stop()
         self._discovery_timer.stop()
-        self.mqtt.disconnect_broker()
         self._tasks.wait_all()
         event.accept()
 

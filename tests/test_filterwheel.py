@@ -290,3 +290,69 @@ def test_the_shutter_is_given_time_to_move_before_it_is_reported_shut(wired):
     started = port.now
     wheel.set_shutter(False)
     assert port.now - started >= filterwheel._SHUTTER_SETTLE
+
+
+# -- a controller that is simply not there ------------------------------------
+def test_homing_without_an_answer_leaves_the_position_unknown(wired):
+    # GOSUB5 used to record HOME whether or not anything came back, which is the
+    # one place the module claimed a position it had never read.
+    wheel, port = wired(deaf=True)
+    assert wheel._home() is None
+    assert wheel.current_filter is None
+
+
+def test_a_rebuild_that_does_not_restore_the_link_says_so(wired):
+    wheel, port = wired(deaf=True)
+    assert wheel._reinitialise(2) is False
+
+
+def test_a_controller_that_never_answers_is_written_off(wired):
+    wheel, port = wired(deaf=True)
+    for _ in range(filterwheel.SILENT_MOVES_BEFORE_LOST):
+        assert wheel.select(2) is False
+    assert wheel._lost is True
+
+
+def test_a_written_off_controller_stops_costing_a_minute_a_frame(wired):
+    wheel, port = wired(deaf=True)
+    started = port.now
+    assert wheel.select(2) is False
+    full_attempt = port.now - started
+    # Two moves, two position reads, a port rebuild and a ten-second homing.
+    assert full_attempt > 20.0
+
+    for _ in range(filterwheel.SILENT_MOVES_BEFORE_LOST - 1):
+        wheel.select(2)
+    assert wheel._lost is True
+
+    started = port.now
+    assert wheel.select(3) is False
+    # Written off, and not yet due to be asked again: the frame is filed without
+    # a filter tag now instead of in three quarters of a minute.
+    assert port.now - started < 1.0
+
+
+def test_a_written_off_controller_is_picked_back_up_when_it_answers(wired):
+    wheel, port = wired(deaf=True)
+    for _ in range(filterwheel.SILENT_MOVES_BEFORE_LOST):
+        wheel.select(2)
+    assert wheel._lost is True
+
+    port.deaf = False
+    port.advance(filterwheel._LOST_RETRY_SECONDS)
+    assert wheel.select(2) is True
+    assert wheel.current_filter == 2
+    assert wheel._lost is False
+
+
+def test_a_wheel_that_talks_but_will_not_turn_is_never_written_off(wired):
+    # Writing a controller off is about silence only. This one answers every
+    # poll and simply refuses to move, which is what the retries and the rebuild
+    # above exist for — and they must keep being paid for it.
+    wheel, port = wired(moves=False, position=2)
+    for _ in range(filterwheel.SILENT_MOVES_BEFORE_LOST + 2):
+        assert wheel.select(5) is False
+    assert wheel._lost is False
+    # And the position stays a reading rather than "unknown": the
+    # controller answered every poll, so the wheel is where it says it is.
+    assert wheel.current_filter is not None

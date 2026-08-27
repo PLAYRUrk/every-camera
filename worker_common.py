@@ -1,17 +1,15 @@
 """
 Shared plumbing for the camera workers (console and Qt alike).
 
-Every driver used to carry its own near-identical copy of: the status-file +
-retained-MQTT publishing, the frame/error/note publishing envelope, and the
-JPEG encoder. This module holds one copy of each, so a fix lands everywhere.
+Every driver used to carry its own near-identical copy of the status publishing
+and the error reporting. This module holds one copy of each, so a fix lands
+everywhere.
 
-The wire format is unchanged — ``monitor.py`` and ``viewer_app.py`` see exactly
-the same topics and JSON keys as before.
+One call to :meth:`WorkerBus.publish_status` reaches every reader there is:
 
-Topics (``prefix`` defaults to ``every_camera``):
-    {prefix}/{instance}/status          retained status snapshot
-    {prefix}/{instance}/frame           frames, errors and progress notes
-    {prefix}/{instance}/cmd/#           incoming commands
+    CameraService  -> the frame server, so /api/status and everything past it
+    status file    -> ~/.every_camera/status/{pid}.json, watched by sentinel.py
+                      and read by a monitor running on the same machine
 """
 import json
 import os
@@ -20,17 +18,13 @@ import time
 
 from datetime import datetime as dt
 
-import console_ui
+import alerts
 
-import frame_archive
+import console_ui
 
 from utils import (
     STATUS_MIN_INTERVAL, write_status_file, cleanup_stale_status_files,
 )
-
-# HiveMQ's free tier caps messages at ~256 KB — leave headroom for the JSON
-# envelope and base64 expansion.
-MQTT_MAX_PAYLOAD_BYTES = 240_000
 
 # Status name published while a camera is up for focusing only.
 SETUP_STATUS = "setup"
@@ -125,22 +119,27 @@ def serving_focus_hold(service, held):
         pass
 
 
-class WorkerMqtt:
-    """Status and frame publishing for one camera worker.
+class WorkerBus:
+    """Status publishing for one camera worker.
 
-    Handles three concerns the drivers kept duplicating:
+    Two concerns the drivers used to duplicate:
 
     * **Throttling.** Outside the schedule a worker loops twice a second. It
       may call :meth:`publish_status` every iteration; only one publication per
       ``STATUS_MIN_INTERVAL`` actually goes out, plus every status *change*.
-    * **Retained cleanup.** :meth:`shutdown` erases the retained status topic,
-      so a stopped camera disappears from monitors instead of being remembered
-      by the broker forever.
-    * **Payload limits.** Frames are downscaled until they fit the broker cap.
+    * **One call, every reader.** A status goes to the frame server, for
+      ``/api/status`` and everything downstream of it, and to the status file
+      under ``~/.every_camera/status``, which is what the sentinel watches and
+      what a monitor on this machine reads.
+
+    It used to publish to a broker as well, and to carry frames there —
+    downscaled to fit a payload ceiling, one at a time, on request. All of
+    that is gone: the frame server serves the archive, the live stream and
+    the parameters over the same network, without a broker to configure or a
+    240 KB limit to squeeze a frame into.
     """
 
     def __init__(self, camera_type, instance_name, status_dir,
-                 mqtt_publisher=None, mqtt_prefix="every_camera",
                  service=None, status_suffix="", node_name=""):
         self.camera_type = camera_type
         self.instance_name = instance_name
@@ -148,13 +147,7 @@ class WorkerMqtt:
         # Stamped onto every status snapshot so the monitor can say which
         # machine a camera is on without every driver remembering to add it.
         self.node_name = node_name or ""
-        self.prefix = mqtt_prefix
-        self._mqtt = mqtt_publisher
         self._service = service
-
-        self.status_topic = f"{mqtt_prefix}/{instance_name}/status"
-        self.frame_topic = f"{mqtt_prefix}/{instance_name}/frame"
-        self.cmd_topic = f"{mqtt_prefix}/{instance_name}/cmd/#"
 
         # The GUI can run several cameras in one process, so it passes a
         # suffix to keep their status files apart.
@@ -164,10 +157,6 @@ class WorkerMqtt:
         self._last_status_at = 0.0
 
     # ------------------------------------------------------------------
-    @property
-    def enabled(self):
-        return self._mqtt is not None
-
     def prepare_status_dir(self):
         """Create the status dir and drop files left by dead processes."""
         os.makedirs(self.status_dir, exist_ok=True)
@@ -175,15 +164,6 @@ class WorkerMqtt:
         if removed:
             console_ui.log(f"Removed {removed} stale status file(s) from "
                            f"{self.status_dir}")
-
-    def subscribe(self, callback):
-        """Subscribe to the instance command topic. Returns True if wired up."""
-        if not self._mqtt:
-            console_ui.log("No MQTT — remote commands disabled")
-            return False
-        self._mqtt.subscribe_commands(self.cmd_topic, callback)
-        console_ui.log(f"Subscribed to commands: {self.cmd_topic}")
-        return True
 
     # ------------------------------------------------------------------
     # Status
@@ -213,119 +193,46 @@ class WorkerMqtt:
             write_status_file(self.status_path, payload)
         except Exception as exc:
             console_ui.warn(f"Could not write status file: {exc}")
-        if self._mqtt:
-            try:
-                self._mqtt.publish(self.status_topic, json.dumps(payload),
-                                   retain=True)
-            except Exception:
-                pass
         return True
 
-    def shutdown(self):
-        """Remove the status file and erase the retained status topic."""
+    def publish_error(self, kind, error, ts_iso=None):
+        """Record something that went wrong, where observers will see it.
+
+        This used to publish to the broker and nowhere else, which meant that
+        on a station with the broker off — the default — every one of these
+        calls did nothing at all. The frame that returned no image, the write
+        that failed, the filter that was never reached: all reported, all
+        discarded. Now it reaches ``/api/status``, which is what the monitor
+        draws and what an alert letter quotes.
+        """
+        if self._service is None:
+            return
+        try:
+            self._service.note_error(kind, error, when=ts_iso)
+        except Exception:
+            pass
+
+    def shutdown(self, reason="stopped normally"):
+        """Remove the status file, having first said this was on purpose.
+
+        The clean-exit marker goes down *before* the status file goes away, and
+        that order is the whole point of it: the sentinel decides a worker
+        crashed by finding a status file with a dead process behind it, and
+        without a marker written first, every orderly stop — an operator at the
+        console, ``systemctl stop``, a reboot — would reach it as a crash and
+        wake somebody up for nothing.
+        """
+        try:
+            alerts.note_clean_exit(self.status_path, reason)
+        except Exception:
+            pass
         try:
             os.remove(self.status_path)
         except FileNotFoundError:
             pass
         except OSError:
             pass
-        if self._mqtt:
-            try:
-                self._mqtt.clear_retained(self.status_topic)
-            except Exception:
-                pass
 
-    # ------------------------------------------------------------------
-    # Frames
-    # ------------------------------------------------------------------
-    def publish_frame_jpeg(self, jpeg_bytes, ts_iso, on_demand=False,
-                           params=None, extra=None):
-        """Publish already-encoded JPEG bytes."""
-        if not self._mqtt:
-            return False
-        import base64
-        body = {
-            "camera_type": self.camera_type,
-            "instance_name": self.instance_name,
-            "status": "ok",
-            "format": "jpeg",
-            "data": base64.b64encode(jpeg_bytes).decode(),
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }
-        if params:
-            body["params"] = params
-        if extra:
-            body.update(extra)
-        payload = json.dumps(body)
-        if len(payload) > MQTT_MAX_PAYLOAD_BYTES:
-            self.publish_error(
-                "too_large",
-                f"Frame payload {len(payload)} bytes exceeds broker limit",
-                ts_iso=ts_iso, on_demand=on_demand)
-            console_ui.warn(f"Frame too large ({len(payload)} bytes); not sent")
-            return False
-        self._mqtt.publish(self.frame_topic, payload, retain=False)
-        return True
-
-    def publish_frame_array(self, frame, ts_iso, on_demand=False, params=None,
-                            extra=None):
-        """Encode a numpy frame (downscaling as needed) and publish it."""
-        if not self._mqtt:
-            return False
-        if isinstance(frame, (bytes, bytearray)):
-            return self.publish_frame_jpeg(bytes(frame), ts_iso,
-                                           on_demand=on_demand, params=params,
-                                           extra=extra)
-        jpeg_bytes, w, h = frame_archive.to_jpeg_capped(
-            frame, MQTT_MAX_PAYLOAD_BYTES)
-        merged = {"width": w, "height": h}
-        if extra:
-            merged.update(extra)
-        return self.publish_frame_jpeg(jpeg_bytes, ts_iso, on_demand=on_demand,
-                                       params=params, extra=merged)
-
-    def publish_error(self, status, error, ts_iso=None, on_demand=False):
-        if not self._mqtt:
-            return
-        self._mqtt.publish(self.frame_topic, json.dumps({
-            "camera_type": self.camera_type,
-            "instance_name": self.instance_name,
-            "status": status,
-            "error": error,
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }), retain=False)
-
-    def publish_note(self, status, note=""):
-        """Publish a progress note (``accepted`` / ``capturing``)."""
-        if not self._mqtt:
-            return
-        self._mqtt.publish(self.frame_topic, json.dumps({
-            "camera_type": self.camera_type,
-            "instance_name": self.instance_name,
-            "status": status,
-            "note": note,
-            "timestamp": dt.now().isoformat(),
-            "on_demand": True,
-        }), retain=False)
-
-
-def parse_command_params(payload):
-    """Decode a ``cmd/capture_frame`` payload into a dict.
-
-    Returns ``(params, error)``; ``error`` is a message string when the payload
-    is not valid JSON.
-    """
-    if not payload:
-        return {}, None
-    try:
-        params = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        return None, f"Invalid JSON: {exc}"
-    if not isinstance(params, dict):
-        return {}, None
-    return params, None
 
 
 def install_stop_handler(handler):

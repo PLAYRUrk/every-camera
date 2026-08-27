@@ -402,7 +402,7 @@ def test_a_refused_change_does_not_leave_the_camera_stopped():
     cam = make_camera(fw)
     cam.start()
 
-    worker = SpttWorkerConsole.__new__(SpttWorkerConsole)   # no MQTT, no thread
+    worker = SpttWorkerConsole.__new__(SpttWorkerConsole)   # no bus, no thread
     worker.cam = cam
     applied, errors = worker._apply_params({"binning": 1})
 

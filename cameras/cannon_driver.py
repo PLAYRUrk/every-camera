@@ -15,6 +15,8 @@ from datetime import datetime as dt
 from time import sleep
 from pathlib import Path
 
+import alerts
+
 import console_ui
 
 from utils import (
@@ -22,7 +24,7 @@ from utils import (
     get_local_ip, get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, publish_current_params,
+    WorkerBus, publish_current_params,
     publish_schedule_state, serving_focus_hold,
     run_focus_iteration, announce_setup_mode, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
@@ -365,8 +367,7 @@ class CannonWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, config, schedule, output_dir, instance_name,
-                 status_dir, capture_seconds, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None, node_name="",
+                 status_dir, capture_seconds, service=None, node_name="",
                  setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
@@ -378,9 +379,8 @@ class CannonWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds)
         self.setup_mode = bool(setup_mode)
         self._service = service
-        self._bus = WorkerMqtt("cannon", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               node_name=node_name)
+        self._bus = WorkerBus("cannon", instance_name, status_dir,
+                              service=service, node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
@@ -390,41 +390,9 @@ class CannonWorkerConsole(threading.Thread):
         # Whether the last loop pass ran under a focus hold, so entering and
         # leaving it is logged once instead of twice a second.
         self._held = False
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
-        self._pending_capture_event = threading.Event()
 
     def request_stop(self):
         self._stop_event.set()
-
-    def _on_mqtt_command(self, topic, payload):
-        """Handle incoming MQTT commands (e.g. get_frame, capture_frame)."""
-        console_ui.log(f"MQTT cmd received: {topic} "
-                       f"({len(payload) if payload else 0} bytes)")
-        if not self._bus.enabled:
-            return
-        if topic.endswith("/cmd/get_frame"):
-            if self._last_frame_data is None:
-                self._bus.publish_error("no_frame", "No frame captured yet")
-                console_ui.warn("Frame requested but no frame available yet")
-                return
-            ts = self._last_shot.isoformat() if self._last_shot else None
-            self._bus.publish_frame_jpeg(self._last_frame_data, ts)
-            console_ui.log("Frame sent via MQTT")
-            return
-        if topic.endswith("/cmd/capture_frame"):
-            params, err = parse_command_params(payload)
-            if err:
-                self._bus.publish_error("bad_request", err, on_demand=True)
-                return
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._pending_capture_event.set()
-            self._bus.publish_note("accepted",
-                                   f"Request queued with params: {params}")
-            console_ui.log(f"On-demand capture queued with params: {params}")
-            return
-        console_ui.log(f"Unknown command: {topic}")
 
     def _apply_cannon_params(self, params):
         failures = []
@@ -438,31 +406,6 @@ class CannonWorkerConsole(threading.Thread):
             except Exception as e:
                 failures.append((key, str(e)))
         return failures
-
-    def _handle_pending_capture(self):
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        self._pending_capture_event.clear()
-        if params is None:
-            return
-        console_ui.log("On-demand capture starting")
-        self._bus.publish_note("capturing", f"Applying params: {params}")
-        try:
-            failures = self._apply_cannon_params(params)
-            for key, err in failures:
-                console_ui.warn(f"Param '{key}' failed: {err}")
-            img_data = capture_image(self.cam)
-            now = dt.now()
-            self._last_frame_data = img_data
-            self._push_live_frame(img_data, now)
-            self._bus.publish_frame_jpeg(img_data, now.isoformat(),
-                                         on_demand=True, params=params)
-            console_ui.log("On-demand frame sent via MQTT")
-        except Exception as e:
-            self._bus.publish_error("error", f"Capture failed: {e}",
-                                    on_demand=True)
-            console_ui.error(f"On-demand capture error: {e}")
 
     # ------------------------------------------------------------------
     # Live view for the LAN focus tool
@@ -519,7 +462,6 @@ class CannonWorkerConsole(threading.Thread):
         last_fired = (-1, -1)
         consecutive_errors = 0
         self._bus.prepare_status_dir()
-        self._bus.subscribe(self._on_mqtt_command)
 
         if self.setup_mode:
             console_ui.log("Cannon ready for focusing (setup mode)")
@@ -530,8 +472,6 @@ class CannonWorkerConsole(threading.Thread):
 
         while not self._stop_event.is_set():
             # Handle on-demand capture requests (outside schedule)
-            if self._pending_capture_event.is_set():
-                self._handle_pending_capture()
 
             now = dt.now()
 
@@ -689,16 +629,14 @@ def run_console_cannon(config_path=None, preview=False, verbose=False,
                        setup_mode=False):
     """Run Canon camera measurement in console mode."""
     from utils import load_config, get_node_name
-    from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
     cannon_cfg = cfg.get("cannon", {})
-    mqtt_cfg = cfg.get("mqtt", {})
 
     node_name = get_node_name(cfg)
     # Reserved for the lifetime of the process, so a second copy started from
     # this same config.json gets "Cannon_node-2" instead of silently sharing
-    # MQTT topics, the log file and preview_{instance}.png with the first.
+    # The log file and preview_{instance}.png go with the first.
     claim = claim_instance_name(cannon_cfg.get("instance_name")
                                 or get_instance_name("Cannon", cfg))
     instance_name = claim.name
@@ -708,11 +646,21 @@ def run_console_cannon(config_path=None, preview=False, verbose=False,
     capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
 
     dash = console_ui.start_dashboard("cannon", instance_name, verbose=verbose)
+    # Alert mail, started before the camera is opened so that a camera which
+    # will not open — and a filter controller that answers nothing — is already
+    # something somebody hears about. The crash handler goes first: it is the
+    # only thing that can speak for a process killed outright.
+    alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+    alerts.install_crash_handler(alert_status_path)
+    alerts.start(cfg.get("alerts", {}), node_name, instance_name, "cannon",
+                 log_path=console_ui.default_log_path("cannon", instance_name),
+                 status_path=alert_status_path)
+
     dash.update(status="starting", node_name=node_name, output_dir=output_dir,
                 frames=0, errors=0,
                 schedule=f"capture at {capture_seconds} s of each minute")
     try:
-        _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
+        _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
                             instance_name, node_name, output_dir, status_dir,
                             schedule_file, capture_seconds, setup_mode)
     finally:
@@ -720,11 +668,10 @@ def run_console_cannon(config_path=None, preview=False, verbose=False,
         claim.release()
 
 
-def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
+def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
                         instance_name, node_name, output_dir, status_dir,
                         schedule_file, capture_seconds, setup_mode=False):
     """Body of :func:`run_console_cannon`, with the dashboard already running."""
-    from mqtt_client import create_console_publisher
 
     if preview:
         console_ui.log("Releasing camera USB...")
@@ -801,10 +748,6 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     apply_camcfg(config, model_name, cannon_cfg.get("camcfg_file", ""))
     apply_shutterspeed(config, cannon_cfg.get("shutterspeed", ""))
 
-    # MQTT
-    mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "cannon")
-    if mqtt_pub:
-        dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
     # LAN frame server (archive browsing + live view). Never fatal.
     from camera_service import CameraService
@@ -830,8 +773,6 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
         instance_name=instance_name,
         status_dir=status_dir,
         capture_seconds=capture_seconds,
-        mqtt_publisher=mqtt_pub,
-        mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
         service=service,
         node_name=node_name,
         setup_mode=setup_mode,
@@ -850,8 +791,3 @@ def _run_console_cannon(cfg, cannon_cfg, mqtt_cfg, config_path, preview, dash,
     finally:
         if server:
             server.stop()
-        if mqtt_pub:
-            try:
-                mqtt_pub.disconnect_broker()
-            except Exception:
-                pass

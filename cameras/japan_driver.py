@@ -4,7 +4,7 @@ Japan all-sky imager driver: Hamamatsu camera (DCAM-API) + filter wheel.
 This is the every-camera front for the hardware in ``cameras/japan/``. It keeps the
 measurement programme of the standalone japan-camera application intact — pre-darks
 timed to the window, the two schedule modes, post-darks on Ctrl+C — and adds what
-every other camera in this program already has: retained MQTT status, status files
+every other camera in this program already has: status files
 for the monitor, the LAN frame server with UDP discovery, live view and remote
 parameter editing for ``focus_app.py``, preview mode, and the shared console
 dashboard.
@@ -56,6 +56,8 @@ import time
 from datetime import datetime as dt, timedelta
 from pathlib import Path
 
+import alerts
+
 import console_ui
 
 from utils import (
@@ -63,7 +65,7 @@ from utils import (
     get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, parse_command_params, publish_current_params,
+    WorkerBus, publish_current_params,
     publish_schedule_state, serving_focus_hold,
     run_focus_iteration, announce_setup_mode, empty_schedule_reason, SETUP_STATUS,
     install_stop_handler, stop_signal_name,
@@ -89,7 +91,7 @@ FOCUS_SLACK_SECONDS = 3.0
 TICK = 0.2
 
 # Words that may stand for a shutter state. A remote parameter arrives as JSON
-# from focus_app (a real bool) or hand-typed over MQTT, and "closed" must never
+# from focus_app (a real bool) or hand-typed in a config, and "closed" must never
 # be read as truthy just because it is a non-empty string.
 _TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
 _FALSE_WORDS = {"0", "false", "no", "off", "closed", "close", "shut"}
@@ -281,8 +283,7 @@ class JapanWorkerConsole(threading.Thread):
     NAME_ATTEMPTS = 10
 
     def __init__(self, cam: JapanCamera, cfg: japan_config.JapanConfig, output_dir,
-                 instance_name, status_dir, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None, dashboard=None,
+                 instance_name, status_dir, service=None, dashboard=None,
                  node_name="", setup_mode=False):
         super().__init__(daemon=True)
         self.cam = cam
@@ -293,8 +294,8 @@ class JapanWorkerConsole(threading.Thread):
         self.setup_mode = bool(setup_mode)
         self._service = service
         self._dash = dashboard
-        self._bus = WorkerMqtt("japan", instance_name, status_dir, mqtt_publisher,
-                               mqtt_prefix, service=service, node_name=node_name)
+        self._bus = WorkerBus("japan", instance_name, status_dir,
+                              service=service, node_name=node_name)
 
         self._stop_event = threading.Event()
         self._force_quit = False
@@ -315,9 +316,6 @@ class JapanWorkerConsole(threading.Thread):
         # Set when a focus hold swallowed the slot we were waiting for, so the
         # mode loops know to plan again instead of shooting a stale target.
         self._schedule_dirty = False
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
-        self._pending_capture_event = threading.Event()
         self._started_event = threading.Event()
         # True only while a dark run owns the shutter. Focus must not touch it
         # then: an opened shutter turns the rest of that run into light frames.
@@ -431,7 +429,7 @@ class JapanWorkerConsole(threading.Thread):
         }
 
     def _apply_params(self, params):
-        """Apply a parameter change from focus_app / MQTT. Worker thread only."""
+        """Apply a parameter change from focus_app. Worker thread only."""
         applied, errors = {}, []
         for name, value in (params or {}).items():
             try:
@@ -600,8 +598,6 @@ class JapanWorkerConsole(threading.Thread):
             self._save_status(SETUP_STATUS if self.setup_mode else status,
                               readings=readings)
         self._serve_params()
-        if self._pending_capture_event.is_set():
-            self._handle_pending_capture()
         if allow_focus:
             self._shutter_for_focus()
             self._serve_focus(slack)
@@ -883,12 +879,6 @@ class JapanWorkerConsole(threading.Thread):
         self._dash_update(frames=self._shots, darks=self._darks,
                           last_file=name, errors=self._errors)
         console_ui.log(f"Saved {name}")
-        if self._bus.enabled:
-            try:
-                self._bus.publish_frame_array(image, now.isoformat(),
-                                              params=self._current_params())
-            except Exception as exc:
-                console_ui.warn(f"MQTT frame publish: {exc}")
         self._save_status("running", force=True, readings=readings)
         return True
 
@@ -1199,82 +1189,10 @@ class JapanWorkerConsole(threading.Thread):
                     break
 
     # ------------------------------------------------------------------
-    # MQTT commands
-    # ------------------------------------------------------------------
-    def _on_mqtt_command(self, topic, payload):
-        if not self._bus.enabled:
-            return
-        if topic.endswith("/cmd/get_frame"):
-            if self._last_frame is None:
-                self._bus.publish_error("no_frame", "No frame captured yet")
-                return
-            ts = self._last_shot.isoformat() if self._last_shot else dt.now().isoformat()
-            try:
-                self._bus.publish_frame_array(self._last_frame, ts,
-                                              params=self._current_params())
-            except Exception as exc:
-                self._bus.publish_error("error", str(exc), ts)
-            return
-        if topic.endswith("/cmd/capture_frame"):
-            params, err = parse_command_params(payload)
-            if err:
-                self._bus.publish_error("bad_request", err, on_demand=True)
-                return
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._pending_capture_event.set()
-            self._bus.publish_note("accepted", f"Request queued with params: {params}")
-            return
-        console_ui.warn(f"Unknown MQTT command: {topic}")
-
-    def _handle_pending_capture(self):
-        """Serve an out-of-schedule ``cmd/capture_frame``.
-
-        The frame is published, not archived: it is taken outside the observing
-        programme and would otherwise appear in the science archive as if it
-        belonged there.
-        """
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        self._pending_capture_event.clear()
-        if params is None:
-            return
-        self._bus.publish_note("capturing", f"Applying params: {params}")
-        applied, _ = self._apply_params(params)
-        exposure = self.cam.current_exposure or 0.0
-        if self._dash is not None:
-            self._dash.capture_begin("ON-DEMAND", exposure)
-        try:
-            image = self.cam.capture()
-        except Exception as exc:
-            image = None
-            console_ui.error(f"On-demand capture failed: {exc}")
-        finally:
-            if self._dash is not None:
-                self._dash.capture_end()
-        if image is None:
-            self._bus.publish_error("error", "capture returned no image",
-                                    ts_iso=dt.now().isoformat(), on_demand=True)
-            return
-        self._last_frame = image
-        now = dt.now()
-        if self._service is not None:
-            self._service.publish_frame(image, now, {"image_type": "ON-DEMAND"})
-        try:
-            self._bus.publish_frame_array(image, now.isoformat(), on_demand=True,
-                                          params=applied or self._current_params())
-            console_ui.log("On-demand frame published")
-        except Exception as exc:
-            self._bus.publish_error("error", f"encode failed: {exc}",
-                                    ts_iso=now.isoformat(), on_demand=True)
-
-    # ------------------------------------------------------------------
     # Main entry
     # ------------------------------------------------------------------
     def run(self):
         self._bus.prepare_status_dir()
-        self._bus.subscribe(self._on_mqtt_command)
         if self._service is not None:
             self._service.set_current_params(self._current_params())
         readings = self._refresh_camera_section()
@@ -1515,13 +1433,11 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
                       setup_mode=False):
     """Run the Japan camera in console mode."""
     from utils import load_config, configure_console_japan
-    from mqtt_client import create_console_publisher
     from camera_service import CameraService
     from frame_server import start_frame_server
 
     cfg = load_config(config_path)
     japan_cfg = cfg.get("japan", {})
-    mqtt_cfg = cfg.get("mqtt", {})
 
     node_name = get_node_name(cfg)
     status_dir = cfg.get("status_dir") or str(Path.home() / ".every_camera" / "status")
@@ -1531,7 +1447,6 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
         configure_console_japan(cfg, config_path)
         cfg = load_config(config_path)
         japan_cfg = cfg.get("japan", {})
-        mqtt_cfg = cfg.get("mqtt", {})
         node_name = get_node_name(cfg)
 
     claim = claim_instance_name(japan_cfg.get("instance_name")
@@ -1542,12 +1457,21 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
     dash = console_ui.start_dashboard(
         "japan", instance_name, verbose=verbose,
         footer="Ctrl+C — finish the frame, shoot the closing darks, stop")
+    # Alert mail, started before the camera is opened so that a camera which
+    # will not open — and a filter controller that answers nothing — is already
+    # something somebody hears about. The crash handler goes first: it is the
+    # only thing that can speak for a process killed outright.
+    alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+    alerts.install_crash_handler(alert_status_path)
+    alerts.start(cfg.get("alerts", {}), node_name, instance_name, "japan",
+                 log_path=console_ui.default_log_path("japan", instance_name),
+                 status_path=alert_status_path)
+
     dash.update(status="starting", node_name=node_name,
                 output_dir=conf.output_dir, frames=0, darks=0, errors=0)
 
     cam = None
     server = None
-    mqtt_pub = None
     worker = None
     try:
         for problem in conf.errors:
@@ -1578,9 +1502,6 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
             run_preview_japan(cam, instance_name, dashboard=dash)
             return
 
-        mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "japan")
-        if mqtt_pub:
-            dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
         # No ``publish_setpoint_limits`` counterpart: every parameter in this
         # camera's schema has a range known without asking the hardware, the
@@ -1601,8 +1522,6 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
             output_dir=conf.output_dir,
             instance_name=instance_name,
             status_dir=status_dir,
-            mqtt_publisher=mqtt_pub,
-            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=service,
             dashboard=dash,
             node_name=node_name,
@@ -1636,11 +1555,6 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
             worker.join(timeout=30)
         if server:
             server.stop()
-        if mqtt_pub:
-            try:
-                mqtt_pub.disconnect_broker()
-            except Exception:
-                pass
         if cam:
             cam.close()
         dash.stop()

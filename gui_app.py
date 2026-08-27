@@ -34,40 +34,15 @@ from utils import (
     write_status_file, get_system_info,
     SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR,
 )
-from mqtt_client import MQTT_AVAILABLE, MqttPublisher
 from monitor import MonitorWidget
 from worker_common import (
-    MQTT_MAX_PAYLOAD_BYTES, WorkerMqtt, publish_current_params,
-    run_focus_iteration,
+    WorkerBus, publish_current_params, run_focus_iteration,
 )
 
 
 # ===========================================================================
 # Shared tab helpers
 # ===========================================================================
-
-def _make_tab_publisher(mqtt_cfg, camera_type, instance_name, log):
-    """Connected MqttPublisher with a retained last-will, or None."""
-    if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
-        return None
-    from mqtt_client import offline_payload
-    prefix = mqtt_cfg.get("prefix", "every_camera")
-    try:
-        pub = MqttPublisher(
-            host=mqtt_cfg.get("host", ""),
-            port=mqtt_cfg.get("port", 1883),
-            user=mqtt_cfg.get("user", ""),
-            password=mqtt_cfg.get("password", ""),
-            use_tls=mqtt_cfg.get("tls", False),
-            will_topic=f"{prefix}/{instance_name}/status",
-            will_payload=offline_payload(instance_name, camera_type),
-        )
-        pub.connect_broker()
-        return pub
-    except Exception as exc:
-        log(f"MQTT failed: {exc}", "warn")
-        return None
-
 
 def _release_claim(tab):
     """Give a tab's reserved instance name back when its worker stops."""
@@ -135,8 +110,7 @@ class CannonWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, config, schedule, output_dir, instance_name,
-                 status_dir, capture_seconds, mqtt_publisher=None, mqtt_prefix="every_camera",
-                 service=None):
+                 status_dir, capture_seconds, service=None):
         super().__init__()
         self.cam = cam
         self.config = config
@@ -146,116 +120,17 @@ class CannonWorkerQt(QThread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self._service = service
-        self._mqtt = mqtt_publisher
-        self._mqtt_prefix = mqtt_prefix
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame_data = None
         self._active_until = None
-        self._bus = WorkerMqtt("cannon", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               status_suffix="_cannon")
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
+        self._bus = WorkerBus("cannon", instance_name, status_dir,
+                              service=service, status_suffix="_cannon")
 
     def request_stop(self):
         self._stop = True
-
-    def _setup_command_listener(self):
-        if self._mqtt:
-            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
-            self._mqtt.command_received.connect(self._on_mqtt_command)
-            self._mqtt.subscribe_commands(cmd_topic)
-            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
-                  flush=True)
-
-    def _publish_frame(self, jpeg_bytes, timestamp_iso, on_demand=False, params=None):
-        import base64
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        jpeg_b64 = base64.b64encode(jpeg_bytes).decode()
-        payload = {
-            "camera_type": "cannon",
-            "instance_name": self.instance_name,
-            "status": "ok",
-            "format": "jpeg",
-            "data": jpeg_b64,
-            "timestamp": timestamp_iso,
-            "on_demand": on_demand,
-        }
-        if params:
-            payload["params"] = params
-        frame_payload = json.dumps(payload)
-        if len(frame_payload) > MQTT_MAX_PAYLOAD_BYTES:
-            err = f"Frame payload {len(frame_payload)} bytes exceeds broker limit"
-            self._mqtt.publish(frame_topic, json.dumps({
-                "camera_type": "cannon",
-                "instance_name": self.instance_name,
-                "status": "too_large",
-                "error": err,
-                "timestamp": timestamp_iso,
-                "on_demand": on_demand,
-            }), retain=False)
-            self.log_msg.emit(f"Frame too large for MQTT ({len(jpeg_b64)} b64 bytes)", "warn")
-            return
-        self._mqtt.publish(frame_topic, frame_payload, retain=False)
-
-    def _publish_frame_error(self, status, error, on_demand=False):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "cannon",
-            "instance_name": self.instance_name,
-            "status": status,
-            "error": error,
-            "timestamp": None,
-            "on_demand": on_demand,
-        }), retain=False)
-
-    def _on_mqtt_command(self, topic, payload):
-        print(f"[cannon:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
-        if topic.endswith("/cmd/get_frame"):
-            if self._last_frame_data is None:
-                self._publish_frame_error("no_frame", "No frame captured yet")
-                self.log_msg.emit("Frame requested but no frame available yet", "warn")
-                return
-            ts = self._last_shot.isoformat() if self._last_shot else None
-            self._publish_frame(self._last_frame_data, ts, on_demand=False)
-            self.log_msg.emit("Frame sent via MQTT", "info")
-            return
-
-        if topic.endswith("/cmd/capture_frame"):
-            try:
-                params = json.loads(payload) if payload else {}
-            except json.JSONDecodeError as e:
-                self._publish_frame_error("bad_request", f"Invalid JSON: {e}",
-                                          on_demand=True)
-                return
-            if not isinstance(params, dict):
-                params = {}
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._publish_frame_status("accepted",
-                                       f"Request queued with params: {params}")
-            msg = f"[cannon:{self.instance_name}] On-demand capture queued: {params}"
-            self.log_msg.emit(msg, "info")
-            print(msg, flush=True)
-            return
-        # Unknown cmd — log for diagnostics
-        print(f"[cannon:{self.instance_name}] Unknown MQTT command: {topic}",
-              flush=True)
-
-    def _publish_frame_status(self, status, note=""):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "cannon",
-            "instance_name": self.instance_name,
-            "status": status,
-            "note": note,
-            "timestamp": dt.now().isoformat(),
-            "on_demand": True,
-        }), retain=False)
 
     def _apply_cannon_params(self, params):
         """Apply Cannon config values from params dict. Returns list of (key, err)."""
@@ -276,36 +151,6 @@ class CannonWorkerQt(QThread):
                 failures.append((key, "param not found in camera config"))
         return failures
 
-    def _handle_pending_capture(self):
-        from cannon_driver import capture_image
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        if params is None:
-            return
-        msg = f"[cannon:{self.instance_name}] On-demand capture starting"
-        self.log_msg.emit("On-demand capture starting", "info")
-        print(msg, flush=True)
-        self._publish_frame_status("capturing", f"Applying params: {params}")
-        try:
-            failures = self._apply_cannon_params(params)
-            for key, err in failures:
-                self.log_msg.emit(f"Param '{key}' failed: {err}", "warn")
-                print(f"[cannon:{self.instance_name}] Param '{key}' failed: {err}",
-                      flush=True)
-            img_data = capture_image(self.cam)
-            now = dt.now()
-            self._publish_frame(img_data, now.isoformat(),
-                                on_demand=True, params=params)
-            self.log_msg.emit("On-demand frame sent via MQTT", "info")
-            print(f"[cannon:{self.instance_name}] On-demand frame published "
-                  f"({len(img_data)} bytes)", flush=True)
-        except Exception as e:
-            self._publish_frame_error("error", f"Capture failed: {e}", on_demand=True)
-            self.log_msg.emit(f"On-demand capture error: {e}", "error")
-            print(f"[cannon:{self.instance_name}] On-demand capture error: {e}",
-                  flush=True)
-
     def run(self):
         from cannon_driver import capture_image, get_camera_settings_info
 
@@ -313,15 +158,12 @@ class CannonWorkerQt(QThread):
         consecutive_errors = 0
         self._bus.prepare_status_dir()
 
-        self._setup_command_listener()
         self.log_msg.emit("Measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running", force=True)
 
         while not self._stop:
             # Handle on-demand capture requests (outside schedule)
-            if self._pending_capture is not None:
-                self._handle_pending_capture()
 
             now = dt.now()
 
@@ -474,7 +316,6 @@ class CannonTab(QWidget):
         self._params = []
         self.worker = None
         self.connect_thread = None
-        self._mqtt_pub = None
         self._server = None
         self._service = None
         self._build_ui()
@@ -724,12 +565,6 @@ class CannonTab(QWidget):
             self._log("Schedule is empty — starting in setup mode: live frames "
                       "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
-        mqtt_cfg = self._cfg.get("mqtt", {})
-
-        # MQTT publisher (with a retained last-will on the status topic)
-        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "cannon", instance_name,
-                                             self._log)
-
         # LAN frame server: archive browsing + live view for viewer/focus apps
         self._service, self._server = _start_tab_server(
             self._cfg, "cannon", instance_name, output_dir, setup_mode)
@@ -738,8 +573,6 @@ class CannonTab(QWidget):
             cam=self.cam, config=self.config, schedule=entries,
             output_dir=output_dir, instance_name=instance_name,
             status_dir=status_dir, capture_seconds=capture_seconds,
-            mqtt_publisher=self._mqtt_pub,
-            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=self._service,
         )
         self.worker.log_msg.connect(self._log)
@@ -762,9 +595,6 @@ class CannonTab(QWidget):
             self._server.stop()
             self._server = None
         _release_claim(self)
-        if self._mqtt_pub:
-            self._mqtt_pub.disconnect_broker()
-            self._mqtt_pub = None
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(self.cam is not None)
         self._on_status_msg("Idle")
@@ -879,123 +709,23 @@ class SpttScheduledWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
+                 service=None):
         super().__init__()
         self.cam = cam
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
         self._service = service
-        self._mqtt = mqtt_publisher
-        self._mqtt_prefix = mqtt_prefix
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
-        self._bus = WorkerMqtt("sptt", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               status_suffix="_sptt")
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
+        self._bus = WorkerBus("sptt", instance_name, status_dir,
+                              service=service, status_suffix="_sptt")
 
     def request_stop(self):
         self._stop = True
-
-    def _setup_command_listener(self):
-        if self._mqtt:
-            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
-            self._mqtt.command_received.connect(self._on_mqtt_command)
-            self._mqtt.subscribe_commands(cmd_topic)
-            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
-                  flush=True)
-
-    def _encode_sptt_jpeg(self, frame):
-        """Convert a 2D frame to JPEG bytes with auto-downscale. Returns (bytes, w, h)."""
-        if frame.ndim != 2:
-            raise ValueError(f"Unexpected frame shape: {frame.shape}")
-        return frame_archive.to_jpeg_capped(frame, MQTT_MAX_PAYLOAD_BYTES)
-
-    def _publish_sptt_frame(self, jpeg_bytes, w, h, ts_iso,
-                             on_demand=False, params=None):
-        import base64
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        body = {
-            "camera_type": "sptt",
-            "instance_name": self.instance_name,
-            "status": "ok",
-            "format": "jpeg",
-            "width": w,
-            "height": h,
-            "data": base64.b64encode(jpeg_bytes).decode(),
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }
-        if params:
-            body["params"] = params
-        self._mqtt.publish(frame_topic, json.dumps(body), retain=False)
-
-    def _publish_sptt_error(self, status, error, ts_iso=None, on_demand=False):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "sptt",
-            "instance_name": self.instance_name,
-            "status": status,
-            "error": error,
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }), retain=False)
-
-    def _on_mqtt_command(self, topic, payload):
-        print(f"[sptt:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
-        if topic.endswith("/cmd/get_frame"):
-            frame = self._last_frame
-            ts_iso = self._last_shot.isoformat() if self._last_shot else None
-            if frame is None:
-                self._publish_sptt_error("no_frame", "No frame captured yet")
-                self.log_msg.emit("Frame requested but no frame available yet", "warn")
-                return
-            try:
-                jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
-            except Exception as e:
-                self._publish_sptt_error("error", str(e), ts_iso)
-                self.log_msg.emit(f"Frame encode error: {e}", "error")
-                return
-            self._publish_sptt_frame(jpeg_bytes, w, h, ts_iso)
-            self.log_msg.emit("Frame sent via MQTT", "info")
-            return
-
-        if topic.endswith("/cmd/capture_frame"):
-            try:
-                params = json.loads(payload) if payload else {}
-            except json.JSONDecodeError as e:
-                self._publish_sptt_error("bad_request", f"Invalid JSON: {e}",
-                                         on_demand=True)
-                return
-            if not isinstance(params, dict):
-                params = {}
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._publish_sptt_status("accepted",
-                                       f"Request queued with params: {params}")
-            msg = f"[sptt:{self.instance_name}] On-demand capture queued: {params}"
-            self.log_msg.emit(msg, "info")
-            print(msg, flush=True)
-            return
-        print(f"[sptt:{self.instance_name}] Unknown MQTT command: {topic}",
-              flush=True)
-
-    def _publish_sptt_status(self, status, note=""):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "sptt",
-            "instance_name": self.instance_name,
-            "status": status,
-            "note": note,
-            "timestamp": dt.now().isoformat(),
-            "on_demand": True,
-        }), retain=False)
 
     def _apply_sptt_params(self, params):
         """Apply exposure/gain/binning to SPTT camera. Returns (applied, errors)."""
@@ -1037,38 +767,6 @@ class SpttScheduledWorkerQt(QThread):
             errors.append(str(e))
         return applied, errors
 
-    def _handle_pending_capture(self):
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        if params is None:
-            return
-        msg = f"[sptt:{self.instance_name}] On-demand capture starting"
-        self.log_msg.emit("On-demand SPTT capture starting", "info")
-        print(msg, flush=True)
-        self._publish_sptt_status("capturing", f"Applying params: {params}")
-        try:
-            applied, errors = self._apply_sptt_params(params)
-            for err in errors:
-                self.log_msg.emit(f"Param apply warning: {err}", "warn")
-                print(f"[sptt:{self.instance_name}] Param apply warning: {err}",
-                      flush=True)
-            # The requester is waiting for a frame that reflects their params.
-            frame = self.cam.grab_fresh_frame()
-            now = dt.now()
-            jpeg_bytes, w, h = self._encode_sptt_jpeg(frame)
-            self._publish_sptt_frame(
-                jpeg_bytes, w, h, now.isoformat(),
-                on_demand=True, params=applied)
-            self.log_msg.emit("On-demand SPTT frame sent via MQTT", "info")
-            print(f"[sptt:{self.instance_name}] On-demand frame published "
-                  f"({w}x{h}, {len(jpeg_bytes)} bytes)", flush=True)
-        except Exception as e:
-            self._publish_sptt_error("error", f"Capture failed: {e}", on_demand=True)
-            self.log_msg.emit(f"On-demand capture error: {e}", "error")
-            print(f"[sptt:{self.instance_name}] On-demand capture error: {e}",
-                  flush=True)
-
     def run(self):
         from sptt_driver import (save_fits, frame_metadata, ENCODING_12BPP,
                                  SPTT_CAPTURE_SECONDS)
@@ -1077,7 +775,6 @@ class SpttScheduledWorkerQt(QThread):
         consecutive_errors = 0
         self._bus.prepare_status_dir()
 
-        self._setup_command_listener()
         self.log_msg.emit("SPTT measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running", force=True)
@@ -1093,8 +790,6 @@ class SpttScheduledWorkerQt(QThread):
 
         while not self._stop:
             # Handle on-demand capture requests (outside schedule)
-            if self._pending_capture is not None:
-                self._handle_pending_capture()
 
             now = dt.now()
 
@@ -1230,7 +925,6 @@ class SpttTab(QWidget):
         self.frame_count = 0
         self.fps_time = time.time()
         self.fps = 0.0
-        self._mqtt_pub = None
         self._server = None
         self._service = None
         self._build_ui()
@@ -1552,10 +1246,6 @@ class SpttTab(QWidget):
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("SPTT", self._cfg))
         instance_name = self._claim.name
-        mqtt_cfg = self._cfg.get("mqtt", {})
-
-        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "sptt", instance_name,
-                                             self._log)
         self._service, self._server = _start_tab_server(
             self._cfg, "sptt", instance_name, output_dir)
 
@@ -1564,8 +1254,6 @@ class SpttTab(QWidget):
             output_dir=output_dir,
             instance_name=instance_name,
             status_dir=status_dir,
-            mqtt_publisher=self._mqtt_pub,
-            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=self._service,
         )
         self.scheduled_worker.log_msg.connect(self._log)
@@ -1590,9 +1278,6 @@ class SpttTab(QWidget):
             self._server.stop()
             self._server = None
         _release_claim(self)
-        if self._mqtt_pub:
-            self._mqtt_pub.disconnect_broker()
-            self._mqtt_pub = None
         self.btn_meas_stop.setEnabled(False)
         self.btn_meas_start.setEnabled(self.cam is not None)
         self.btn_preview_start.setEnabled(self.cam is not None)
@@ -1707,7 +1392,7 @@ class InfraWorkerQt(QThread):
 
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
-                 mqtt_publisher=None, mqtt_prefix="every_camera", service=None):
+                 service=None):
         super().__init__()
         self._service = service
         self.cam = cam
@@ -1717,66 +1402,17 @@ class InfraWorkerQt(QThread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self.save_format = save_format
-        self._mqtt = mqtt_publisher
-        self._mqtt_prefix = mqtt_prefix
         self._stop = False
         self._shots = 0
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
         self._active_until = None
-        self._bus = WorkerMqtt("infra", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               status_suffix="_infra")
-        self._pending_capture = None
-        self._pending_capture_lock = threading.Lock()
+        self._bus = WorkerBus("infra", instance_name, status_dir,
+                              service=service, status_suffix="_infra")
 
     def request_stop(self):
         self._stop = True
-
-    def _setup_command_listener(self):
-        if self._mqtt:
-            cmd_topic = f"{self._mqtt_prefix}/{self.instance_name}/cmd/#"
-            self._mqtt.command_received.connect(self._on_mqtt_command)
-            self._mqtt.subscribe_commands(cmd_topic)
-            print(f"[{self.instance_name}] MQTT subscribed: {cmd_topic}",
-                  flush=True)
-
-    def _publish_infra_ok(self, jpeg_bytes, ts_iso, on_demand=False, params=None):
-        import base64
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        body = {
-            "camera_type": "infra",
-            "instance_name": self.instance_name,
-            "status": "ok",
-            "format": "jpeg",
-            "data": base64.b64encode(jpeg_bytes).decode(),
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }
-        if params:
-            body["params"] = params
-        payload = json.dumps(body)
-        if len(payload) > MQTT_MAX_PAYLOAD_BYTES:
-            self._publish_infra_error(
-                "too_large",
-                f"Frame payload {len(payload)} bytes exceeds broker limit",
-                ts_iso=ts_iso, on_demand=on_demand)
-            self.log_msg.emit(
-                f"Frame too large for MQTT ({len(payload)} bytes)", "warn")
-            return
-        self._mqtt.publish(frame_topic, payload, retain=False)
-
-    def _publish_infra_error(self, status, error, ts_iso=None, on_demand=False):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "infra",
-            "instance_name": self.instance_name,
-            "status": status,
-            "error": error,
-            "timestamp": ts_iso,
-            "on_demand": on_demand,
-        }), retain=False)
 
     def _apply_infra_params(self, params):
         applied = {}
@@ -1803,90 +1439,6 @@ class InfraWorkerQt(QThread):
             errors.append(str(e))
         return applied, errors
 
-    def _handle_pending_capture(self):
-        from infra_driver import frame_to_jpeg_bytes
-        with self._pending_capture_lock:
-            params = self._pending_capture
-            self._pending_capture = None
-        if params is None:
-            return
-        msg = f"[infra:{self.instance_name}] On-demand capture starting"
-        self.log_msg.emit("On-demand Infra capture starting", "info")
-        print(msg, flush=True)
-        self._publish_infra_status("capturing", f"Applying params: {params}")
-        try:
-            applied, errors = self._apply_infra_params(params)
-            for err in errors:
-                self.log_msg.emit(f"Param apply warning: {err}", "warn")
-                print(f"[infra:{self.instance_name}] Param apply warning: {err}",
-                      flush=True)
-            frame = self.cam.grab_frame()
-            now = dt.now()
-            jpeg_bytes = frame_to_jpeg_bytes(frame)
-            self._publish_infra_ok(
-                jpeg_bytes, now.isoformat(),
-                on_demand=True, params=applied)
-            self.log_msg.emit("On-demand Infra frame sent via MQTT", "info")
-            print(f"[infra:{self.instance_name}] On-demand frame published "
-                  f"({len(jpeg_bytes)} bytes)", flush=True)
-        except Exception as e:
-            self._publish_infra_error("error", f"Capture failed: {e}",
-                                      on_demand=True)
-            self.log_msg.emit(f"On-demand capture error: {e}", "error")
-            print(f"[infra:{self.instance_name}] On-demand capture error: {e}",
-                  flush=True)
-
-    def _on_mqtt_command(self, topic, payload):
-        print(f"[infra:{self.instance_name}] MQTT cmd received: {topic} "
-              f"({len(payload) if payload else 0} bytes)", flush=True)
-        if topic.endswith("/cmd/get_frame"):
-            from infra_driver import frame_to_jpeg_bytes
-            if self._last_frame is None:
-                self._publish_infra_error("no_frame", "No frame captured yet")
-                self.log_msg.emit("Frame requested but no frame available yet", "warn")
-                return
-            ts = self._last_shot.isoformat() if self._last_shot else None
-            try:
-                jpeg_data = frame_to_jpeg_bytes(self._last_frame)
-            except Exception as e:
-                self._publish_infra_error("error", str(e), ts)
-                self.log_msg.emit(f"Frame encode error: {e}", "error")
-                return
-            self._publish_infra_ok(jpeg_data, ts)
-            self.log_msg.emit("Frame sent via MQTT", "info")
-            return
-
-        if topic.endswith("/cmd/capture_frame"):
-            try:
-                params = json.loads(payload) if payload else {}
-            except json.JSONDecodeError as e:
-                self._publish_infra_error("bad_request", f"Invalid JSON: {e}",
-                                          on_demand=True)
-                return
-            if not isinstance(params, dict):
-                params = {}
-            with self._pending_capture_lock:
-                self._pending_capture = params
-            self._publish_infra_status("accepted",
-                                       f"Request queued with params: {params}")
-            msg = f"[infra:{self.instance_name}] On-demand capture queued: {params}"
-            self.log_msg.emit(msg, "info")
-            print(msg, flush=True)
-            return
-        print(f"[infra:{self.instance_name}] Unknown MQTT command: {topic}",
-              flush=True)
-
-    def _publish_infra_status(self, status, note=""):
-        frame_topic = f"{self._mqtt_prefix}/{self.instance_name}/frame"
-        self._mqtt.publish(frame_topic, json.dumps({
-            "camera_type": "infra",
-            "instance_name": self.instance_name,
-            "status": status,
-            "note": note,
-            "timestamp": dt.now().isoformat(),
-            "on_demand": True,
-        }), retain=False)
-
     def run(self):
         from infra_driver import save_tiff, save_png, save_fits
 
@@ -1894,15 +1446,12 @@ class InfraWorkerQt(QThread):
         consecutive_errors = 0
         self._bus.prepare_status_dir()
 
-        self._setup_command_listener()
         self.log_msg.emit("Infra measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running", force=True)
 
         while not self._stop:
             # Handle on-demand capture requests (outside schedule)
-            if self._pending_capture is not None:
-                self._handle_pending_capture()
 
             now = dt.now()
 
@@ -2054,7 +1603,6 @@ class InfraTab(QWidget):
         self.frame_count = 0
         self.fps_time = time.time()
         self.fps = 0.0
-        self._mqtt_pub = None
         self._server = None
         self._service = None
         self._build_ui()
@@ -2465,10 +2013,6 @@ class InfraTab(QWidget):
                       "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
         save_format = self.combo_format.currentText()
-        mqtt_cfg = self._cfg.get("mqtt", {})
-
-        self._mqtt_pub = _make_tab_publisher(mqtt_cfg, "infra", instance_name,
-                                             self._log)
         self._service, self._server = _start_tab_server(
             self._cfg, "infra", instance_name, output_dir, setup_mode)
 
@@ -2480,8 +2024,6 @@ class InfraTab(QWidget):
             status_dir=status_dir,
             capture_seconds=capture_seconds,
             save_format=save_format,
-            mqtt_publisher=self._mqtt_pub,
-            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=self._service,
         )
         self.worker.log_msg.connect(self._log)
@@ -2505,9 +2047,6 @@ class InfraTab(QWidget):
             self._server.stop()
             self._server = None
         _release_claim(self)
-        if self._mqtt_pub:
-            self._mqtt_pub.disconnect_broker()
-            self._mqtt_pub = None
         self.btn_meas_stop.setEnabled(False)
         self.btn_meas_start.setEnabled(self.cam is not None)
         self.btn_preview_start.setEnabled(self.cam is not None)
@@ -2556,8 +2095,7 @@ class SentryWorkerQt(QThread):
     finished = pyqtSignal()
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 capture_seconds, mqtt_publisher=None,
-                 mqtt_prefix="every_camera", service=None):
+                 capture_seconds, service=None):
         super().__init__()
         self.cam = cam
         self.output_dir = output_dir
@@ -2565,11 +2103,8 @@ class SentryWorkerQt(QThread):
         self.status_dir = status_dir
         self.capture_seconds = sorted(capture_seconds)
         self._service = service
-        self._mqtt = mqtt_publisher
-        self._mqtt_prefix = mqtt_prefix
-        self._bus = WorkerMqtt("sentry", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               status_suffix="_sentry")
+        self._bus = WorkerBus("sentry", instance_name, status_dir,
+                              service=service, status_suffix="_sentry")
         self._stop = False
         self._shots = 0
         self._errors = 0
@@ -2584,7 +2119,7 @@ class SentryWorkerQt(QThread):
 
         This used to be missing entirely: the worker computed a status path and
         then never wrote it, so a sentry camera driven from the GUI was
-        invisible to the monitor and published nothing over MQTT.
+        invisible to the monitor and to every observer tool.
         """
         meta = self.cam.get_metadata()
         payload = {
@@ -2666,7 +2201,7 @@ class SentryWorkerQt(QThread):
         self.finished.emit()
 
     def _archive_and_publish(self, now):
-        """Archive the daemon's latest FITS and publish it to MQTT / LAN."""
+        """Archive the daemon's latest FITS and hand the frame to the LAN."""
         if self.output_dir:
             path = self.cam.archive_latest_image(self.output_dir, now)
             if path:
@@ -2677,22 +2212,15 @@ class SentryWorkerQt(QThread):
             return
         if self._service is not None:
             self._service.publish_frame(frame, now, self.cam.get_metadata())
-        if self._bus.enabled:
-            try:
-                self._bus.publish_frame_array(frame, now.isoformat())
-            except Exception as exc:
-                self._errors += 1
-                self.log_msg.emit(f"[WARN] Could not publish frame: {exc}", "warn")
 
 
 class SentryTab(QWidget):
     """GUI tab for the Sentry (imagerd_rt) camera."""
 
-    def __init__(self, cfg: dict, log_fn, mqtt_fn=None):
+    def __init__(self, cfg: dict, log_fn):
         super().__init__()
         self._cfg = cfg
         self._log = log_fn
-        self._mqtt_fn = mqtt_fn
         self._worker = None
         self._server = None
         self._service = None
@@ -2812,11 +2340,8 @@ class SentryTab(QWidget):
         sentry_cfg = self._cfg.get("sentry", {})
         capture_seconds = sentry_cfg.get("capture_seconds", [0, 30])
 
-        # MQTT and the LAN frame server, same as the console entry point —
-        # neither used to be wired up here at all.
-        mqtt_pub = self._mqtt_fn("sentry", instance) if self._mqtt_fn else None
-        mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
-
+        # The LAN frame server, same as the console entry point — it used
+        # not to be wired up here at all.
         from camera_service import CameraService
         from frame_server import start_frame_server
         from utils import get_node_name
@@ -2832,8 +2357,6 @@ class SentryTab(QWidget):
             instance_name=instance,
             status_dir=status_dir,
             capture_seconds=capture_seconds,
-            mqtt_publisher=mqtt_pub,
-            mqtt_prefix=mqtt_prefix,
             service=self._service,
         )
         self._worker.log_msg.connect(self._log_local)
@@ -2897,15 +2420,13 @@ class AsiTab(QWidget):
 
     log_line = pyqtSignal(str, str)
 
-    def __init__(self, cfg: dict, log_fn, mqtt_fn=None):
+    def __init__(self, cfg: dict, log_fn):
         super().__init__()
         self._cfg = cfg
         self._log = log_fn
-        self._mqtt_fn = mqtt_fn
         self._worker = None
         self._server = None
         self._service = None
-        self._mqtt_pub = None
         self.cam = None
         self.log_line.connect(self._append_log)
         self._build_ui()
@@ -3096,8 +2617,6 @@ class AsiTab(QWidget):
             self.cam = None
             return
 
-        self._mqtt_pub = self._mqtt_fn("asi", instance) if self._mqtt_fn else None
-        mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
 
         self._service = CameraService("asi", instance, conf.output_dir,
                                       node_name=node_name,
@@ -3113,8 +2632,6 @@ class AsiTab(QWidget):
             output_dir=conf.output_dir,
             instance_name=instance,
             status_dir=status_dir,
-            mqtt_publisher=self._mqtt_pub,
-            mqtt_prefix=mqtt_prefix,
             service=self._service,
             node_name=node_name,
             setup_mode=setup_mode,
@@ -3167,12 +2684,6 @@ class AsiTab(QWidget):
             self._server.stop()
             self._server = None
         _release_claim(self)
-        if self._mqtt_pub:
-            try:
-                self._mqtt_pub.disconnect_broker()
-            except Exception:
-                pass
-            self._mqtt_pub = None
         if self.cam:
             self.cam.close()
             self.cam = None
@@ -3203,15 +2714,13 @@ class JapanTab(QWidget):
 
     log_line = pyqtSignal(str, str)
 
-    def __init__(self, cfg: dict, log_fn, mqtt_fn=None):
+    def __init__(self, cfg: dict, log_fn):
         super().__init__()
         self._cfg = cfg
         self._log = log_fn
-        self._mqtt_fn = mqtt_fn
         self._worker = None
         self._server = None
         self._service = None
-        self._mqtt_pub = None
         self.cam = None
         self.log_line.connect(self._append_log)
         self._build_ui()
@@ -3399,8 +2908,6 @@ class JapanTab(QWidget):
             self.cam = None
             return
 
-        self._mqtt_pub = self._mqtt_fn("japan", instance) if self._mqtt_fn else None
-        mqtt_prefix = self._cfg.get("mqtt", {}).get("prefix", "every_camera")
 
         # No setpoint-limit publishing counterpart: every field in this camera's
         # focus_app schema has a range that is known without asking the hardware.
@@ -3417,8 +2924,6 @@ class JapanTab(QWidget):
             output_dir=conf.output_dir,
             instance_name=instance,
             status_dir=status_dir,
-            mqtt_publisher=self._mqtt_pub,
-            mqtt_prefix=mqtt_prefix,
             service=self._service,
             node_name=node_name,
             setup_mode=setup_mode,
@@ -3468,12 +2973,6 @@ class JapanTab(QWidget):
             self._server.stop()
             self._server = None
         _release_claim(self)
-        if self._mqtt_pub:
-            try:
-                self._mqtt_pub.disconnect_broker()
-            except Exception:
-                pass
-            self._mqtt_pub = None
         if self.cam:
             self.cam.close()
             self.cam = None
@@ -3515,45 +3014,6 @@ class MainWindow(QMainWindow):
         root.setSpacing(4)
         root.setContentsMargins(6, 6, 6, 6)
 
-        # MQTT settings bar (collapsible)
-        mqtt_box = QGroupBox("MQTT")
-        mqtt_box.setCheckable(True)
-        mqtt_enabled = self._cfg.get("mqtt", {}).get("enabled", False)
-        mqtt_box.setChecked(mqtt_enabled)
-        self._mqtt_box = mqtt_box
-        mqtt_content = QWidget()
-        mqtt_grid = QGridLayout(mqtt_content)
-        mqtt_grid.setContentsMargins(4, 2, 4, 2)
-        mqtt_grid.setColumnStretch(1, 1)
-        mqtt_grid.addWidget(QLabel("Host:"), 0, 0)
-        self.le_mqtt_host = QLineEdit(self._cfg.get("mqtt", {}).get("host", "broker.hivemq.com"))
-        mqtt_grid.addWidget(self.le_mqtt_host, 0, 1)
-        mqtt_grid.addWidget(QLabel("Port:"), 0, 2)
-        self.le_mqtt_port = QLineEdit(str(self._cfg.get("mqtt", {}).get("port", 1883)))
-        self.le_mqtt_port.setMaximumWidth(70)
-        mqtt_grid.addWidget(self.le_mqtt_port, 0, 3)
-        mqtt_grid.addWidget(QLabel("User:"), 0, 4)
-        self.le_mqtt_user = QLineEdit(self._cfg.get("mqtt", {}).get("user", ""))
-        self.le_mqtt_user.setPlaceholderText("(optional)")
-        mqtt_grid.addWidget(self.le_mqtt_user, 0, 5)
-        mqtt_grid.addWidget(QLabel("Pass:"), 0, 6)
-        self.le_mqtt_pass = QLineEdit(self._cfg.get("mqtt", {}).get("password", ""))
-        self.le_mqtt_pass.setEchoMode(QLineEdit.Password)
-        mqtt_grid.addWidget(self.le_mqtt_pass, 0, 7)
-        mqtt_grid.addWidget(QLabel("Prefix:"), 1, 0)
-        self.le_mqtt_prefix = QLineEdit(self._cfg.get("mqtt", {}).get("prefix", "every_camera"))
-        mqtt_grid.addWidget(self.le_mqtt_prefix, 1, 1)
-        self.cb_mqtt_tls = QCheckBox("TLS")
-        self.cb_mqtt_tls.setChecked(self._cfg.get("mqtt", {}).get("tls", False))
-        self.cb_mqtt_tls.stateChanged.connect(
-            lambda s: self.le_mqtt_port.setText("8883" if s else "1883"))
-        mqtt_grid.addWidget(self.cb_mqtt_tls, 1, 2)
-        mqtt_box_lay = QVBoxLayout(mqtt_box)
-        mqtt_box_lay.setContentsMargins(0, 0, 0, 0)
-        mqtt_box_lay.addWidget(mqtt_content)
-        mqtt_content.setVisible(mqtt_enabled)
-        mqtt_box.toggled.connect(mqtt_content.setVisible)
-        root.addWidget(mqtt_box)
 
         # Tabs
         self.tab_widget = QTabWidget()
@@ -3574,26 +3034,22 @@ class MainWindow(QMainWindow):
             self._tabs["infra"] = self._infra_tab
 
         if camera_type is None or camera_type == "sentry":
-            self._sentry_tab = SentryTab(self._cfg, self._log,
-                                         self.create_mqtt_publisher)
+            self._sentry_tab = SentryTab(self._cfg, self._log)
             self.tab_widget.addTab(self._sentry_tab, "Sentry Camera")
             self._tabs["sentry"] = self._sentry_tab
 
         if camera_type is None or camera_type == "asi":
-            self._asi_tab = AsiTab(self._cfg, self._log,
-                                   self.create_mqtt_publisher)
+            self._asi_tab = AsiTab(self._cfg, self._log)
             self.tab_widget.addTab(self._asi_tab, "ASI Camera")
             self._tabs["asi"] = self._asi_tab
 
         if camera_type is None or camera_type == "japan":
-            self._japan_tab = JapanTab(self._cfg, self._log,
-                                       self.create_mqtt_publisher)
+            self._japan_tab = JapanTab(self._cfg, self._log)
             self.tab_widget.addTab(self._japan_tab, "Japan Camera")
             self._tabs["japan"] = self._japan_tab
 
         # Monitor tab
-        mqtt_cfg = self._cfg.get("mqtt", {})
-        self._monitor = MonitorWidget(mqtt_cfg)
+        self._monitor = MonitorWidget()
         self.tab_widget.addTab(self._monitor, "Monitor")
 
         root.addWidget(self.tab_widget, 1)
@@ -3617,49 +3073,7 @@ class MainWindow(QMainWindow):
         self.log_text.append(f'<span style="color:{color}">[{ts}] {message}</span>')
         self.log_text.moveCursor(QTextCursor.End)
 
-    def _get_mqtt_config(self):
-        # Keep the port an int: saving it as a string is what put
-        # "port": "1883" into config.json.
-        try:
-            port = int(self.le_mqtt_port.text().strip() or 1883)
-        except ValueError:
-            port = 1883
-        return {
-            "enabled": self._mqtt_box.isChecked(),
-            "host": self.le_mqtt_host.text().strip(),
-            "port": port,
-            "user": self.le_mqtt_user.text().strip(),
-            "password": self.le_mqtt_pass.text(),
-            "prefix": self.le_mqtt_prefix.text().strip(),
-            "tls": self.cb_mqtt_tls.isChecked(),
-        }
-
-    def create_mqtt_publisher(self, camera_type, instance_name):
-        """Build a connected MqttPublisher with a last-will, or None."""
-        mqtt_cfg = self._get_mqtt_config()
-        if not mqtt_cfg.get("enabled") or not MQTT_AVAILABLE:
-            return None
-        from mqtt_client import offline_payload
-        prefix = mqtt_cfg.get("prefix") or "every_camera"
-        try:
-            pub = MqttPublisher(
-                host=mqtt_cfg["host"],
-                port=mqtt_cfg["port"] or 1883,
-                user=mqtt_cfg["user"],
-                password=mqtt_cfg["password"],
-                use_tls=mqtt_cfg["tls"],
-                will_topic=f"{prefix}/{instance_name}/status",
-                will_payload=offline_payload(instance_name, camera_type),
-            )
-            pub.connect_broker()
-            return pub
-        except Exception as exc:
-            self._log(f"MQTT setup failed: {exc}", "error")
-            return None
-
     def closeEvent(self, event):
-        # Save MQTT config back to the file it was loaded from
-        self._cfg["mqtt"] = self._get_mqtt_config()
         save_config(self._cfg, self._config_path)
         for tab in self._tabs.values():
             tab.cleanup()

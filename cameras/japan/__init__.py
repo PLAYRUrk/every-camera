@@ -2,7 +2,7 @@
 Japan all-sky imager support: Hamamatsu camera (DCAM-API) + SmartMotor filter wheel.
 
 This package is the hardware half of the ``japan`` camera type; the every-camera
-worker that wraps it (MQTT, status files, LAN frame server, focus) lives in
+worker that wraps it (status files, LAN frame server, focus) lives in
 ``cameras/japan_driver.py``.
 
     dcamsdk/       Hamamatsu's own DCAM-API wrappers, vendored, loaded on demand

@@ -4,7 +4,8 @@ Sentry camera driver: Princeton Instruments CCD via imagerd_rt daemon.
 The sentry camera is controlled by the pre-compiled `imagerd_rt` binary
 (Keo Scientific / Princeton Instruments PicamSDK + Pleora eBUS SDK).
 This driver acts as a supervisor: it generates the schedule.conf, starts
-the daemon, monitors its outputs, and publishes status/frames via MQTT.
+the daemon, monitors its outputs, and publishes status and frames to the LAN
+frame server.
 
 Interface with imagerd_rt:
   Input:   <imagerd_rt_dir>/schedule.conf   — imaging schedule
@@ -31,6 +32,8 @@ import subprocess
 import threading
 import time
 
+import alerts
+
 import console_ui
 
 import numpy as np
@@ -45,7 +48,7 @@ from utils import (
     get_system_info, APP_DIR,
 )
 from worker_common import (
-    WorkerMqtt, announce_setup_mode, SETUP_STATUS,
+    WorkerBus, announce_setup_mode, SETUP_STATUS,
     publish_schedule_state, install_stop_handler, stop_signal_name,
 )
 
@@ -309,7 +312,7 @@ _read_fits_minimal = frame_archive.read_fits_minimal
 
 
 def frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
-    """Convert a 16-bit (or any) numpy frame to JPEG bytes for MQTT."""
+    """Convert a 16-bit (or any) numpy frame to JPEG bytes."""
     return frame_archive.to_jpeg_bytes(frame)
 
 
@@ -317,13 +320,12 @@ def frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
 # Console worker
 # ---------------------------------------------------------------------------
 class SentryWorkerConsole(threading.Thread):
-    """Monitors the imagerd_rt daemon and publishes status + frames via MQTT."""
+    """Monitors the imagerd_rt daemon and publishes status and frames."""
 
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam: SentryCamera, output_dir: str, instance_name: str,
                  status_dir: str, capture_seconds: list,
-                 mqtt_publisher=None, mqtt_prefix: str = "every_camera",
                  service=None, node_name: str = "", setup_mode: bool = False):
         super().__init__(daemon=True)
         self.cam = cam
@@ -333,60 +335,20 @@ class SentryWorkerConsole(threading.Thread):
         self.capture_seconds = sorted(capture_seconds)
         self.setup_mode = bool(setup_mode)
         self._service = service
-        self._bus = WorkerMqtt("sentry", instance_name, status_dir,
-                               mqtt_publisher, mqtt_prefix, service=service,
-                               node_name=node_name)
+        self._bus = WorkerBus("sentry", instance_name, status_dir,
+                              service=service, node_name=node_name)
         self._stop_event = threading.Event()
         self._shots = 0          # frames published (not necessarily captured)
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
         self._last_seqno = -1
-        self._pending_get_frame = threading.Event()
 
     def request_stop(self):
         self._stop_event.set()
 
-    # ------------------------------------------------------------------
-    # MQTT publish helpers
-    # ------------------------------------------------------------------
-    def _publish_frame(self, jpeg_bytes: bytes, ts_iso: str,
-                       metadata: dict = None, on_demand: bool = False):
-        extra = {"metadata": metadata} if metadata else None
-        self._bus.publish_frame_jpeg(jpeg_bytes, ts_iso, on_demand=on_demand,
-                                     extra=extra)
-
-    def _publish_frame_error(self, status: str, error: str,
-                             ts_iso: str = None, on_demand: bool = False):
-        self._bus.publish_error(status, error, ts_iso=ts_iso,
-                                on_demand=on_demand)
-
-    def _publish_status_note(self, status: str, note: str = ""):
-        self._bus.publish_note(status, note)
-
-    # ------------------------------------------------------------------
-    # MQTT commands
-    # ------------------------------------------------------------------
-    def _on_mqtt_command(self, topic: str, payload):
-        console_ui.log(f"MQTT cmd: {topic} "
-                       f"({len(payload) if payload else 0} bytes)")
-        if not self._bus.enabled:
-            return
-        if topic.endswith("/cmd/get_frame"):
-            self._pending_get_frame.set()
-            return
-        if topic.endswith("/cmd/capture_frame"):
-            # sentry camera schedule is autonomous; treat as get_frame
-            self._pending_get_frame.set()
-            return
-        console_ui.log(f"Unknown command: {topic}")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
     def run(self):
         self._bus.prepare_status_dir()
-        self._bus.subscribe(self._on_mqtt_command)
 
         # Start daemon if not already running
         if not self.cam.is_running():
@@ -408,11 +370,6 @@ class SentryWorkerConsole(threading.Thread):
         last_fired = (-1, -1)
 
         while not self._stop_event.is_set():
-            # Handle on-demand get_frame request
-            if self._pending_get_frame.is_set():
-                self._pending_get_frame.clear()
-                self._send_latest_frame(on_demand=True)
-
             now = dt.now()
 
             # Periodic publish at configured capture_seconds
@@ -424,7 +381,7 @@ class SentryWorkerConsole(threading.Thread):
                     # New frame available
                     self._last_seqno = seqno
                     self._archive_latest(now)
-                    self._send_latest_frame(on_demand=False)
+                    self._send_latest_frame()
                     self._shots += 1
                     self._last_shot = now
                 self._save_status(
@@ -471,14 +428,13 @@ class SentryWorkerConsole(threading.Thread):
         if frame is not None:
             self._service.publish_frame(frame, now, self.cam.get_metadata())
 
-    def _send_latest_frame(self, on_demand: bool = False):
-        """Read aux/image.fits, convert to JPEG, publish via MQTT."""
+    def _send_latest_frame(self):
+        """Read aux/image.fits and hand the frame to the frame server."""
         frame = self.cam.get_latest_image()
         if frame is None:
-            self._publish_frame_error(
+            self._bus.publish_error(
                 "no_frame", "No image available yet (aux/image.fits missing)",
-                ts_iso=dt.now().isoformat(), on_demand=on_demand,
-            )
+                ts_iso=dt.now().isoformat())
             console_ui.warn("SENTRY: no image.fits available yet")
             return
         try:
@@ -486,16 +442,11 @@ class SentryWorkerConsole(threading.Thread):
             self._last_frame = frame
             if self._service is not None:
                 self._service.publish_frame(frame, dt.now(), meta)
-            if not self._bus.enabled:
-                return
-            jpeg = frame_to_jpeg_bytes(frame)
-            ts = meta.get("ExpoTime") or dt.now().isoformat()
-            self._publish_frame(jpeg, ts, metadata=meta, on_demand=on_demand)
             console_ui.log(f"SENTRY frame published (seqno={self._last_seqno})")
         except Exception as exc:
             self._errors += 1
-            self._publish_frame_error("error", str(exc), ts_iso=dt.now().isoformat(),
-                                      on_demand=on_demand)
+            self._bus.publish_error("error", str(exc),
+                                    ts_iso=dt.now().isoformat())
             console_ui.error(f"SENTRY frame publish: {exc}")
 
     def _save_status(self, status: str, force: bool = False):
@@ -593,11 +544,9 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
                        setup_mode=False):
     """Run Sentry (imagerd_rt) camera in console mode."""
     from utils import load_config, get_node_name
-    from mqtt_client import create_console_publisher
 
     cfg = load_config(config_path)
     sentry_cfg = cfg.get("sentry", {})
-    mqtt_cfg = cfg.get("mqtt", {})
 
     node_name = get_node_name(cfg)
     claim = claim_instance_name(sentry_cfg.get("instance_name")
@@ -609,6 +558,16 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
     capture_seconds = sentry_cfg.get("capture_seconds", SENTRY_CAPTURE_SECONDS)
 
     dash = console_ui.start_dashboard("sentry", instance_name, verbose=verbose)
+    # Alert mail, started before the camera is opened so that a camera which
+    # will not open — and a filter controller that answers nothing — is already
+    # something somebody hears about. The crash handler goes first: it is the
+    # only thing that can speak for a process killed outright.
+    alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
+    alerts.install_crash_handler(alert_status_path)
+    alerts.start(cfg.get("alerts", {}), node_name, instance_name, "sentry",
+                 log_path=console_ui.default_log_path("sentry", instance_name),
+                 status_path=alert_status_path)
+
     dash.update(status="starting", node_name=node_name, output_dir=output_dir,
                 frames=0, errors=0)
     dash.set_section("device", [
@@ -617,7 +576,6 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
     ])
 
     cam = SentryCamera(imagerd_rt_dir)
-    mqtt_pub = None
     server = None
     try:
         if not cam.is_available():
@@ -644,16 +602,13 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
                                 "exists in " + imagerd_rt_dir)
 
         if not output_dir:
-            console_ui.log("sentry.output_dir not set. Status/MQTT still work; "
+            console_ui.log("sentry.output_dir not set. Status still works; "
                            "FITS archives go wherever imagerd_rt is configured.")
 
         os.makedirs(status_dir, exist_ok=True)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        mqtt_pub = create_console_publisher(mqtt_cfg, instance_name, "sentry")
-        if mqtt_pub:
-            dash.update(mqtt=f"{mqtt_cfg.get('host', '?')} — connected")
 
         # LAN frame server (archive browsing + live view). Never fatal.
         # imagerd_rt owns exposure/schedule, so no remote parameter editing.
@@ -678,8 +633,6 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
             instance_name=instance_name,
             status_dir=status_dir,
             capture_seconds=capture_seconds,
-            mqtt_publisher=mqtt_pub,
-            mqtt_prefix=mqtt_cfg.get("prefix", "every_camera"),
             service=service,
             node_name=node_name,
             setup_mode=setup_mode,
@@ -697,10 +650,5 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
     finally:
         if server:
             server.stop()
-        if mqtt_pub:
-            try:
-                mqtt_pub.disconnect_broker()
-            except Exception:
-                pass
         dash.stop()
         claim.release()

@@ -318,7 +318,7 @@ class Dashboard:
         Recognised keys: ``status``, ``detail``, ``phase``, ``schedule``,
         ``next_at``, ``frames``, ``darks``, ``errors``, ``last_file``,
         ``output_dir``, ``disk_free_mb``, ``server_url``, ``node_name``,
-        ``focus``, ``mqtt``, ``note``. Unknown keys are stored and ignored by
+        ``focus``, ``alerts``, ``note``. Unknown keys are stored and ignored by
         the renderer, so a driver can stage values without breaking the layout.
         """
         with self._lock:
@@ -475,8 +475,8 @@ class Dashboard:
             rows.append(("LAN server:", value))
         if state.get("focus"):
             rows.append(("Live view / focus:", str(state["focus"])))
-        if state.get("mqtt"):
-            rows.append(("MQTT:", str(state["mqtt"])))
+        if state.get("alerts"):
+            rows.append(("Alerts:", str(state["alerts"])))
         return rows
 
     def _draw(self):

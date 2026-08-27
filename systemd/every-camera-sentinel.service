@@ -1,0 +1,58 @@
+# The alert watchdog — one per machine, not one per camera.
+#
+#   systemctl enable --now every-camera-sentinel
+#
+# This is the process that sends the mail. Every camera on the machine queues
+# its letters as files in ~/.every_camera/outbox and never opens a socket
+# itself; this drains that queue, and separately notices a worker that died,
+# one that hung, and a disk that is filling up.
+#
+# It has to be a service of its own, and it has to be Restart=always, because
+# the failure it exists to report is a camera process that is no longer there.
+# A watchdog that lived inside the thing it watches would report every fault
+# except the one that matters.
+#
+# It is cheap: no camera SDK, no numpy, no Qt. It wakes every fifteen seconds,
+# reads a few small files and goes back to sleep.
+#
+# Install with systemd/install.sh, which fills in the paths below.
+
+[Unit]
+Description=Every Camera — alert watchdog
+# Ordered after the cameras only so that the journal reads in the right order
+# on a boot; it does not need them, and must keep running when they stop.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@APP_DIR@
+
+# No --config: the sentinel is one per machine while the cameras are one
+# per type, so it reads theirs (the checkout's config.json, then
+# @CONFIG_DIR@/*.json) rather than having a copy of the addresses that
+# could disagree with them.
+ExecStart=@PYTHON@ @APP_DIR@/sentinel.py
+Environment=PYTHONUNBUFFERED=1
+
+# Same reason as the camera unit: the status files, logs and the outbox all
+# live under $HOME, and root's own home is not where anything else looks.
+Environment=HOME=@USER_HOME@
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=every-camera-sentinel
+
+# Not on-failure. A watchdog that stays down after one bad night is worse than
+# no watchdog, because everyone still believes it is watching.
+Restart=always
+RestartSec=15
+
+# Nothing here is worth waiting for on shutdown: it holds no hardware and the
+# spool is on disk, so whatever it was about to send is still there next time.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

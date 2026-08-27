@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Sender account for alert e-mail. Copy to ~/.every_camera/mail_account.json",
+    "on each station and fill in. This file describes the mailbox, not the",
+    "program, so the real one is in .gitignore — exactly like env.sh.",
+    "",
+    "Everything else is already set: host, port and encryption come from the",
+    "preset. A station's own configuration is then just the addresses to notify,",
+    "in config.json under alerts.to.",
+    "",
+    "preset: yandex | mailru | gmail | brevo | resend | localhost | custom",
+    "  yandex/mailru — application password, NOT the account password",
+    "  gmail         — app password; needs 2-step verification on the account",
+    "  brevo         — login is not the account e-mail; see SMTP & API -> SMTP",
+    "  resend        — user is the literal word 'resend', password is the API key",
+    "  localhost     — a relay already running on the machine, no login",
+    "  custom        — spell out host, port and security yourself",
+    "",
+    "Use a mailbox created for this and nothing else: every station holds this",
+    "password, so it is as exposed as the least private machine among them.",
+    "",
+    "security (only needed with preset 'custom'): ssl | starttls | none"
+  ],
+
+  "preset": "yandex",
+  "user": "obs-alerts@yandex.ru",
+  "password": "put-the-application-password-here",
+  "from": "obs-alerts@yandex.ru"
+}

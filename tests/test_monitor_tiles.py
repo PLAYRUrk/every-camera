@@ -170,14 +170,27 @@ def test_a_camera_without_a_focus_mode_cannot_be_focused_from_here(qt_app):
     assert not tile.btn_focus.isEnabled()
 
 
-def test_an_mqtt_tile_offers_neither(qt_app):
-    # There is no route to the camera — only a broker relaying what it says.
-    tile = monitor_app.CameraTile((monitor_app.MQTT, "Sentry_far"),
+def test_a_forwarded_tile_offers_both(qt_app):
+    # The broker's tiles had these greyed out, because a relayed status was all
+    # there was. A gateway forwards the archive and the live stream too, so a
+    # camera reached through one is not a lesser camera.
+    tile = monitor_app.CameraTile(("192.168.1.9:8765", "10.0.0.5", 8765),
+                                  {"instance_name": "Sentry_far"})
+    tile.set_status({"status": "running", "camera_type": "sentry",
+                     "supports_focus": True})
+    assert tile.address == ("10.0.0.5", 8765)
+    assert tile.via == "192.168.1.9:8765"
+    assert tile.btn_frames.isEnabled() and tile.btn_focus.isEnabled()
+
+
+def test_a_forwarded_tile_says_which_camera_is_fetching(qt_app):
+    # Two things can be wrong — the camera or the one relaying for it — and the
+    # tile has to name both for "not answering" to be actionable.
+    tile = monitor_app.CameraTile(("192.168.1.9:8765", "10.0.0.5", 8765),
                                   {"instance_name": "Sentry_far"})
     tile.set_status({"status": "running", "camera_type": "sentry"})
-    assert tile.address is None
-    assert not tile.btn_frames.isEnabled()
-    assert not tile.btn_focus.isEnabled()
+    assert "10.0.0.5:8765" in tile.lbl_where.text()
+    assert "192.168.1.9:8765" in tile.lbl_where.text()
 
 
 def test_an_offline_tile_says_why_and_stops_offering_anything(qt_app):

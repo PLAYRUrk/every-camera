@@ -6,6 +6,9 @@ config.json
 # Machine-local environment for run.sh (PICAM paths, interpreter choice).
 # env.sh.example is tracked; the real one describes one machine.
 env.sh
+# Sender account for alert e-mail. mail_account.json.example is tracked;
+# the real one holds a password every station shares.
+mail_account.json
 venv/
 .venv/
 .claude/

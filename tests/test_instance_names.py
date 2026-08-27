@@ -1,6 +1,6 @@
 """Instance names must stay unique so several every-camera runs cannot collide.
 
-The name drives the MQTT topics, the log file and preview_{instance}.png. Two
+The name drives the log file and preview_{instance}.png. Two
 copies started from one identical config.json used to get the same name and
 quietly overwrite each other's status and frames. ``claim_instance_name`` holds
 a flock for the life of the process and appends -2, -3 … while a live process

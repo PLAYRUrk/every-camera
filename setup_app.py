@@ -24,6 +24,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import load_config, save_config, DEFAULT_CONFIG, can_use_gui, LOCAL_CONFIG_FILE
 
 
+# Said in both filter-wheel tabs, and worth saying: a wheel whose port name
+# moved is indistinguishable, from inside the program, from a dead one.
+_WHEEL_PORT_TIP = (
+    "Serial port of the SmartMotor controller, or 'sim' for the simulator.\n"
+    "Prefer a stable name \u2014 /dev/serial/by-id/usb-...-if00-port0 \u2014 to\n"
+    "/dev/ttyUSB0: ttyUSB* is numbered in the order devices turn up, so a\n"
+    "reboot or a replug can hand ttyUSB0 to a different adapter. That port\n"
+    "still opens and nothing answers on it, which costs the night its\n"
+    "filter tags."
+)
+
+
 # ---------------------------------------------------------------------------
 # Console wizard
 # ---------------------------------------------------------------------------
@@ -36,7 +48,7 @@ def run_console_wizard(config_path=None, camera_type=None):
         configure_console_sentry,
         configure_console_asi,
         configure_console_japan,
-        _configure_mqtt,
+        _configure_alerts,
         _ask_bool,
     )
 
@@ -77,8 +89,8 @@ def run_console_wizard(config_path=None, camera_type=None):
     for name in to_configure:
         CONFIGURATORS[name](cfg, config_path)
 
-    # MQTT settings
-    _configure_mqtt(cfg)
+    # Who to tell when a camera stops working
+    _configure_alerts(cfg)
     save_config(cfg, config_path)
     print("\nAll configuration saved.\n")
 
@@ -528,7 +540,7 @@ class SentryConfigTab:
         self.le_capture_secs = QLineEdit(
             ", ".join(str(s) for s in c.get("capture_seconds", [0, 30]))
         )
-        self.le_capture_secs.setToolTip("Seconds within each minute to poll daemon status / publish MQTT")
+        self.le_capture_secs.setToolTip("Seconds within each minute to poll the daemon's status")
         _add_label_row(grid, row, "Capture seconds:", self.le_capture_secs); row += 1
 
         root.addWidget(box)
@@ -788,8 +800,7 @@ class AsiConfigTab:
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
         self.le_port = QLineEdit(wheel.get("port", "/dev/ttyUSB0"))
-        self.le_port.setToolTip("Serial port of the SmartMotor controller, "
-                                "or 'sim' for the simulator")
+        self.le_port.setToolTip(_WHEEL_PORT_TIP)
         _add_label_row(hgrid, row, "Serial port:", self.le_port); row += 1
 
         self.sb_baud = QSpinBox()
@@ -1227,8 +1238,7 @@ class JapanConfigTab:
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
         self.le_port = QLineEdit(wheel.get("port", "/dev/ttyUSB0"))
-        self.le_port.setToolTip("Serial port of the SmartMotor controller, "
-                                "or 'sim' for the simulator")
+        self.le_port.setToolTip(_WHEEL_PORT_TIP)
         _add_label_row(hgrid, row, "Serial port:", self.le_port); row += 1
 
         self.sb_baud = QSpinBox()
@@ -1459,70 +1469,308 @@ class JapanConfigTab:
 
 
 # ---------------------------------------------------------------------------
-# MQTT config tab
+# Alert mail config tab
 # ---------------------------------------------------------------------------
-class MqttConfigTab:
-    """Builds and reads the MQTT broker configuration form."""
+class AlertsConfigTab:
+    """Builds and reads the alert-mail form.
+
+    Shaped around one claim: setting a station up means typing the addresses to
+    notify, and nothing else. The sender's mailbox arrives with the
+    installation, in ~/.every_camera/mail_account.json, so it is shown here as a
+    fact rather than asked for — and the box that edits it is switched off until
+    somebody deliberately switches it on.
+
+    The test button is the point of the tab. An alert system nobody has ever
+    seen deliver a letter is one nobody believes, and the first attempt is where
+    every mistake shows up — the wrong kind of password, a blocked port, a From
+    address the provider will not accept for that login.
+    """
 
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
-            QWidget, QVBoxLayout, QLineEdit, QSpinBox, QCheckBox,
+            QWidget, QVBoxLayout, QLineEdit, QSpinBox, QCheckBox, QLabel,
+            QPushButton, QHBoxLayout, QComboBox,
         )
-        m = cfg.get("mqtt", {})
+        import mailer
+
+        self._cfg = cfg
+        a = cfg.get("alerts", {})
         self.widget = QWidget()
         root = QVBoxLayout(self.widget)
         root.setContentsMargins(8, 8, 8, 8)
 
-        box, grid = _group_grid("MQTT Broker")
+        blurb = QLabel(
+            "Письма об отказах отправляет служба <b>every-camera-sentinel</b>, "
+            "работающая рядом с камерой.<br>Она сообщает, если камера "
+            "остановилась, если процесс упал или завис, если замолчал "
+            "контроллер фильтров или кончается место на диске.<br>"
+            "<b>Заполнить нужно только адреса.</b> Ящик отправителя уже "
+            "настроен на этой машине.")
+        blurb.setWordWrap(True)
+        root.addWidget(blurb)
+
+        # ── Who hears about it ────────────────────────────────────────────
+        box, grid = _group_grid("Оповещения")
         row = 0
 
-        self.cb_enabled = QCheckBox("Enable MQTT publishing")
-        self.cb_enabled.setChecked(m.get("enabled", False))
+        self.cb_enabled = QCheckBox("Отправлять письма об отказах")
+        self.cb_enabled.setChecked(a.get("enabled", True))
         grid.addWidget(self.cb_enabled, row, 0, 1, 2); row += 1
 
-        self.le_host = QLineEdit(m.get("host", "broker.hivemq.com"))
-        _add_label_row(grid, row, "Broker host:", self.le_host); row += 1
+        self.le_to = QLineEdit(", ".join(a.get("to") or []))
+        self.le_to.setPlaceholderText("ivanov@example.ru, petrov@example.ru")
+        self.le_to.setToolTip("Адреса через запятую. Это единственное поле, "
+                              "которое обязательно заполнить.")
+        _add_label_row(grid, row, "Кому:", self.le_to); row += 1
 
-        self.sb_port = QSpinBox()
-        self.sb_port.setRange(1, 65535)
-        try:
-            self.sb_port.setValue(int(m.get("port", 1883)))
-        except (ValueError, TypeError):
-            self.sb_port.setValue(1883)
-        _add_label_row(grid, row, "Port:", self.sb_port); row += 1
+        test_bar = QHBoxLayout()
+        self.btn_test = QPushButton("Отправить тестовое письмо")
+        self.btn_test.clicked.connect(self._on_test)
+        test_bar.addWidget(self.btn_test)
+        test_bar.addStretch()
+        grid.addLayout(test_bar, row, 0, 1, 2); row += 1
 
-        self.le_user = QLineEdit(m.get("user", ""))
-        self.le_user.setPlaceholderText("(leave blank if not required)")
-        _add_label_row(grid, row, "Username:", self.le_user); row += 1
-
-        self.le_pass = QLineEdit(m.get("password", ""))
-        self.le_pass.setEchoMode(QLineEdit.Password)
-        self.le_pass.setPlaceholderText("(leave blank if not required)")
-        _add_label_row(grid, row, "Password:", self.le_pass); row += 1
-
-        self.le_prefix = QLineEdit(m.get("prefix", "every_camera"))
-        self.le_prefix.setToolTip("MQTT topic prefix, e.g. every_camera/<instance>/status")
-        _add_label_row(grid, row, "Topic prefix:", self.le_prefix); row += 1
-
-        self.cb_tls = QCheckBox("Use TLS (port 8883)")
-        self.cb_tls.setChecked(m.get("tls", False))
-        self.cb_tls.stateChanged.connect(
-            lambda s: self.sb_port.setValue(8883 if s else 1883))
-        grid.addWidget(self.cb_tls, row, 0, 1, 2); row += 1
+        self.lbl_sender = QLabel()
+        self.lbl_sender.setWordWrap(True)
+        grid.addWidget(self.lbl_sender, row, 0, 1, 2); row += 1
 
         root.addWidget(box)
+
+        # ── The sender, normally left alone ───────────────────────────────
+        acc_box, acc_grid = _group_grid("Учётная запись отправителя")
+        acc_box.setCheckable(True)
+        acc_box.setChecked(False)
+        acc_box.setToolTip(
+            "Обычно менять не нужно: файл mail_account.json кладётся один раз "
+            "при установке узла. Включите этот блок, только если ящик "
+            "отправителя действительно меняется.")
+        row = 0
+
+        self.cmb_preset = QComboBox()
+        for key in mailer.SMTP_PRESETS:
+            self.cmb_preset.addItem(key)
+        _add_label_row(acc_grid, row, "Провайдер:", self.cmb_preset); row += 1
+
+        self.le_acc_user = QLineEdit()
+        self.le_acc_user.setPlaceholderText("obs-alerts@yandex.ru")
+        _add_label_row(acc_grid, row, "Логин:", self.le_acc_user); row += 1
+
+        self.le_acc_pass = QLineEdit()
+        self.le_acc_pass.setEchoMode(QLineEdit.Password)
+        self.le_acc_pass.setPlaceholderText("пароль приложения")
+        _add_label_row(acc_grid, row, "Пароль:", self.le_acc_pass); row += 1
+
+        self.le_acc_from = QLineEdit()
+        self.le_acc_from.setPlaceholderText("(по умолчанию — логин)")
+        _add_label_row(acc_grid, row, "От кого:", self.le_acc_from); row += 1
+
+        self.lbl_hint = QLabel()
+        self.lbl_hint.setWordWrap(True)
+        acc_grid.addWidget(self.lbl_hint, row, 0, 1, 2); row += 1
+        self.cmb_preset.currentTextChanged.connect(self._on_preset)
+
+        save_bar = QHBoxLayout()
+        self.btn_save_account = QPushButton("Сохранить учётную запись")
+        self.btn_save_account.setToolTip(
+            "Записывает ~/.every_camera/mail_account.json. Отдельно от кнопки "
+            "Save: пароль не хранится в config.json.")
+        self.btn_save_account.clicked.connect(self._on_save_account)
+        save_bar.addWidget(self.btn_save_account)
+        save_bar.addStretch()
+        acc_grid.addLayout(save_bar, row, 0, 1, 2); row += 1
+
+        self._acc_box = acc_box
+        root.addWidget(acc_box)
+
+        # ── Thresholds ────────────────────────────────────────────────────
+        lim_box, lim_grid = _group_grid("Пороги и ограничения")
+        row = 0
+
+        self.sb_cooldown = QSpinBox()
+        self.sb_cooldown.setRange(0, 1440)
+        self.sb_cooldown.setSuffix(" мин")
+        self.sb_cooldown.setValue(int(a.get("cooldown_minutes", 60)))
+        self.sb_cooldown.setToolTip(
+            "Сколько молчать после письма об одной и той же неисправности. "
+            "Отказ колеса фильтров повторяется каждые сорок секунд — без этого "
+            "за ночь ушла бы тысяча писем.")
+        _add_label_row(lim_grid, row, "Пауза между повторами:",
+                       self.sb_cooldown); row += 1
+
+        self.sb_digest = QSpinBox()
+        self.sb_digest.setRange(0, 1440)
+        self.sb_digest.setSuffix(" мин")
+        self.sb_digest.setValue(int(a.get("digest_minutes", 30)))
+        self.sb_digest.setToolTip("Как часто отправлять сводку обычных ошибок. "
+                                  "Аварии, обрывающие ночь, её не ждут.")
+        _add_label_row(lim_grid, row, "Сводка ошибок:", self.sb_digest); row += 1
+
+        self.sb_max_day = QSpinBox()
+        self.sb_max_day.setRange(0, 1000)
+        self.sb_max_day.setValue(int(a.get("max_per_day", 50)))
+        self.sb_max_day.setToolTip(
+            "Потолок писем с этого узла за сутки; 0 — без ограничения. Ящик "
+            "один на все камеры, значит и суточная квота провайдера общая.")
+        _add_label_row(lim_grid, row, "Не больше писем в сутки:",
+                       self.sb_max_day); row += 1
+
+        self.sb_disk = QSpinBox()
+        self.sb_disk.setRange(0, 1_000_000)
+        self.sb_disk.setSuffix(" МБ")
+        self.sb_disk.setValue(int(a.get("disk_free_min_mb", 5000)))
+        self.sb_disk.setToolTip("Порог свободного места; 0 — не следить.")
+        _add_label_row(lim_grid, row, "Предупреждать, если свободно меньше:",
+                       self.sb_disk); row += 1
+
+        self.sb_tail = QSpinBox()
+        self.sb_tail.setRange(0, 500)
+        self.sb_tail.setValue(int(a.get("log_tail_lines", 50)))
+        self.sb_tail.setToolTip("Сколько последних строк лога прикладывать к письму.")
+        _add_label_row(lim_grid, row, "Строк лога в письме:", self.sb_tail); row += 1
+
+        root.addWidget(lim_box)
         root.addStretch()
 
-    def get_config(self) -> dict:
+        self._refresh_sender()
+
+    # -- helpers -------------------------------------------------------------
+    def _account_from_form(self):
+        """What the form describes, or None if it does not describe anything."""
+        import mailer
+        user = self.le_acc_user.text().strip()
+        if not user:
+            return None
+        preset = self.cmb_preset.currentText()
+        base = dict(mailer.SMTP_PRESETS.get(preset, {}))
         return {
-            "enabled":  self.cb_enabled.isChecked(),
-            "host":     self.le_host.text().strip(),
-            "port":     self.sb_port.value(),
-            "user":     self.le_user.text().strip(),
-            "password": self.le_pass.text(),
-            "prefix":   self.le_prefix.text().strip(),
-            "tls":      self.cb_tls.isChecked(),
+            "preset": preset,
+            "host": base.get("host", ""),
+            "port": int(base.get("port", 0) or 0),
+            "security": base.get("security", "ssl"),
+            "user": user,
+            "password": self.le_acc_pass.text(),
+            "from": self.le_acc_from.text().strip() or user,
+            "source": "форма мастера настройки",
         }
+
+    def _refresh_sender(self):
+        import mailer
+        account = self._account_from_form() or mailer.resolve_account(
+            self._cfg.get("alerts", {}))
+        if account is None:
+            self.lbl_sender.setText(
+                "<b>Отправитель не настроен.</b> Скопируйте "
+                "<code>mail_account.json.example</code> в "
+                f"<code>{mailer.HOME_DIR}\\mail_account.json</code> и заполните, "
+                "либо раскройте блок ниже.")
+        else:
+            self.lbl_sender.setText(
+                f"Отправитель: <b>{account['from']}</b> через "
+                f"{account['host']}:{account['port']} "
+                f"<i>(из: {account['source']})</i>")
+            if not self.le_acc_user.text().strip():
+                self.le_acc_user.setText(account.get("user", ""))
+                self.le_acc_from.setText(account.get("from", ""))
+                index = self.cmb_preset.findText(account.get("preset", ""))
+                if index >= 0:
+                    self.cmb_preset.setCurrentIndex(index)
+        self._on_preset(self.cmb_preset.currentText())
+
+    def _on_preset(self, preset):
+        import mailer
+        self.lbl_hint.setText(mailer.PRESET_HINTS.get(preset, ""))
+
+    def _recipients(self):
+        return [part.strip() for part in self.le_to.text().replace(";", ",").split(",")
+                if part.strip()]
+
+    # -- buttons -------------------------------------------------------------
+    def _on_save_account(self):
+        from PyQt5.QtWidgets import QMessageBox
+        import json
+        import os
+        import mailer
+
+        account = self._account_from_form()
+        if account is None:
+            QMessageBox.warning(self.widget, "Учётная запись",
+                                "Укажите логин ящика-отправителя.")
+            return
+        path = mailer.ACCOUNT_FILES[0]
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            mailer._write_json_atomic(path, {
+                "preset": account["preset"],
+                "user": account["user"],
+                "password": account["password"],
+                "from": account["from"],
+            })
+        except OSError as exc:
+            QMessageBox.critical(self.widget, "Учётная запись",
+                                 f"Не удалось записать {path}:\n{exc}")
+            return
+        QMessageBox.information(
+            self.widget, "Учётная запись",
+            f"Записано в {path}.\n\nЭтот файл не попадает в git и не "
+            f"перезаписывается обновлением.")
+        self._refresh_sender()
+
+    def _on_test(self):
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        from PyQt5.QtCore import Qt
+        import socket
+        import mailer
+
+        recipients = self._recipients()
+        if not recipients:
+            QMessageBox.warning(self.widget, "Тестовое письмо",
+                                "Сначала укажите хотя бы один адрес.")
+            return
+        account = self._account_from_form() or mailer.resolve_account(
+            self._cfg.get("alerts", {}))
+        if account is None:
+            QMessageBox.warning(
+                self.widget, "Тестовое письмо",
+                "Ящик отправителя не настроен — раскройте блок «Учётная "
+                "запись отправителя» и заполните его.")
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            mailer.send_now(
+                account, recipients,
+                "[every-camera] тестовое письмо",
+                f"Если вы это читаете, оповещения с узла "
+                f"{socket.gethostname()} настроены и работают.\n\n"
+                f"Отправитель: {account['from']} через "
+                f"{account['host']}:{account['port']}",
+                timeout=15.0)
+        except mailer.MailError as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self.widget, "Тестовое письмо не ушло", str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+        QMessageBox.information(
+            self.widget, "Тестовое письмо",
+            "Отправлено на:\n  " + "\n  ".join(recipients))
+
+    # -- config --------------------------------------------------------------
+    def get_config(self) -> dict:
+        alerts = {
+            "enabled": self.cb_enabled.isChecked(),
+            "to": self._recipients(),
+            "digest_minutes": self.sb_digest.value(),
+            "cooldown_minutes": self.sb_cooldown.value(),
+            "disk_free_min_mb": self.sb_disk.value(),
+            "max_per_day": self.sb_max_day.value(),
+            "log_tail_lines": self.sb_tail.value(),
+        }
+        # Carried through untouched: this form does not offer them, and dropping
+        # a key the operator set by hand would be a silent change of behaviour.
+        for key in ("daily_summary", "status_mail_minutes", "smtp"):
+            if key in (self._cfg.get("alerts") or {}):
+                alerts[key] = self._cfg["alerts"][key]
+        return alerts
 
 
 # ---------------------------------------------------------------------------
@@ -1679,7 +1927,7 @@ class GeneralConfigTab:
 class ConfigWizardWindow:
     """PyQt5 configuration wizard window."""
 
-    TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "japan", "mqtt",
+    TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "japan", "alerts",
                "server", "general"]
 
     def __init__(self, cfg: dict, camera_type=None, config_path: str = LOCAL_CONFIG_FILE):
@@ -1714,7 +1962,7 @@ class ConfigWizardWindow:
             "sentry":  (SentryConfigTab,  "Sentry"),
             "asi":     (AsiConfigTab,     "ASI"),
             "japan":   (JapanConfigTab,   "Japan"),
-            "mqtt":    (MqttConfigTab,    "MQTT"),
+            "alerts":  (AlertsConfigTab,  "Оповещения"),
             "server":  (ServerConfigTab,  "LAN Server"),
             "general": (GeneralConfigTab, "General"),
         }
@@ -1774,7 +2022,7 @@ class ConfigWizardWindow:
             "sentry":  "sentry",
             "asi":     "asi",
             "japan":   "japan",
-            "mqtt":    "mqtt",
+            "alerts":  "alerts",
             "server":  "server",
         }
         for tab_key, cfg_key in KEY_MAP.items():

@@ -11,7 +11,12 @@
 #     paths of this checkout filled in;
 #   * copies config.json to /etc/every-camera/<type>.json if that file does not
 #     exist yet, so the service has a config of its own to edit;
-#   * enables and starts every-camera@<type>.
+#   * enables and starts every-camera@<type>;
+#   * installs the alert watchdog, every-camera-sentinel, which is one per
+#     machine rather than one per camera. It is what sends the mail, and what
+#     reports a camera process that died — so it has to be installed whether
+#     or not anyone has configured an address yet, or the first thing it
+#     would miss is the fault that made somebody want it.
 #
 # All of it is reversible: --uninstall stops the service, disables the autostart
 # and removes the unit. The config in /etc/every-camera and the archive are left
@@ -23,6 +28,7 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$APP_DIR/systemd/every-camera@.service"
+SENTINEL_TEMPLATE="$APP_DIR/systemd/every-camera-sentinel.service"
 UNIT_DIR=/etc/systemd/system
 CONFIG_DIR=/etc/every-camera
 CAMERA=""
@@ -79,8 +85,14 @@ if [[ $UNINSTALL -eq 1 ]]; then
     if [[ "$remaining" -eq 0 ]]; then
         rm -f "$UNIT_DIR/every-camera@.service"
         echo "removed $UNIT_DIR/every-camera@.service"
+        # The watchdog serves every camera on the machine, so it goes only
+        # when the last of them does.
+        systemctl disable --now every-camera-sentinel 2>/dev/null || true
+        rm -f "$UNIT_DIR/every-camera-sentinel.service"
+        echo "removed $UNIT_DIR/every-camera-sentinel.service"
     else
         echo "kept $UNIT_DIR/every-camera@.service — other instances still use it"
+        echo "kept every-camera-sentinel — it watches them"
     fi
     systemctl daemon-reload
     echo
@@ -113,7 +125,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
         -e "s|@USER_HOME@|$USER_HOME|g" \
         "$TEMPLATE"
     echo "--- would use config $TARGET_CONFIG (copied from $APP_DIR/config.json if absent) ---"
+    echo "--- would write $UNIT_DIR/every-camera-sentinel.service ---"
+    sed -e "s|@APP_DIR@|$APP_DIR|g" \
+        -e "s|@PYTHON@|$PYTHON|g" \
+        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
+        -e "s|@USER_HOME@|$USER_HOME|g" \
+        "$SENTINEL_TEMPLATE"
     echo "--- would run: systemctl enable --now every-camera@$CAMERA ---"
+    echo "--- would run: systemctl enable --now every-camera-sentinel ---"
     exit 0
 fi
 
@@ -139,8 +158,24 @@ chmod 644 "$UNIT"
 chmod +x "$APP_DIR/run.sh"
 echo "installed $UNIT"
 
+# One per machine, and rewritten on every install so that an upgraded
+# checkout does not leave an old unit pointing at the wrong interpreter.
+if [[ -f "$SENTINEL_TEMPLATE" ]]; then
+    SENTINEL_UNIT="$UNIT_DIR/every-camera-sentinel.service"
+    sed -e "s|@APP_DIR@|$APP_DIR|g" \
+        -e "s|@PYTHON@|$PYTHON|g" \
+        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
+        -e "s|@USER_HOME@|$USER_HOME|g" \
+        "$SENTINEL_TEMPLATE" > "$SENTINEL_UNIT"
+    chmod 644 "$SENTINEL_UNIT"
+    echo "installed $SENTINEL_UNIT"
+fi
+
 systemctl daemon-reload
 systemctl enable --now "every-camera@$CAMERA"
+if [[ -f "$UNIT_DIR/every-camera-sentinel.service" ]]; then
+    systemctl enable --now every-camera-sentinel
+fi
 
 cat <<EOF
 
@@ -150,8 +185,25 @@ every-camera@$CAMERA is enabled and running; it will come back after a reboot.
   journalctl -u every-camera@$CAMERA -f
   systemctl stop every-camera@$CAMERA     # closing darks and warm-up run first
 
+The alert watchdog every-camera-sentinel is installed and running too. It
+sends the mail and reports a camera process that dies:
+
+  systemctl status every-camera-sentinel
+  journalctl -u every-camera-sentinel -f
+
+To make it send anything, two things are needed on this machine:
+
+  1. the addresses to notify, in $TARGET_CONFIG:
+       "alerts": { "to": ["someone@example.org"] }
+  2. the sender's mailbox, copied once from
+     $APP_DIR/mail_account.json.example to
+     $USER_HOME/.every_camera/mail_account.json
+
+Check it with:  $PYTHON $APP_DIR/sentinel.py --once
+
 Config:  $TARGET_CONFIG
 Logs:    $USER_HOME/.every_camera/logs/
+Outbox:  $USER_HOME/.every_camera/outbox/
 
 The service runs $APP_DIR/run.sh — the same launcher you can use by hand:
   $APP_DIR/run.sh --type $CAMERA

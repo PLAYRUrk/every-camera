@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import console_ui
+import gateway
 
 import cycles
 import frame_archive
@@ -155,6 +156,7 @@ class _Handler(BaseHTTPRequestHandler):
     focus_ttl = 60.0
     stream_slots = None
     thumb_cache = None
+    gateway = None
     verbose = False
 
     # -- plumbing ------------------------------------------------------
@@ -243,6 +245,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._post_params()
             elif path == "/api/focus":
                 self._post_focus()
+            elif path.startswith("/api/node/"):
+                self._proxy(path, "POST")
             else:
                 self._error(404, f"Unknown endpoint: {path}")
         except (BrokenPipeError, ConnectionResetError):
@@ -279,8 +283,107 @@ class _Handler(BaseHTTPRequestHandler):
             result = self.service.param_result(path.rsplit("/", 1)[-1])
             self._send_json(result or {"error": "unknown request id"},
                             code=200 if result else 404)
+        elif path == "/api/nodes":
+            self._get_nodes()
+        elif path.startswith("/api/node/"):
+            self._proxy(path, "GET")
         else:
             self._error(404, f"Unknown endpoint: {path}")
+
+    # -- the fleet -----------------------------------------------------
+    def _hops(self):
+        try:
+            return int(self.headers.get(gateway.HOP_HEADER) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_nodes(self):
+        """Every camera this node knows about, including itself."""
+        if self.gateway is None:
+            self._send_json({"nodes": [], "gateway": False})
+            return
+        self._send_json({"nodes": self.gateway.nodes(), "gateway": True})
+
+    def _proxy(self, path, method):
+        """Make a request to another node on the caller's behalf.
+
+        Streamed rather than buffered, because one of the things worth
+        forwarding is ``/api/live.mjpg``, which does not end.
+        """
+        if self.gateway is None:
+            self._error(503, "This node does not forward requests")
+            return
+        target, rest = gateway.parse_node_path(path)
+        if not target:
+            self._error(400, "Usage: /api/node/<host>:<port>/<path>")
+            return
+        query = urlparse(self.path).query
+        if query:
+            rest = f"{rest}?{query}"
+
+        body = None
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if 0 < length <= 1_000_000:
+                body = self.rfile.read(length)
+
+        try:
+            upstream = self.gateway.open_upstream(
+                target, rest, method=method, body=body,
+                content_type=self.headers.get("Content-Type"),
+                hops=self._hops())
+        except LookupError as exc:
+            self._error(404, str(exc))
+            return
+        except RecursionError:
+            # Two nodes that know each other could otherwise pass one
+            # request back and forth until a thread pool ran out.
+            self._error(508, "Request forwarded too many times")
+            return
+        except ValueError as exc:
+            self._error(400, str(exc))
+            return
+        except Exception as exc:
+            self._error(502, f"{target}: {type(exc).__name__}: {exc}")
+            return
+
+        self._stream_upstream(upstream)
+
+    def _stream_upstream(self, upstream):
+        """Copy an upstream response through, headers first, then chunks."""
+        try:
+            self.send_response(upstream.status)
+            content_type = upstream.headers.get("Content-Type",
+                                                "application/octet-stream")
+            self.send_header("Content-Type", content_type)
+            length = upstream.headers.get("Content-Length")
+            if length:
+                self.send_header("Content-Length", length)
+            else:
+                # No length upstream means a stream; say so rather than let
+                # HTTP/1.1 keep-alive wait for a body that never finishes.
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            while True:
+                chunk = upstream.read(64 * 1024)
+                if not chunk:
+                    return
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
 
     # -- handlers ------------------------------------------------------
     def _get_info(self):
@@ -653,8 +756,12 @@ def start_frame_server(server_cfg, service, verbose=False):
     # 0 restores the old strict behaviour: use the configured port or nothing.
     port_search = max(0, int(cfg.get("port_search", DEFAULT_PORT_SEARCH)))
 
+    # One per server, started below once the port is known. It is what makes
+    # a single reachable camera a way in to every camera beside it.
+    fleet = gateway.Gateway(service)
     handler = type("_BoundHandler", (_Handler,), {
         "service": service,
+        "gateway": fleet,
         "max_list": int(cfg.get("max_list", MAX_LIST_LIMIT)),
         "focus_ttl": float(cfg.get("focus_ttl", 60)),
         "stream_slots": threading.BoundedSemaphore(MAX_MJPEG_CLIENTS),
@@ -688,6 +795,14 @@ def start_frame_server(server_cfg, service, verbose=False):
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.5},
                               daemon=True, name="everycam-frame-server")
     thread.start()
+
+    # The gateway lists this node among the others, so it has to know which
+    # port the search above actually settled on.
+    try:
+        service.http_port = port
+    except Exception:
+        pass
+    fleet.start()
 
     responder = None
     if cfg.get("discovery", True):

@@ -81,7 +81,7 @@ def test_applying_the_shutter_moves_it_and_reports_it(worker, cam):
     assert cam.shutter_open is True
 
 
-def test_a_worded_value_from_mqtt_applies_too(worker, cam):
+def test_a_worded_value_applies_too(worker, cam):
     cam.set_shutter(True)
     applied, errors = worker._apply_params({"shutter": "closed"})
     assert errors == []

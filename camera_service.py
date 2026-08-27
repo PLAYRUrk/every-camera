@@ -172,6 +172,12 @@ class CameraService:
         self._lock = threading.Lock()
         self._frame_cond = threading.Condition(self._lock)
 
+        # The last thing that went wrong, and how many have. See note_error.
+        self._error_count = 0
+        self._last_error = ""
+        self._last_error_kind = ""
+        self._last_error_at = ""
+
         # Latest live frame
         self._frame = None
         self._frame_ts = None
@@ -332,6 +338,36 @@ class CameraService:
             self._focus_errors = 0
             self._focus_disabled_reason = ""
 
+    def note_error(self, kind, message, when=None):
+        """Record the last thing that went wrong, for observers to see.
+
+        The drivers have always reported these — a capture that returned no
+        image, a write that failed, a filter that was never reached — but
+        they reported them to the broker, which is off by default. So on a
+        normal station the call did nothing at all, and the only trace was a
+        line in a log file nobody reads until they already know something is
+        wrong. Here it reaches ``/api/status``, which is what the monitor
+        shows and what an alert letter quotes.
+
+        The count is cumulative and the message is the most recent one:
+        "seventeen errors, most recently this" is what somebody looking at a
+        tile actually needs.
+        """
+        stamp = when or dt.now().isoformat(timespec="seconds")
+        with self._lock:
+            self._error_count += 1
+            self._last_error = str(message)
+            self._last_error_kind = str(kind or "error")
+            self._last_error_at = stamp
+
+    def clear_errors(self):
+        """Forget the recorded errors — a new run, or an operator saying so."""
+        with self._lock:
+            self._error_count = 0
+            self._last_error = ""
+            self._last_error_kind = ""
+            self._last_error_at = ""
+
     def set_focus_note(self, text=""):
         """Say why no live frame is coming, while focus is on and healthy.
 
@@ -408,6 +444,13 @@ class CameraService:
                 snap["focus_note"] = self._focus_disabled_reason
             elif self._focus_note:
                 snap["focus_note"] = self._focus_note
+            if self._last_error:
+                snap["last_error"] = self._last_error
+                snap["last_error_kind"] = self._last_error_kind
+                snap["last_error_at"] = self._last_error_at
+                # Only when the worker has not counted them itself: the
+                # drivers keep their own tally and theirs is the fuller one.
+                snap.setdefault("errors", self._error_count)
             snap["has_frame"] = self._frame is not None
             snap["frame_counter"] = self._frame_counter
             snap["frame_ts"] = (self._frame_ts.isoformat()

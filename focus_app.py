@@ -11,8 +11,11 @@ Works with all four cameras. The editable controls come from the camera itself
 (``GET /api/params``), so each camera offers exactly what it supports — and the
 sentry camera, whose schedule belongs to imagerd_rt, is shown read-only.
 
-Deliberately LAN-only: a live stream over a public MQTT broker would be far
-too much traffic. Use ``viewer_app.py`` for remote work.
+A camera this machine cannot reach directly is reached through one that can:
+``--via`` names a camera to fetch on our behalf, and the live stream comes back
+through it (``gateway.py``). That is what the broker could never do — a
+continuous MJPEG stream through a public broker was out of the question, so
+remote focusing simply did not exist.
 
 Two safeguards keep this from disturbing measurements:
   * The camera only free-runs while this program keeps asking it to. The
@@ -719,6 +722,10 @@ class FocusWindow(QMainWindow):
         self._settings = settings
         self._tasks = TaskRunner(self)
         self._client = None
+        # host:port of a camera that will fetch on our behalf, or None when we
+        # talk to the camera directly. Set once, from --via, and used for every
+        # camera picked afterwards.
+        self._via = None
         self._stream = None
         self._discovery = None
         self._info = {}
@@ -998,10 +1005,15 @@ class FocusWindow(QMainWindow):
                                     "Pick a camera or type its address first.")
             return
         host, port = target
-        self._client = CameraClient(host, port)
+        self._client = CameraClient(host, port, via=self._via)
         self._remember(host, port)
         self.lbl_camera.setText(f"connecting to {host}:{port}…")
         self._tasks.run(self._client.info, self._on_info, self._on_error)
+
+    def set_via(self, via):
+        """Route everything through ``via`` (``host:port``), or directly if None."""
+        self._via = str(via) if via else None
+        return self
 
     def _remember(self, host, port):
         recent = [tuple(x) for x in self._settings.get("recent_hosts", [])]
@@ -1394,9 +1406,11 @@ class FocusWindow(QMainWindow):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Every Camera — focus assistant (local network only)")
+        description="Every Camera — focus assistant")
     parser.add_argument("--host", help="Connect to this camera straight away")
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    parser.add_argument("--via", default="", metavar="HOST:PORT",
+                        help="Reach --host through this camera, which fetches on our behalf")
     args = parser.parse_args()
 
     try:
@@ -1410,6 +1424,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = FocusWindow(load_settings())
+    window.set_via(args.via or None)
     window.show()
 
     if args.host:
