@@ -58,6 +58,13 @@ def compute_sun_on_off(date, location, angle):
         (on_time, off_time) as UTC datetime objects or (None, None)
         if the sun never crosses the angle on this night.
     """
+    # Same reason as in the drivers, and here it matters twice over: this
+    # search makes 1440 solar calculations per night, and astropy's defaults
+    # would spend the first of them waiting on two web servers and then raise
+    # rather than return a number. See cameras/common/sun.py.
+    from cameras.common.sun import configure_iers
+    configure_iers()
+
     from astropy.coordinates import get_sun, AltAz
     from astropy.time import Time
 
