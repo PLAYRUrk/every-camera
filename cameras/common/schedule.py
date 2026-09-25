@@ -11,11 +11,16 @@ different observing programmes:
   readout``, where ``delta`` is seconds from the start of the cycle. The period
   is ``schedule_len`` when configured, otherwise derived: last delta + that
   exposure + that entry's readout.
-* **sun_cycle** — the same cycle as *time*, but anchored to the evening the sun
-  drops to ``sun_max_angle`` instead of to a wall-clock time. This is what
-  imagerd_rt did (``imagerd_rt.c:531-738``): nothing is exposed until the sun is
-  low enough, the pre-darks are timed to finish just as that happens, and the
-  cycle then free-runs from the first whole minute of the window.
+* **sun_cycle** — the same cycle as *time*, but *started* by the sun: nothing
+  is exposed until the solar altitude drops to ``sun_max_angle``, and the
+  pre-darks are timed to finish just as that happens, which is what imagerd_rt
+  did (``imagerd_rt.c:531-738``). The cycle's *phase* is still locked to
+  ``t_start``, read as **UTC** in this mode (:func:`utc_cycle_anchor`): the run
+  joins the cycle at whichever slot is due when the window opens, so that at
+  ``t_start`` the cycle is at its slot zero. Stations at different sites — and
+  so with different moments of the same solar altitude — then run the same
+  cycle in step. Without a ``t_start`` the cycle falls back to imagerd_rt's own
+  anchor, the first whole minute of the window.
 
 Entries come from ``config.json`` (a list of objects, the normal case), from a
 converted imagerd_rt schedule in JSON, or from a legacy asi-camera
@@ -528,16 +533,26 @@ def schedule_snapshot(sched):
     """
     if sched is None:
         return {}
+    mode = getattr(sched, "mode", "")
     t_start = getattr(sched, "t_start", None)
     entries = list(getattr(sched, "entries", None) or [])
+    if mode == "sun_cycle" and t_start is not None:
+        # In this mode ``t_start`` is already UTC; the local reading is the
+        # derived one.
+        anchor = utc_cycle_anchor(t_start, datetime.now())
+        t_start_local = anchor.strftime("%H:%M:%S")
+        t_start_utc = t_start.strftime("%H:%M:%S")
+    else:
+        t_start_local = t_start.strftime("%H:%M:%S") if t_start else None
+        t_start_utc = _as_utc_time(t_start)
     return {
-        "mode": getattr(sched, "mode", ""),
-        "t_start": t_start.strftime("%H:%M:%S") if t_start else None,
+        "mode": mode,
+        "t_start": t_start_local,
         # The same instant in UTC. Frame names are UTC on every camera that
         # writes them, and an observer never learns the station's offset — so
         # the anchor has to travel in the clock the names are in, and only the
         # camera can convert it.
-        "t_start_utc": _as_utc_time(t_start),
+        "t_start_utc": t_start_utc,
         "period": float(getattr(sched, "period", 0.0) or 0.0),
         "dead_time": float(getattr(sched, "dead_time", 0.0) or 0.0),
         "entries": [{"filter": e.filter, "delta": e.delta,
@@ -592,6 +607,30 @@ def cycle_anchor(t_start, now):
     if now - anchor > timedelta(hours=12):
         return anchor + timedelta(days=1)
     return anchor
+
+
+def utc_cycle_anchor(t_start_utc, now):
+    """The occurrence of the UTC time of day ``t_start_utc`` nearest to ``now``.
+
+    The ``sun_cycle`` counterpart of :func:`cycle_anchor`. There ``t_start`` is
+    the station's own wall clock, which is right for one station on its own;
+    here it is UTC, because the point of the mode is that stations in different
+    places — possibly in different time zones — share one cycle phase.
+
+    ``now`` is a naive local datetime, as everywhere in the drivers, and so is
+    the answer: the anchor is the UTC instant converted back to local time, so it
+    can be handed straight to :func:`next_cycle_slot`. The nearest occurrence in
+    either direction is chosen, for the reason :func:`cycle_anchor` gives.
+    """
+    from .timeutil import to_utc
+
+    now_utc = to_utc(now)
+    anchor = datetime.combine(now_utc.date(), t_start_utc, tzinfo=timezone.utc)
+    if anchor - now_utc > timedelta(hours=12):
+        anchor -= timedelta(days=1)
+    elif now_utc - anchor > timedelta(hours=12):
+        anchor += timedelta(days=1)
+    return anchor.astimezone().replace(tzinfo=None)
 
 
 def next_second_slot(seconds, now=None):

@@ -21,6 +21,7 @@ import intensity
 
 from . import schedule as schedule_mod
 from ..common import cfgparse
+from ..common import filters as common_filters
 
 DEFAULT_MODE = "sun"
 
@@ -41,17 +42,10 @@ SATURATION_ADU = float(intensity.FULL_SCALE)
 # plans sub-frames tighter than this, whatever the config asks for.
 ARCHIVE_NAME_RESOLUTION = 1.0
 
-# The Tory instrument's wheel, from imagerd_rt's imager.conf. Overridable
-# through ``asi.filters``; a station with a different wheel says so there.
-DEFAULT_FILTERS = [
-    {"slot": 1, "wavelength": "5577", "description": "557.7nm x 2.0nm"},
-    {"slot": 2, "wavelength": "6300", "description": "630.0nm x 2.0nm"},
-    {"slot": 3, "wavelength": "OH__",
-     "description": "Broadband OH with 18 nm notch at 865.0nm"},
-    {"slot": 4, "wavelength": "8400", "description": "840.0nm x 1.8nm"},
-    {"slot": 5, "wavelength": "8465", "description": "846.5nm x 1.8nm"},
-    {"slot": 6, "wavelength": "8570", "description": "857.0nm x 1.8nm"},
-]
+# The Tory instrument's wheel lives in cameras/common/filters.py now, shared
+# with the japan imager's sun_cycle mode; re-exported under the old names.
+DEFAULT_FILTERS = common_filters.DEFAULT_FILTERS
+FilterInfo = common_filters.FilterInfo
 
 
 @dataclass
@@ -96,20 +90,6 @@ class LocationCfg:
 
 
 @dataclass
-class FilterInfo:
-    """One filter wheel position, as imagerd_rt's ``imager.conf`` described it.
-
-    The wavelength is a *tag*, not a number: the OH channel is spelled ``OH__``
-    in the archive, and both the file name and the ``FilterWavelength`` header
-    have always carried it that way.
-    """
-
-    slot: int = 0
-    wavelength: str = ""
-    description: str = ""
-
-
-@dataclass
 class StationCfg:
     """Identity written into every frame, carried over from imagerd_rt."""
 
@@ -125,7 +105,9 @@ class StationCfg:
 class ScheduleCfg:
     mode: str = DEFAULT_MODE
     sun_max_angle: float = -10.0
-    t_start: time = None              # time mode: phase reference of the cycle
+    # Phase reference of the cycle: local time in ``time`` mode, UTC in
+    # ``sun_cycle`` mode.
+    t_start: time = None
     entries: list = field(default_factory=list)
     dark_frames: int = 3
     dead_time: float = 5.0
@@ -199,10 +181,7 @@ class AsiConfig:
         still has to be saved — an unknown filter must cost the header its
         wavelength, not the night its data.
         """
-        for entry in self.filters:
-            if entry.slot == number:
-                return entry
-        return FilterInfo(slot=number or 0)
+        return common_filters.lookup(self.filters, number)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +299,9 @@ def from_dict(asi_cfg):
     if mode == "time" and t_start is None:
         errors.append("asi.t_start is required in 'time' mode (HH:MM); using 20:00")
         t_start = time(20, 0)
+    # ``sun_cycle`` without a ``t_start`` is legitimate — a converted imagerd_rt
+    # schedule has none — and keeps imagerd_rt's whole-minute anchor. With one,
+    # it is read as UTC and the cycle phase is locked to it.
 
     schedule_len = None
     raw_len = settings.get("schedule_len")
@@ -486,22 +468,4 @@ def _overexposure(raw, errors):
 
 def _filters(raw):
     """Build the wheel table, falling back to the Tory instrument's."""
-    entries, errors = [], []
-    for index, item in enumerate(raw if isinstance(raw, list) and raw
-                                 else DEFAULT_FILTERS, 1):
-        if not isinstance(item, dict):
-            errors.append(f"asi.filters[{index}]: expected an object, got "
-                          f"{type(item).__name__}")
-            continue
-        try:
-            slot = int(item.get("slot", item.get("filter", index)))
-        except (TypeError, ValueError):
-            errors.append(f"asi.filters[{index}]: slot must be an integer, got "
-                          f"{item.get('slot')!r}")
-            continue
-        entries.append(FilterInfo(
-            slot=slot,
-            wavelength=str(item.get("wavelength", "") or ""),
-            description=str(item.get("description", "") or ""),
-        ))
-    return entries, errors
+    return common_filters.parse_filters(raw, what="asi.filters")

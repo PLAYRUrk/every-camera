@@ -15,6 +15,12 @@ schedule line must not cost a night. This is also where the camera's own policy
 lives — which schedule modes it runs, which readout speeds and binnings the sensor
 takes — since ``cameras/common/schedule.py`` deliberately carries the union of both
 imagers' vocabularies and does not know who is asking.
+
+The ``sun_cycle`` mode brings three settings of its own, because its frames are
+filed in the ASI imager's archive layout: ``name`` (the instrument name, written
+into the ``NAME`` card and into the file name), ``location.name`` (the observing
+site's name, the file name's site field and the ``SiteID`` record) and
+``filters`` (the wheel table whose wavelength tags go into the name).
 """
 from __future__ import annotations
 
@@ -22,15 +28,21 @@ from dataclasses import dataclass, field
 from datetime import time
 
 from ..common import cfgparse
+from ..common import filters as common_filters
 from ..common import schedule as schedule_mod
 
 DEFAULT_MODE = "sun"
 
-# The two schedule shapes the Hamamatsu program had, and the only two this driver
-# runs. ``sun_cycle`` exists in the shared schedule module but belongs to the ASI
-# imager: it is imagerd_rt's night, anchored to the sun with automatic exposures,
-# and nothing in this programme corresponds to it.
-JAPAN_MODES = ("sun", "time")
+# The two schedule shapes the Hamamatsu program had, plus ``sun_cycle``: the
+# general cycle of ``time`` mode, started by the sun and phase-locked to
+# ``t_start`` in UTC, so that this camera and the ASI imager — or two stations
+# far apart — run the same cycle in step. The ASI imager's automatic exposure
+# and slot splitting are not part of it here.
+JAPAN_MODES = ("sun", "time", "sun_cycle")
+
+# Characters a name may not carry into the ``sun_cycle`` file name: ``_``
+# separates its fields, and the rest would make a path or a broken name.
+_NAME_FORBIDDEN = frozenset('_/\\ \t:*?"<>|')
 
 # DCAM READOUTSPEED on this camera: 1 is the slow, low-noise readout and 2 the
 # fast one. The property is an enumeration, not a range, so a third value is a
@@ -63,16 +75,19 @@ class FilterWheelCfg:
 
 @dataclass
 class LocationCfg:
+    name: str = ""                    # observing site; sun_cycle file names
     lat: float = 0.0
     lon: float = 0.0
-    elevation: float = 0.0
+    elevation: float = 0.0            # height above sea level, metres
 
 
 @dataclass
 class ScheduleCfg:
     mode: str = DEFAULT_MODE
     sun_max_angle: float = -10.0
-    t_start: time = None              # time mode: phase reference of the cycle
+    # Phase reference of the cycle: local time in ``time`` mode, UTC in
+    # ``sun_cycle`` mode.
+    t_start: time = None
     entries: list = field(default_factory=list)
     dark_frames: int = 3
     dead_time: float = 5.0
@@ -80,7 +95,7 @@ class ScheduleCfg:
 
     @property
     def period(self):
-        """Length of one general cycle (``time`` mode only).
+        """Length of one general cycle (``time`` and ``sun_cycle`` modes).
 
         Derived from the slots — last delta plus that exposure plus the dead
         time — which is what the Hamamatsu program did and what its schedules
@@ -97,9 +112,11 @@ class ScheduleCfg:
 @dataclass
 class JapanConfig:
     output_dir: str = ""
+    name: str = ""                    # instrument name: NAME card, sun_cycle names
     camera: CameraCfg = field(default_factory=CameraCfg)
     filter_wheel: FilterWheelCfg = field(default_factory=FilterWheelCfg)
     location: LocationCfg = field(default_factory=LocationCfg)
+    filters: list = field(default_factory=list)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
     wait_for_enter: bool = True
     errors: list = field(default_factory=list)
@@ -107,6 +124,25 @@ class JapanConfig:
     @property
     def simulated(self):
         return self.camera.backend == "sim"
+
+    def filter_info(self, number):
+        """The wheel position's wavelength tag and description (``sun_cycle``)."""
+        return common_filters.lookup(self.filters, number)
+
+
+def clean_name(value, what, errors):
+    """``value`` made safe for the ``sun_cycle`` file name, with a note if changed.
+
+    The name is ``..._SITE_NAME_WAVE_...``, split on underscores by whatever
+    reads it back, so an underscore inside a field would silently shift every
+    field after it.
+    """
+    text = str(value or "").strip()
+    cleaned = "".join("-" if ch in _NAME_FORBIDDEN else ch for ch in text)
+    if cleaned != text:
+        errors.append(f"{what} {text!r} carries characters a file name field "
+                      f"cannot hold; using {cleaned!r}")
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +200,7 @@ def from_dict(japan_cfg):
 
     loc_cfg = cfgparse.sub(japan_cfg, "location")
     location = LocationCfg(
+        name=str(loc_cfg.get("name", "") or "").strip(),
         lat=cfgparse.as_float(loc_cfg, "lat", 0.0),
         lon=cfgparse.as_float(loc_cfg, "lon", 0.0),
         elevation=cfgparse.as_float(loc_cfg, "elevation", 0.0),
@@ -171,14 +208,8 @@ def from_dict(japan_cfg):
 
     mode = str(japan_cfg.get("mode", DEFAULT_MODE)).strip().lower()
     if mode not in JAPAN_MODES:
-        extra = ""
-        if mode in schedule_mod.MODES:
-            # Almost certainly a config copied from the ASI camera. Saying so is
-            # the difference between a five-second fix and an evening of puzzling.
-            extra = (f" ({mode!r} belongs to the asi camera, which has modes "
-                     f"{schedule_mod.MODES})")
-        errors.append(f"japan.mode must be one of {JAPAN_MODES}, got {mode!r}"
-                      f"{extra}; using {DEFAULT_MODE!r}")
+        errors.append(f"japan.mode must be one of {JAPAN_MODES}, got {mode!r}; "
+                      f"using {DEFAULT_MODE!r}")
         mode = DEFAULT_MODE
 
     overrides = {}
@@ -222,6 +253,9 @@ def from_dict(japan_cfg):
         errors.append("japan.t_start is required in 'time' mode (HH:MM); "
                       "using 20:00")
         t_start = time(20, 0)
+    # In ``sun_cycle`` mode ``t_start`` is UTC and optional: without it the
+    # cycle is anchored to the first whole minute of the window, as the ASI
+    # imager does, and is simply not in step with any other station.
 
     schedule_len = None
     raw_len = settings.get("schedule_len")
@@ -257,11 +291,31 @@ def from_dict(japan_cfg):
                       f"{sched.dark_frames}; using 0")
         sched.dark_frames = 0
 
+    filters, filter_errors = common_filters.parse_filters(
+        japan_cfg.get("filters"), what="japan.filters")
+    errors.extend(filter_errors)
+
+    name = clean_name(japan_cfg.get("name", ""), "japan.name", errors)
+    location.name = clean_name(location.name, "japan.location.name", errors)
+    if mode == "sun_cycle":
+        # Both go into every file name; an empty field would still have to be
+        # parsed, so it is filled with something that says what is missing.
+        if not name:
+            errors.append("japan.name is not set; sun_cycle frames are named and "
+                          "headed with 'JAPAN'")
+            name = "JAPAN"
+        if not location.name:
+            errors.append("japan.location.name is not set; sun_cycle frames are "
+                          "named with 'SITE'")
+            location.name = "SITE"
+
     return JapanConfig(
         output_dir=str(japan_cfg.get("output_dir", "") or ""),
+        name=name,
         camera=camera,
         filter_wheel=wheel,
         location=location,
+        filters=filters,
         schedule=sched,
         wait_for_enter=cfgparse.as_bool(japan_cfg, "wait_for_enter", True),
         errors=errors,

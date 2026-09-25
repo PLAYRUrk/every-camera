@@ -19,25 +19,20 @@ eight characters become HIERARCH cards, which keeps the spelling intact;
 astropy reads them back under the same name.
 """
 from __future__ import annotations
-import warnings
 
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
-from astropy.io.fits.verify import VerifyWarning
 
-from ..common.fits import (
+# The legacy records themselves are written by ``write_legacy_keys``, shared with
+# the Hamamatsu imager's ``sun_cycle`` frames; importing it also silences
+# astropy's HIERARCH warning for them.
+from ..common.fits import (  # noqa: F401
     UNKNOWN_TEMP, utc_string as _utc_string, write_core_header, write_image,
+    write_legacy_keys,
 )
-
-# The long legacy names deliberately become HIERARCH cards. astropy warns once
-# per card, which would be five lines of noise for every frame of every night;
-# the choice is made knowingly, so the warning is silenced here rather than
-# left to whoever reads the console. Only this writer produces such cards.
-warnings.filterwarnings("ignore", category=VerifyWarning,
-                        message=r"Keyword name .* is greater than 8 characters")
 
 # imagerd_rt's own version string (``SOFTWARE_VERSION``, imagerd_rt.h:95). The
 # processing program has always seen "3.0" here.
@@ -129,14 +124,14 @@ def write_fits(
         h["SPLITNUM"] = (int(split_count), "sub-frames this slot was divided into")
         h["SPLITIDX"] = (int(split_index), "index of this sub-frame, 1-based")
 
-    _write_legacy_keys(
+    write_legacy_keys(
         h,
         binning=binning,
         bit_depth=bit_depth,
         gain=gain,
         ccd_temp=ccd_temp,
         exposure_sec=exposure_sec,
-        readout_speed=readout_speed,
+        readout_speed_text=_readout_speed_text(readout_speed),
         seqno=seqno,
         site_id=site_id,
         device_id=device_id,
@@ -150,38 +145,3 @@ def write_fits(
     )
     write_image(path, data, h)
 
-
-def _write_legacy_keys(h, *, binning, bit_depth, gain, ccd_temp, exposure_sec,
-                       readout_speed, seqno, site_id, device_id, lat, lon,
-                       filter_num, filter_wavelength, filter_description,
-                       fw_temp, legacy_version) -> None:
-    """Append imagerd_rt's sixteen metadata records, in its own order.
-
-    Values keep the original formatting, down to ``Exposure`` being a string in
-    milliseconds and the coordinates being rounded to two decimals: the
-    processing program parses what the old archive contains, not what would be
-    tidier here.
-    """
-    # ``Binning`` uppercases onto the BINNING card written above — same value,
-    # same meaning, so the duplicate spelling costs nothing.
-    h["Binning"] = (binning, "pixel binning NxN")
-    if bit_depth is not None:
-        h["BitDepth"] = (bit_depth, "sensor bit depth")
-    if gain is not None:
-        h["CCDGain"] = (gain, "ADC analog gain: 1 Low, 2 Medium, 3 High")
-    h["CCDTemp"] = (round(ccd_temp if ccd_temp is not None else UNKNOWN_TEMP, 2),
-                    "[C] CCD sensor temperature")
-    h["Exposure"] = (f"{float(exposure_sec) * 1000:.2f} ms", "exposure duration")
-    h["ReadoutSpeed"] = (_readout_speed_text(readout_speed), "ADC readout speed")
-    if seqno is not None:
-        h["SEQNO"] = (seqno, "archive frame sequence number")
-    h["SiteID"] = (site_id, "station identifier")
-    h["DeviceID"] = (device_id, "imager identifier")
-    h["Latitude"] = (round(float(lat), 2), "[deg] observatory latitude")
-    h["Longitude"] = (round(float(lon), 2), "[deg] observatory longitude")
-    h["FilterWavelength"] = (filter_wavelength, "filter wavelength tag")
-    h["FilterPosition"] = (filter_num, "filter wheel position")
-    h["FilterDescription"] = (filter_description, "filter description")
-    h["FWTemp"] = (round(fw_temp if fw_temp is not None else UNKNOWN_TEMP, 2),
-                   "[C] filter wheel temperature")
-    h["Version"] = (legacy_version, "imagerd_rt metadata version")

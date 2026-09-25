@@ -7,7 +7,9 @@ That is kept: the station's processing program matches these names, and the
 per-night directory is what makes a flat layout workable at all.
 
 This is deliberately **not** the ASI archive: no ``YYYY/MM/DD`` tree, no site or
-device fields, no exposure in the name — see ``cameras/asi/paths.py`` for that one.
+device fields, no exposure in the name — see ``cameras/common/archive_paths.py``
+for that one. The ``sun`` and ``time`` modes file here; ``sun_cycle`` files into
+the ASI archive, named with ``japan.location.name`` and ``japan.name``.
 
 The timestamp is UTC, where japan-camera used local time. The old program's
 ``DATE-OBS`` claimed UTC while holding local time, so one of the two had to move;

@@ -235,7 +235,8 @@ DEFAULT_CONFIG = {
         "output_dir": "",
         "mode": "sun",                  # "sun", "time" or "sun_cycle"
         "sun_max_angle": -10.0,         # sun/sun_cycle: start below this altitude
-        "t_start": "20:00",             # time mode: phase reference of the cycle
+        "t_start": "20:00",             # cycle phase reference: local time in
+                                        # time mode, UTC in sun_cycle mode
         "schedule_len": None,           # cycle length, s (None = derive from slots)
         "dark_frames": 3,
         "dead_time": 5.0,
@@ -322,25 +323,29 @@ DEFAULT_CONFIG = {
     },
     # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor
     # filter wheel the ASI camera uses. This is the older of the two observing
-    # programmes — two schedule modes, no cooling control, no automatic exposure —
-    # so its block is much smaller than the asi one above.
+    # programmes — no cooling control, no automatic exposure — so its block is
+    # much smaller than the asi one above.
     "japan": {
         "instance_name": "",
-        "output_dir": "",               # frames land here flat, one dir per night
-        "mode": "sun",                  # "sun" or "time" ("sun_cycle" is asi-only)
-        "sun_max_angle": -10.0,         # sun mode: start below this altitude
-        "t_start": "20:00",             # time mode: phase reference of the cycle
+        "output_dir": "",               # sun/time: frames land here flat, one dir
+                                        # per night; sun_cycle: YYYY/MM/DD tree
+        "name": "",                     # instrument name: the NAME card and the
+                                        # sun_cycle file name
+        "mode": "sun",                  # "sun", "time" or "sun_cycle"
+        "sun_max_angle": -10.0,         # sun/sun_cycle: start below this altitude
+        "t_start": "20:00",             # cycle phase reference: local time in
+                                        # time mode, UTC in sun_cycle mode
         "dark_frames": 3,
         "dead_time": 5.0,
-        "schedule_len": None,           # time mode: cycle period, s; None -> derived.
+        "schedule_len": None,           # cycle modes: period, s; None -> derived.
                                         # A schedule file may state its own with a
                                         # "period = 1440" header, which is the place
                                         # it stays in step with the slots below it.
         "wait_for_enter": True,         # time mode: wait for the operator to start
         "schedule_file": "",            # legacy japan-camera schedule.txt, or .json
         "schedule": [],                 # sun:  {"filter":3,"exposure":30,"seconds":[0,30]}
-                                        # time: {"delta":100,"filter":3,"exposure":25,
-                                        #        "binning":1}
+                                        # time/sun_cycle: {"delta":100,"filter":3,
+                                        #        "exposure":25,"binning":1}
         "camera": {
             "backend": "dcam",          # "dcam" (real SDK) or "sim"
             "readout_speed": 2,         # 1 slow / low noise, 2 fast
@@ -353,10 +358,15 @@ DEFAULT_CONFIG = {
             "move_timeout": 8.0,
         },
         "location": {
+            "name": "",                 # observing site: sun_cycle file names, SiteID
             "lat": 0.0,
             "lon": 0.0,
-            "elevation": 0.0,
+            "elevation": 0.0,           # height above sea level, m
         },
+        # Wheel table for sun_cycle names and headers; empty = the Tory wheel
+        # (cameras/common/filters.py). {"slot":1,"wavelength":"5577",
+        # "description":"557.7nm x 2.0nm"}
+        "filters": [],
     },
     "sentry": {
         "instance_name": "",
@@ -944,6 +954,11 @@ def configure_console_asi(cfg, config_path=None):
     if asi["mode"] == "time":
         asi["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
                               asi.get("t_start", "20:00"))
+    elif asi["mode"] == "sun_cycle":
+        # UTC, so stations in different places and time zones share one phase.
+        asi["t_start"] = _ask("Cycle phase reference T_start, UTC (HH:MM; "
+                              "empty = first whole minute of the window)",
+                              asi.get("t_start", "") or "")
     if asi["mode"] in ("time", "sun_cycle"):
         asi["schedule_len"] = _ask_float(
             "Cycle length (s, 0 = derive from the slots)",
@@ -1044,8 +1059,9 @@ def configure_console_japan(cfg, config_path=None):
     location = japan.get("location", _deep_copy(DEFAULT_CONFIG["japan"]["location"]))
     print("\n--- Japan (Hamamatsu DCAM) Camera Configuration ---\n")
 
-    print("Frames are written flat into this directory, so a directory per night "
-          "is the usual arrangement.")
+    print("In sun and time mode frames are written flat into this directory, so a "
+          "directory per night is the usual arrangement; sun_cycle files them "
+          "into a YYYY/MM/DD tree under it.")
     japan["output_dir"] = _ask("Output directory for FITS files",
                                japan.get("output_dir", ""))
     japan["instance_name"] = _ask("Instance name (auto if empty)",
@@ -1065,18 +1081,30 @@ def configure_console_japan(cfg, config_path=None):
         wheel["baudrate"] = _ask_int("Filter wheel baudrate",
                                      wheel.get("baudrate", 9600))
 
+    location["name"] = _ask("Site name (e.g. TORY)", location.get("name", ""))
     location["lat"] = _ask_float("Site latitude (degrees)", location.get("lat", 0.0))
     location["lon"] = _ask_float("Site longitude (degrees)", location.get("lon", 0.0))
-    location["elevation"] = _ask_float("Site elevation (m)",
+    location["elevation"] = _ask_float("Site elevation above sea level (m)",
                                        location.get("elevation", 0.0))
+    # Written into the NAME card, and with the site name into sun_cycle names.
+    japan["name"] = _ask("Instrument name (e.g. HAMA1)", japan.get("name", ""))
 
-    mode = _ask("Schedule mode (sun / time)", japan.get("mode", "sun"))
-    japan["mode"] = mode if mode in ("sun", "time") else "sun"
-    if japan["mode"] == "sun":
+    mode = _ask("Schedule mode (sun / time / sun_cycle)", japan.get("mode", "sun"))
+    japan["mode"] = mode if mode in ("sun", "time", "sun_cycle") else "sun"
+    if japan["mode"] in ("sun", "sun_cycle"):
         japan["sun_max_angle"] = _ask_float(
             "Start when the solar altitude drops below (degrees)",
             japan.get("sun_max_angle", -10.0))
-    else:
+    if japan["mode"] == "sun_cycle":
+        # UTC, so stations in different places and time zones share one phase.
+        japan["t_start"] = _ask("Cycle phase reference T_start, UTC (HH:MM; "
+                                "empty = first whole minute of the window)",
+                                japan.get("t_start", "") or "")
+        period = _ask_float("Cycle period in seconds "
+                            "(0 = derive it from the last slot)",
+                            float(japan.get("schedule_len") or 0.0))
+        japan["schedule_len"] = period if period > 0 else None
+    elif japan["mode"] == "time":
         japan["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
                                 japan.get("t_start", "20:00"))
         # A schedule file may say this itself with a "period = 1440" header, and
@@ -1107,7 +1135,7 @@ def configure_console_japan(cfg, config_path=None):
                 "filter": _ask_int("    Filter (1-6)", 1),
                 "exposure": _ask_float("    Exposure (s)", 30.0),
             }
-            if japan["mode"] == "time":
+            if japan["mode"] in ("time", "sun_cycle"):
                 slot["delta"] = _ask_float("    Offset from the cycle start (s)", 0.0)
                 slot["binning"] = _ask_int("    Binning", camera.get("binning", 1))
             else:

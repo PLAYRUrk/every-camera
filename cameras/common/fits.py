@@ -16,19 +16,45 @@ Values are written through untouched. That is what lets one function serve a
 ``READSPD`` of ``2.0`` MHz for the PIXIS and an ``int`` speed setting of ``2`` for
 the Hamamatsu without either camera's spelling leaking into the other's frames;
 the differing comment text comes in through ``comments``.
+
+``instrument=False`` leaves out every card that describes the camera and its
+software (``INSTRUME``, ``VENDOR``, ``CAMSN``, ``CAMVER``, ``DRVVER``,
+``DCAMVER``). The Hamamatsu imager's ``sun_cycle`` frames are written that way:
+they carry the instrument's name in one ``NAME`` card, set in config.json, and
+nothing about which camera took them.
+
+:func:`write_legacy_keys` appends the sixteen records imagerd_rt attached to
+every frame. The ASI imager writes all of them; ``sun_cycle`` frames of the
+Hamamatsu imager write them with ``instrument=False``, which drops the four
+that describe the camera or the program (``BitDepth``, ``CCDGain``,
+``DeviceID``, ``Version``).
 """
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 
+import warnings
+
 import numpy as np
 
 from astropy.io import fits
+from astropy.io.fits.verify import VerifyWarning
 
 import intensity
 
 from .timeutil import to_utc
+
+# The long legacy names deliberately become HIERARCH cards. astropy warns once
+# per card, which would be five lines of noise for every frame of every night;
+# the choice is made knowingly, so the warning is silenced here rather than
+# left to whoever reads the console. Only the legacy writer produces such cards.
+warnings.filterwarnings("ignore", category=VerifyWarning,
+                        message=r"Keyword name .* is greater than 8 characters")
+
+# The cards that say which camera and which software took a frame. Left out of
+# the header when ``write_core_header`` is called with ``instrument=False``.
+INSTRUMENT_CARDS = ("INSTRUME", "VENDOR", "CAMSN", "CAMVER", "DRVVER", "DCAMVER")
 
 # Written where a program had a reading it could not take. imagerd_rt's value,
 # kept because the station's processing program tests for it.
@@ -89,12 +115,16 @@ def write_core_header(
     elevation: float,
     date_loc: bool,
     comments: dict | None = None,
+    instrument: bool = True,
 ) -> None:
     """Append the shared cards to ``h``, in the order the archive has them.
 
     ``date_loc`` has no default on purpose: whether a camera writes the local
     timestamp is a property of its archive, and both callers say so out loud
     rather than inheriting whatever happened to be convenient here.
+
+    ``instrument=False`` skips :data:`INSTRUMENT_CARDS`; the values passed for
+    them are then simply not used.
     """
     say = dict(CORE_COMMENTS, **(comments or {}))
     h["DATE-OBS"] = (utc_string(timestamp), say["DATE-OBS"])
@@ -108,12 +138,13 @@ def write_core_header(
                      say["CCD-TEMP"])
     h["IMAGETYP"] = (image_type, say["IMAGETYP"])
     h["OBSMODE"] = (obs_mode, say["OBSMODE"])
-    h["INSTRUME"] = (camera_model, say["INSTRUME"])
-    h["VENDOR"] = (camera_vendor, say["VENDOR"])
-    h["CAMSN"] = (camera_sn, say["CAMSN"])
-    h["CAMVER"] = (camera_version, say["CAMVER"])
-    h["DRVVER"] = (driver_version, say["DRVVER"])
-    h["DCAMVER"] = (dcam_version, say["DCAMVER"])
+    if instrument:
+        h["INSTRUME"] = (camera_model, say["INSTRUME"])
+        h["VENDOR"] = (camera_vendor, say["VENDOR"])
+        h["CAMSN"] = (camera_sn, say["CAMSN"])
+        h["CAMVER"] = (camera_version, say["CAMVER"])
+        h["DRVVER"] = (driver_version, say["DRVVER"])
+        h["DCAMVER"] = (dcam_version, say["DCAMVER"])
     h["SITELAT"] = (lat, say["SITELAT"])
     h["SITELON"] = (lon, say["SITELON"])
     h["SITEELEV"] = (elevation, say["SITEELEV"])
@@ -123,6 +154,49 @@ def write_core_header(
     # PIXIS's own ``BitDepth`` card says the same thing in imagerd_rt's words
     # and stays where it is, in the ASI writer.
     h["ADCFULL"] = (intensity.FULL_SCALE, say["ADCFULL"])
+
+
+def write_legacy_keys(h, *, binning, bit_depth, gain, ccd_temp, exposure_sec,
+                      readout_speed_text, seqno, site_id, device_id, lat, lon,
+                      filter_num, filter_wavelength, filter_description,
+                      fw_temp, legacy_version, instrument=True) -> None:
+    """Append imagerd_rt's sixteen metadata records, in its own order.
+
+    Values keep the original formatting, down to ``Exposure`` being a string in
+    milliseconds and the coordinates being rounded to two decimals: the
+    processing program parses what the old archive contains, not what would be
+    tidier here. ``readout_speed_text`` arrives already worded, because the two
+    cameras word it differently (``2 MHz`` against ``2 (fast)``).
+
+    ``instrument=False`` drops the records that describe the camera or the
+    program rather than the frame: ``BitDepth``, ``CCDGain``, ``DeviceID`` and
+    ``Version``.
+    """
+    # ``Binning`` uppercases onto the BINNING card written above — same value,
+    # same meaning, so the duplicate spelling costs nothing.
+    h["Binning"] = (binning, "pixel binning NxN")
+    if instrument and bit_depth is not None:
+        h["BitDepth"] = (bit_depth, "sensor bit depth")
+    if instrument and gain is not None:
+        h["CCDGain"] = (gain, "ADC analog gain: 1 Low, 2 Medium, 3 High")
+    h["CCDTemp"] = (round(ccd_temp if ccd_temp is not None else UNKNOWN_TEMP, 2),
+                    "[C] CCD sensor temperature")
+    h["Exposure"] = (f"{float(exposure_sec) * 1000:.2f} ms", "exposure duration")
+    h["ReadoutSpeed"] = (readout_speed_text, "ADC readout speed")
+    if seqno is not None:
+        h["SEQNO"] = (seqno, "archive frame sequence number")
+    h["SiteID"] = (site_id, "station identifier")
+    if instrument:
+        h["DeviceID"] = (device_id, "imager identifier")
+    h["Latitude"] = (round(float(lat), 2), "[deg] observatory latitude")
+    h["Longitude"] = (round(float(lon), 2), "[deg] observatory longitude")
+    h["FilterWavelength"] = (filter_wavelength, "filter wavelength tag")
+    h["FilterPosition"] = (filter_num, "filter wheel position")
+    h["FilterDescription"] = (filter_description, "filter description")
+    h["FWTemp"] = (round(fw_temp if fw_temp is not None else UNKNOWN_TEMP, 2),
+                   "[C] filter wheel temperature")
+    if instrument:
+        h["Version"] = (legacy_version, "imagerd_rt metadata version")
 
 
 def write_image(path: Path, data: np.ndarray | None, header) -> None:

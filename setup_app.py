@@ -877,11 +877,14 @@ class AsiConfigTab:
         _add_label_row(sgrid, row, "Start below solar altitude:",
                        self.sb_sun_angle); row += 1
 
-        self.le_t_start = QLineEdit(str(c.get("t_start", "20:00")))
-        self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM. "
-                                   "Unused in sun_cycle mode, where the sun sets "
-                                   "the phase.")
-        _add_label_row(sgrid, row, "T_start (time mode):", self.le_t_start); row += 1
+        self.le_t_start = QLineEdit(str(c.get("t_start", "20:00") or ""))
+        self.le_t_start.setToolTip(
+            "The cycle phase reference, HH:MM.\ntime mode: local time.\n"
+            "sun_cycle mode: UTC — the sun starts the session, but the cycle is "
+            "at its first slot at this instant, at every station that sets it; "
+            "empty anchors the cycle to the first whole minute of the window.")
+        _add_label_row(sgrid, row, "T_start (time: local, sun_cycle: UTC):",
+                       self.le_t_start); row += 1
 
         self.sb_sched_len = QDoubleSpinBox()
         self.sb_sched_len.setRange(0.0, 86400.0)
@@ -1162,9 +1165,11 @@ class JapanConfigTab:
     """Builds and reads the Japan (Hamamatsu) all-sky imager configuration form.
 
     Deliberately smaller than :class:`AsiConfigTab`: this camera has no cooling to
-    configure, no automatic exposure and no overexposure guard, and its schedule
-    has two modes rather than three. The slot table has no gain or readout column
-    for the same reason — nothing here would read them.
+    configure, no automatic exposure and no overexposure guard. The slot table
+    has no gain or readout column for the same reason — nothing here would read
+    them. What it has that the ASI tab does not is the instrument name (the
+    ``NAME`` card) and the site's name, which ``sun_cycle`` puts into every
+    file name.
     """
 
     SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
@@ -1192,13 +1197,22 @@ class JapanConfigTab:
         row = 0
 
         self.le_output = QLineEdit(c.get("output_dir", ""))
-        self.le_output.setToolTip("Frames are written flat into this directory, "
-                                  "so one directory per night is usual")
+        self.le_output.setToolTip("sun/time: frames are written flat into this "
+                                  "directory, so one directory per night is "
+                                  "usual.\nsun_cycle: frames go into a "
+                                  "YYYY/MM/DD tree under it.")
         _add_dir_row(grid, row, "Output directory:", self.le_output); row += 1
 
         self.le_instance = QLineEdit(c.get("instance_name", ""))
         self.le_instance.setPlaceholderText("auto")
         _add_label_row(grid, row, "Instance name:", self.le_instance); row += 1
+
+        self.le_name = QLineEdit(c.get("name", ""))
+        self.le_name.setPlaceholderText("e.g. HAMA1")
+        self.le_name.setToolTip("Instrument name, written into the NAME card of "
+                                "sun_cycle frames and into their file name "
+                                "(…_SITE_NAME_WAVE_…). Underscores are replaced.")
+        _add_label_row(grid, row, "Instrument name:", self.le_name); row += 1
 
         self.cb_backend = QComboBox()
         self.cb_backend.addItems(["dcam", "sim"])
@@ -1258,6 +1272,13 @@ class JapanConfigTab:
         self.sb_move_timeout.setValue(float(wheel.get("move_timeout", 8.0)))
         _add_label_row(hgrid, row, "Move timeout:", self.sb_move_timeout); row += 1
 
+        self.le_site_name = QLineEdit(loc.get("name", ""))
+        self.le_site_name.setPlaceholderText("e.g. TORY")
+        self.le_site_name.setToolTip("Name of the observing site: the SiteID "
+                                     "record and the site field of sun_cycle "
+                                     "file names")
+        _add_label_row(hgrid, row, "Site name:", self.le_site_name); row += 1
+
         self.sb_lat = QDoubleSpinBox()
         self.sb_lat.setRange(-90.0, 90.0)
         self.sb_lat.setDecimals(6)
@@ -1275,7 +1296,8 @@ class JapanConfigTab:
         self.sb_elev.setDecimals(1)
         self.sb_elev.setSuffix(" m")
         self.sb_elev.setValue(float(loc.get("elevation", 0.0)))
-        _add_label_row(hgrid, row, "Elevation:", self.sb_elev); row += 1
+        _add_label_row(hgrid, row, "Elevation (above sea level):",
+                       self.sb_elev); row += 1
 
         root.addWidget(hw_box)
 
@@ -1283,13 +1305,16 @@ class JapanConfigTab:
         sched_box, sgrid = _group_grid("Schedule")
         row = 0
         self.cb_mode = QComboBox()
-        self.cb_mode.addItems(["sun", "time"])
-        self.cb_mode.setCurrentText(c.get("mode", "sun")
-                                    if c.get("mode") in ("sun", "time") else "sun")
+        self.cb_mode.addItems(["sun", "time", "sun_cycle"])
+        self.cb_mode.setCurrentText(
+            c.get("mode", "sun")
+            if c.get("mode") in ("sun", "time", "sun_cycle") else "sun")
         self.cb_mode.setToolTip(
             "'sun': shoot on given seconds while the sun is below the angle "
             "below.\n'time': repeat a fixed cycle from T_start.\n"
-            "('sun_cycle' belongs to the asi camera and is not offered here.)")
+            "'sun_cycle': the same cycle, started when the sun drops below the "
+            "angle, its phase locked to T_start in UTC; frames named and headed "
+            "as on the asi camera.")
         _add_label_row(sgrid, row, "Mode:", self.cb_mode); row += 1
 
         self.sb_sun_angle = QDoubleSpinBox()
@@ -1300,16 +1325,22 @@ class JapanConfigTab:
         _add_label_row(sgrid, row, "Start below solar altitude:",
                        self.sb_sun_angle); row += 1
 
-        self.le_t_start = QLineEdit(str(c.get("t_start", "20:00")))
-        self.le_t_start.setToolTip("Time mode: the cycle phase reference, HH:MM")
-        _add_label_row(sgrid, row, "T_start (time mode):", self.le_t_start); row += 1
+        self.le_t_start = QLineEdit(str(c.get("t_start", "20:00") or ""))
+        self.le_t_start.setToolTip(
+            "The cycle phase reference, HH:MM.\ntime mode: local time.\n"
+            "sun_cycle mode: UTC — the cycle is at its first slot at this "
+            "instant, at every station that sets it; empty anchors the cycle to "
+            "the first whole minute of the window.")
+        _add_label_row(sgrid, row, "T_start (time: local, sun_cycle: UTC):",
+                       self.le_t_start); row += 1
 
         self.sb_sched_len = QDoubleSpinBox()
         self.sb_sched_len.setRange(0.0, 86400.0)
         self.sb_sched_len.setDecimals(1)
         self.sb_sched_len.setSuffix(" s")
         self.sb_sched_len.setToolTip(
-            "Length of one cycle in time mode. 0 derives it from the last slot.\n"
+            "Length of one cycle in time and sun_cycle mode. 0 derives it from "
+            "the last slot.\n"
             "A schedule file may state its own with a 'period = 1440' header, "
             "which wins over this — that is where it stays in step with the slots.")
         self.sb_sched_len.setValue(float(c.get("schedule_len") or 0.0))
@@ -1349,8 +1380,8 @@ class JapanConfigTab:
         root.addWidget(sched_box)
 
         # ── Slot table ─────────────────────────────────────────────────────
-        slot_box = QGroupBox("Schedule slots  (delta+binning: time mode · "
-                             "seconds: sun mode)")
+        slot_box = QGroupBox("Schedule slots  (delta+binning: time/sun_cycle "
+                             "mode · seconds: sun mode)")
         slot_root = QVBoxLayout(slot_box)
         self._slot_table = QTableWidget(0, len(self.SLOT_HEADERS))
         self._slot_table.setHorizontalHeaderLabels(self.SLOT_HEADERS)
@@ -1440,6 +1471,7 @@ class JapanConfigTab:
         return {
             "instance_name": self.le_instance.text().strip(),
             "output_dir": self.le_output.text().strip(),
+            "name": self.le_name.text().strip(),
             "mode": self.cb_mode.currentText(),
             "sun_max_angle": self.sb_sun_angle.value(),
             "t_start": self.le_t_start.text().strip(),
@@ -1461,6 +1493,7 @@ class JapanConfigTab:
                 "move_timeout": self.sb_move_timeout.value(),
             },
             "location": {
+                "name": self.le_site_name.text().strip(),
                 "lat": self.sb_lat.value(),
                 "lon": self.sb_lon.value(),
                 "elevation": self.sb_elev.value(),

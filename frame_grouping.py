@@ -31,6 +31,8 @@ Provides:
   - frame_day()            — the ``YYYY-MM-DD`` a frame belongs to
   - group_by_session()     — measuring sessions, newest first (every camera)
   - parse_japan_frame()    — stamp / wheel position / dark flag off a japan name
+                             (flat ``sun``/``time`` names and ``sun_cycle``'s
+                             imagerd_rt-layout names alike)
   - detect_cycle_period()  — the general cycle's period, guessed from the frames
   - group_japan_cycles()   — sessions -> cycles -> filters (japan, ``time`` mode)
 """
@@ -63,6 +65,28 @@ UNKNOWN_DAY = "unknown date"
 SESSION_GAP = timedelta(hours=6)
 
 JAPAN_NAME_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)(_bg)?$", re.IGNORECASE)
+
+# The imagerd_rt layout: ``YYYYMMDD_hhmmss_SITE_DEV_WAVE_EEEEEEms[_DARK][_pf]``.
+# The japan camera writes it in ``sun_cycle`` mode (``cameras/common/
+# archive_paths.py``). The wavelength tag may itself hold underscores — the OH
+# channel is ``OH__`` — so it is matched lazily up to the exposure field.
+ARCHIVE_NAME_RE = re.compile(
+    r"^(\d{8}_\d{6})_([^_]+)_([^_]+)_(.+?)_(\d{6})ms(_DARK)?(_pf)?$",
+    re.IGNORECASE)
+
+# Wavelength tag -> wheel position, for reading a position back off an
+# imagerd_rt-layout name, which carries the tag instead. The Tory wheel, as in
+# ``cameras/common/filters.DEFAULT_FILTERS`` — spelled out here rather than
+# imported, this module staying free of the camera packages; a test keeps the
+# two in step.
+ARCHIVE_WAVELENGTH_SLOTS = {
+    "5577": 1,
+    "6300": 2,
+    "OH__": 3,
+    "8400": 4,
+    "8465": 5,
+    "8570": 6,
+}
 
 # Wheel positions of the Hamamatsu instrument, as the station's schedule file
 # documents them (see the comment at ``cameras/common/schedule.py:36``). The
@@ -193,21 +217,37 @@ def japan_filter_label(position):
 def parse_japan_frame(frame):
     """Read the capture time, wheel position and dark flag off a japan name.
 
-    ``None`` for anything that is not one — a hand-copied file, an ASI frame in a
-    shared directory, a screenshot — so a caller can show those unchanged rather
-    than invent a cycle for them.
+    Both of the camera's namings are read: the flat ``sun``/``time`` one and the
+    imagerd_rt layout ``sun_cycle`` writes, whose wavelength tag is mapped back
+    to a wheel position (0 for a tag the Tory wheel does not carry). ``None``
+    for anything else — a hand-copied file, a screenshot — so a caller can show
+    those unchanged rather than invent a cycle for them.
     """
     name = frame.get("name") if isinstance(frame, dict) else frame
-    stem = os.path.splitext(str(name or ""))[0]
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0]
     match = JAPAN_NAME_RE.match(stem)
     if not match:
-        return None
+        return _parse_archive_frame(frame, stem)
     try:
         stamp = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
     except ValueError:
         return None
     return {"frame": frame, "time": stamp, "filter": int(match.group(2)),
             "dark": bool(match.group(3))}
+
+
+def _parse_archive_frame(frame, stem):
+    """``parse_japan_frame`` for an imagerd_rt-layout (``sun_cycle``) name."""
+    match = ARCHIVE_NAME_RE.match(stem)
+    if not match:
+        return None
+    try:
+        stamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+    return {"frame": frame, "time": stamp,
+            "filter": ARCHIVE_WAVELENGTH_SLOTS.get(match.group(4).upper(), 0),
+            "dark": bool(match.group(6))}
 
 
 def cycle_score(lights, period):

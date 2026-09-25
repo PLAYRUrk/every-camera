@@ -2538,7 +2538,9 @@ class AsiTab(QWidget):
                     f"{sched.t_start.strftime('%H:%M') if sched.t_start else '?'}")
         elif sched.mode == "sun_cycle":
             text = (f"sun_cycle ≤ {sched.sun_max_angle:g}° · "
-                    f"{len(sched.entries)} slot(s) · period {sched.period:.0f} s")
+                    f"{len(sched.entries)} slot(s) · period {sched.period:.0f} s"
+                    f" · phase "
+                    f"{sched.t_start.strftime('%H:%M') + ' UTC' if sched.t_start else 'whole minute'}")
         else:
             text = (f"sun ≤ {sched.sun_max_angle:g}° · "
                     f"{len(sched.entries)} slot(s)")
@@ -2708,8 +2710,8 @@ class JapanTab(QWidget):
     mirrors its status through the CameraService and shows its log lines.
 
     The status block has no setpoint reading — this camera reports a sensor
-    temperature and has nothing to set it to — and the schedule summary knows two
-    modes rather than three.
+    temperature and has nothing to set it to. The schedule summary knows the same
+    three modes as the ASI tab's.
     """
 
     log_line = pyqtSignal(str, str)
@@ -2832,6 +2834,11 @@ class JapanTab(QWidget):
             text = (f"time · {len(sched.entries)} slot(s) · period "
                     f"{sched.period:.0f} s from "
                     f"{sched.t_start.strftime('%H:%M') if sched.t_start else '?'}")
+        elif sched.mode == "sun_cycle":
+            text = (f"sun_cycle ≤ {sched.sun_max_angle:g}° · "
+                    f"{len(sched.entries)} slot(s) · period {sched.period:.0f} s"
+                    f" · phase "
+                    f"{sched.t_start.strftime('%H:%M') + ' UTC' if sched.t_start else 'whole minute'}")
         else:
             text = (f"sun ≤ {sched.sun_max_angle:g}° · "
                     f"{len(sched.entries)} slot(s)")

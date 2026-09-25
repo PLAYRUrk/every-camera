@@ -161,10 +161,32 @@ def test_a_wheel_at_home_is_filter_zero():
 
 
 def test_a_foreign_name_is_not_read_as_a_japan_frame():
-    """An ASI frame in a shared directory must not be given a wheel position."""
-    assert fg.parse_japan_frame(
-        entry("20260729_140530_TOR_ASI_5577_055000ms.fits")) is None
     assert fg.parse_japan_frame(entry("screenshot.png")) is None
+    assert fg.parse_japan_frame(entry("20260729_140530_TORY.fits")) is None
+
+
+def test_a_sun_cycle_name_is_read_through_its_wavelength_tag():
+    """sun_cycle files frames in the imagerd_rt layout, tag instead of position."""
+    parsed = fg.parse_japan_frame(
+        entry("2026/07/29/20260729_140530_TORY_HAMA1_OH___000050ms.fits"))
+    assert parsed["filter"] == 3
+    assert parsed["dark"] is False
+    assert parsed["time"] == datetime(2026, 7, 29, 14, 5, 30)
+    dark = fg.parse_japan_frame(
+        entry("20260729_140530_TORY_HAMA1_5577_055000ms_DARK.fits"))
+    assert (dark["filter"], dark["dark"]) == (1, True)
+
+
+def test_an_unknown_wavelength_tag_is_filter_zero():
+    parsed = fg.parse_japan_frame(
+        entry("20260729_140530_TORY_HAMA1_none_055000ms_DARK.fits"))
+    assert parsed["filter"] == 0
+
+
+def test_the_tag_table_matches_the_default_wheel():
+    from cameras.common.filters import DEFAULT_FILTERS
+    assert fg.ARCHIVE_WAVELENGTH_SLOTS == {
+        f["wavelength"]: f["slot"] for f in DEFAULT_FILTERS}
 
 
 # ---------------------------------------------------------------------------

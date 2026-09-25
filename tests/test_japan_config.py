@@ -2,10 +2,10 @@
 
 Two jobs, and the second is the interesting one. The first is the ordinary
 mapping of a dict onto typed objects. The second is that this camera shares its
-schedule module with the ASI imager, whose vocabulary is strictly larger — a third
-schedule mode, a per-slot gain, an explicit cycle length. Which of that this camera
-accepts is decided here and nowhere else, so a config copied from the ASI camera
-has to be *reported*, not half-honoured.
+schedule module with the ASI imager, whose vocabulary is larger — a per-slot
+gain, for one. Which of that this camera accepts is decided here and nowhere else,
+so a config copied from the ASI camera has to be *reported*, not half-honoured.
+Both cameras now share all three modes, ``sun_cycle`` included.
 
 Nothing raises for a bad value: a station whose config has one typo should still
 observe tonight, with the problem on the console.
@@ -69,12 +69,70 @@ def test_numbers_written_as_strings_are_still_read():
 # ---------------------------------------------------------------------------
 # This camera's own policy
 # ---------------------------------------------------------------------------
-def test_sun_cycle_is_reported_as_belonging_to_the_other_camera():
-    """The likeliest mistake is a config copied from the ASI imager."""
-    conf = japan_config.from_dict({"mode": "sun_cycle"})
-    assert conf.schedule.mode == "sun"
-    assert "sun_cycle" in problems(conf)
-    assert "asi" in problems(conf)
+def test_sun_cycle_is_a_mode_of_this_camera_too():
+    conf = japan_config.from_dict({
+        "mode": "sun_cycle", "t_start": "12:00", "name": "HAMA1",
+        "location": {"name": "TORY", "lat": 51.81, "lon": 103.08,
+                     "elevation": 658},
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
+    })
+    assert conf.errors == []
+    assert conf.schedule.mode == "sun_cycle"
+    # UTC in this mode, but stored as the plain time of day that was written.
+    assert conf.schedule.t_start == time(12, 0)
+    assert conf.schedule.entries[0].delta == 0
+    assert (conf.name, conf.location.name) == ("HAMA1", "TORY")
+    assert conf.location.elevation == 658
+
+
+def test_sun_cycle_needs_no_t_start():
+    """Without one the cycle keeps the whole-minute anchor, as on the ASI imager."""
+    conf = japan_config.from_dict({
+        "mode": "sun_cycle", "name": "HAMA1", "location": {"name": "TORY"},
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
+    })
+    assert conf.errors == []
+    assert conf.schedule.t_start is None
+
+
+def test_sun_cycle_without_names_is_reported_and_still_runs():
+    conf = japan_config.from_dict({
+        "mode": "sun_cycle",
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 5}],
+    })
+    assert (conf.name, conf.location.name) == ("JAPAN", "SITE")
+    assert "japan.name" in problems(conf)
+    assert "japan.location.name" in problems(conf)
+
+
+def test_names_are_not_required_outside_sun_cycle():
+    conf = japan_config.from_dict({})
+    assert (conf.name, conf.location.name) == ("", "")
+    assert conf.errors == []
+
+
+@pytest.mark.parametrize("raw, cleaned", [
+    ("HAMA_1", "HAMA-1"), ("Tory site", "Tory-site"), ("a/b", "a-b"),
+])
+def test_a_name_cannot_break_the_file_name(raw, cleaned):
+    """Fields of the sun_cycle file name are split on underscores."""
+    conf = japan_config.from_dict({"name": raw, "location": {"name": raw}})
+    assert (conf.name, conf.location.name) == (cleaned, cleaned)
+    assert raw in problems(conf)
+
+
+def test_the_filter_table_defaults_to_the_tory_wheel():
+    conf = japan_config.from_dict({})
+    assert conf.filter_info(1).wavelength == "5577"
+    assert conf.filter_info(3).wavelength == "OH__"
+    assert conf.filter_info(0).wavelength == ""
+
+
+def test_the_filter_table_can_be_replaced():
+    conf = japan_config.from_dict({"filters": [
+        {"slot": 1, "wavelength": "4861", "description": "H-beta"}]})
+    assert conf.filter_info(1).wavelength == "4861"
+    assert conf.filter_info(2).wavelength == ""
 
 
 def test_an_invented_mode_is_reported_without_blaming_the_other_camera():
@@ -227,15 +285,26 @@ def test_a_missing_schedule_file_is_reported_not_raised(tmp_path):
     assert "gone.txt" in problems(conf)
 
 
-def test_a_schedule_file_may_not_switch_the_camera_to_an_asi_mode(tmp_path):
-    """A converted ASI schedule can carry globals; ``sun_cycle`` is not one to take."""
+def test_a_schedule_file_may_switch_the_camera_to_sun_cycle(tmp_path):
+    """A converted ASI schedule carries its mode, and this camera now has it."""
     path = tmp_path / "schedule.json"
     path.write_text('{"mode": "sun_cycle", "sun_max_angle": -12.0, '
                     '"slots": [{"delta": 0, "filter": 1, "exposure": 5}]}')
     conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
+                                   "name": "HAMA1", "location": {"name": "TORY"},
+                                   "schedule_file": str(path)})
+    assert conf.schedule.mode == "sun_cycle"
+    assert conf.schedule.sun_max_angle == pytest.approx(-12.0)
+
+
+def test_a_schedule_file_may_not_switch_the_camera_to_an_unknown_mode(tmp_path):
+    path = tmp_path / "schedule.json"
+    path.write_text('{"mode": "whenever", '
+                    '"slots": [{"delta": 0, "filter": 1, "exposure": 5}]}')
+    conf = japan_config.from_dict({"mode": "time", "t_start": "20:00",
                                    "schedule_file": str(path)})
     assert conf.schedule.mode == "time"
-    assert "sun_cycle" in problems(conf)
+    assert "whenever" in problems(conf)
 
 
 def test_a_schedule_file_may_still_set_what_this_camera_understands(tmp_path):

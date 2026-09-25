@@ -3,18 +3,17 @@ Japan all-sky imager driver: Hamamatsu camera (DCAM-API) + filter wheel.
 
 This is the every-camera front for the hardware in ``cameras/japan/``. It keeps the
 measurement programme of the standalone japan-camera application intact — pre-darks
-timed to the window, the two schedule modes, post-darks on Ctrl+C — and adds what
-every other camera in this program already has: status files
-for the monitor, the LAN frame server with UDP discovery, live view and remote
+timed to the window, its two schedule modes, post-darks on Ctrl+C — adds the
+ASI imager's ``sun_cycle`` mode, and adds what every other camera in this program
+already has: status files for the monitor, the LAN frame server with UDP discovery, live view and remote
 parameter editing for ``focus_app.py``, preview mode, and the shared console
 dashboard.
 
 japan-camera is the ancestor of the ``asi`` driver, so the two are deliberately
-close: the sun-mode and time-mode loops here are the same loops, and the shared
+close: the sun-mode, time-mode and sun_cycle loops here are the same loops, and the shared
 schedule arithmetic, filter wheel and FITS core live in ``cameras/common/``. What
-this driver does *not* have is everything the PIXIS grew afterwards — no
-``sun_cycle`` mode, no automatic exposure, no overexposure splitting, and no
-cooling control, the Hamamatsu offering a sensor temperature to read and no
+this driver does *not* have is most of what the PIXIS grew afterwards — no
+automatic exposure, no overexposure splitting, and no cooling control, the Hamamatsu offering a sensor temperature to read and no
 setpoint to command.
 
 Two rules govern the threading, both inherited from the original program because
@@ -44,9 +43,21 @@ Schedule modes (``japan.mode`` in config.json):
            its offset (``delta``), filter, exposure and binning. Started on time,
            the opening darks are shot first; started late, they are skipped and
            only the closing ones are taken.
+    sun_cycle
+           The same general cycle, started by the sun: nothing is exposed until
+           the altitude reaches ``sun_max_angle``, the pre-darks finish as that
+           happens, and the cycle runs until sunrise, night after night. Its
+           phase is locked to ``t_start`` read as **UTC**, so the run joins the
+           cycle at whichever slot is due and stations at different sites run
+           in step — with each other and with the ASI imager's ``sun_cycle``.
 
-Frames are filed flat into ``<output_dir>`` under the original's own name — see
-``cameras/japan/paths.py``, which also explains why the stamp is UTC.
+In ``sun`` and ``time`` mode frames are filed flat into ``<output_dir>`` under
+the original's own name — see ``cameras/japan/paths.py``, which also explains why
+the stamp is UTC. In ``sun_cycle`` mode they go into the ASI archive layout
+instead (``cameras/common/archive_paths.py``), named with the site's name
+(``japan.location.name``) and the instrument's (``japan.name``), with the ASI
+header set minus every card that describes the camera and its software, plus
+``NAME`` — see ``cameras/japan/fits.py``.
 """
 import os
 import sys
@@ -73,7 +84,9 @@ from worker_common import (
 
 from cameras.japan import config as japan_config
 from cameras.japan import devices, paths as japan_paths
-from cameras.japan.fits import write_fits
+from cameras.japan.fits import write_fits, write_sun_cycle_fits
+from cameras.common import archive_paths
+from cameras.common.seqno import next_seqno
 # Imported as a module rather than by name so a test can patch the timing helpers
 # through ``japan_driver.japan_schedule``.
 from cameras.common import schedule as japan_schedule
@@ -767,9 +780,43 @@ class JapanWorkerConsole(threading.Thread):
     # ------------------------------------------------------------------
     # Capture
     # ------------------------------------------------------------------
+    @property
+    def _archive_layout(self):
+        """True when frames go into the ASI archive layout (``sun_cycle`` mode).
+
+        A property of the whole run, darks included: a session's darks are
+        filed beside its lights, under the same naming, or the processing
+        program would never pair them.
+        """
+        return self.cfg.schedule.mode == "sun_cycle"
+
     def _write_frame(self, path, image, timestamp, exposure, image_type, obs_mode,
                      readings=None):
         readings = readings or {}
+        if self._archive_layout:
+            filt = self.cfg.filter_info(self.cam.filter_number)
+            write_sun_cycle_fits(
+                Path(path), image,
+                timestamp=timestamp,
+                exposure_sec=exposure,
+                binning=self.cam.current_binning,
+                readout_speed=self.cam.current_readout_speed,
+                readout_speed_text=japan_config.readout_text(
+                    self.cam.current_readout_speed),
+                filter_num=self.cam.filter_number,
+                ccd_temp=readings.get("ccd_temp"),
+                image_type=image_type,
+                obs_mode=obs_mode,
+                name=self.cfg.name,
+                site_name=self.cfg.location.name,
+                lat=self.cfg.location.lat,
+                lon=self.cfg.location.lon,
+                elevation=self.cfg.location.elevation,
+                seqno=next_seqno(self.output_dir),
+                filter_wavelength=filt.wavelength,
+                filter_description=filt.description,
+            )
+            return
         write_fits(
             Path(path), image,
             timestamp=timestamp,
@@ -791,7 +838,7 @@ class JapanWorkerConsole(threading.Thread):
             elevation=self.cfg.location.elevation,
         )
 
-    def _unique_frame_path(self, now, dark=False):
+    def _unique_frame_path(self, now, dark=False, exposure=None):
         """A free path for this frame, or None when the second is hopelessly full.
 
         The name resolves to one second and ``write_fits`` refuses to overwrite, so
@@ -803,11 +850,25 @@ class JapanWorkerConsole(threading.Thread):
         The name's second is nudged forward until it is free. ``DATE-OBS`` keeps the
         true start of the exposure, so a name and a header can then disagree by a
         second or two; the header is the one to believe.
+
+        In ``sun_cycle`` mode the name is the ASI archive's instead —
+        ``YYYY/MM/DD/YYYYMMDD_hhmmss_SITE_NAME_WAVE_EEEEEEms[_DARK].fits`` — with
+        the site name and the instrument name from config.json.
         """
         for offset in range(self.NAME_ATTEMPTS):
-            path = japan_paths.frame_path(self.output_dir,
-                                          now + timedelta(seconds=offset),
-                                          self.cam.filter_number, dark=dark)
+            when = now + timedelta(seconds=offset)
+            if self._archive_layout:
+                path = archive_paths.frame_path(
+                    self.output_dir, when,
+                    site_id=self.cfg.location.name,
+                    device_id=self.cfg.name,
+                    wavelength=self.cfg.filter_info(
+                        self.cam.filter_number).wavelength,
+                    exposure_sec=exposure or 0.0,
+                    dark=dark)
+            else:
+                path = japan_paths.frame_path(self.output_dir, when,
+                                              self.cam.filter_number, dark=dark)
             if not path.exists():
                 return path
         return None
@@ -836,7 +897,8 @@ class JapanWorkerConsole(threading.Thread):
                                     ts_iso=now.isoformat())
             return False
 
-        path = self._unique_frame_path(now, dark=(image_type == "DARK"))
+        path = self._unique_frame_path(now, dark=(image_type == "DARK"),
+                                       exposure=exposure)
         if path is None:
             self._errors += 1
             self._dash_update(errors=self._errors)
@@ -845,7 +907,10 @@ class JapanWorkerConsole(threading.Thread):
             self._bus.publish_error("error", "frame name collision",
                                     ts_iso=now.isoformat())
             return False
-        name = path.name
+        # Shown on the dashboard and in the log. In the dated archive layout
+        # the date tree is part of what identifies the frame; flat, it is not.
+        name = (str(path.relative_to(self.output_dir)) if self._archive_layout
+                else path.name)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._write_frame(path, image, now, exposure, image_type, obs_mode,
@@ -1189,6 +1254,146 @@ class JapanWorkerConsole(threading.Thread):
                     break
 
     # ------------------------------------------------------------------
+    # Sun-triggered cycle mode
+    # ------------------------------------------------------------------
+    def _run_sun_cycle_mode(self):
+        """The general cycle of ``time`` mode, started by the sun rather than the clock.
+
+        The same night the ASI imager's ``sun_cycle`` runs, without its
+        automatic exposure and slot splitting: nothing is exposed until the solar
+        altitude reaches ``sun_max_angle``; the pre-darks are timed to finish as
+        the window opens; the cycle then runs until sunrise. Its phase is locked
+        to ``t_start`` in UTC — see :meth:`_sun_cycle_anchor` — so the run opens
+        with whichever slot the cycle is due at, and two stations far apart,
+        whose windows open at different moments, shoot the same filter at the
+        same instant.
+
+        Called once per night by :meth:`run`, and returns when that night's
+        session is over.
+        """
+        # A new session starts here — see _run_sun_mode for why the counter is
+        # reset as the next night is planned.
+        self._session_shots = 0
+        sched = self.cfg.schedule
+        angle_fn = self._sun_angle_fn()
+        period = sched.period
+
+        activation = japan_schedule.sun_crossing_time(angle_fn, sched.sun_max_angle)
+        dark_seconds = japan_schedule.estimate_cycle_dark_duration(
+            sched.entries, sched.dark_frames, sched.dead_time)
+        dark_start = activation - timedelta(seconds=dark_seconds)
+        self._dash_update(schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle "
+                                   f"{period:.0f} s, window "
+                                   f"~{activation.strftime('%H:%M')}")
+        if dark_start > dt.now():
+            console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
+                           f"measurements ~{activation.strftime('%H:%M:%S')}")
+            if not self._wait_until(dark_start, phase="waiting for pre-darks"):
+                return
+        self._capture_darks("initial", abort_on_stop=True)
+        if self._stop_event.is_set():
+            return
+
+        try:
+            self.cam.set_shutter(True)
+        except Exception as exc:
+            console_ui.warn(f"Could not open the shutter: {exc}")
+
+        anchor = self._sun_cycle_anchor(activation, period)
+        if anchor is None:
+            return
+
+        consecutive_errors = 0
+        in_session = False
+        while not self._stop_event.is_set():
+            now = dt.now()
+            angle = angle_fn(now)
+            if angle > sched.sun_max_angle:
+                if in_session:
+                    console_ui.log("Sun above the threshold — measurements done.")
+                    break
+                # The window was predicted but has not opened — a crossing
+                # estimate a few seconds early. Wait rather than end the night.
+                if not self._wait_seconds(30, phase="waiting for darkness"):
+                    return
+                continue
+            if not in_session:
+                in_session = True
+                console_ui.log("Measurements started.")
+
+            slot, entry, iteration = japan_schedule.next_cycle_slot(
+                anchor, period, sched.entries, now)
+            self._dash_update(
+                detail=f"cycle {iteration}, Δ{entry.delta:g} s",
+                schedule=f"sun {angle:+.1f}° (threshold {sched.sun_max_angle:g}°)"
+                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}")
+
+            self._prepare_entry(entry)
+            self._refresh_camera_section()
+
+            if not self._wait_until(slot, phase="measuring"):
+                break
+            if self._take_schedule_dirty():
+                continue           # the anchor still holds; the slot does not
+            if angle_fn(dt.now()) > sched.sun_max_angle:
+                console_ui.log("Window closed while waiting — skipping frame.")
+                continue
+
+            # As in time mode, the camera is the authority on what was applied.
+            exposure = entry.exposure
+            applied = self.cam.current_exposure
+            if applied and abs(float(applied) - float(exposure)) > 1e-6:
+                console_ui.warn(f"Camera holds {applied:g} s but {exposure:g} s was "
+                                f"planned — filing the frame as {applied:g} s")
+                exposure = applied
+
+            if self._capture_one(dt.now(), exposure, "LIGHT", "sun_cycle"):
+                consecutive_errors = 0
+            else:
+                consecutive_errors += 1
+                if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                    console_ui.error(f"{consecutive_errors} consecutive capture "
+                                     f"failures — stopping.")
+                    self._stop_event.set()
+                    break
+
+    def _sun_cycle_anchor(self, activation, period):
+        """Fix the cycle's phase for tonight and wait for the window to open.
+
+        With ``t_start`` set (UTC in this mode) the phase is that time of day:
+        the run joins the cycle at whichever slot is due when the window opens,
+        so the cycle reaches its slot zero at ``t_start`` — the same instant at
+        every station configured with it, whatever its sun does. Without it the
+        cycle is anchored to the first whole minute of the window, as on the
+        ASI imager. The two drivers say this in the same words on purpose: it
+        is what lets their archives line up.
+
+        Either way the wait happens *here*, before the loop: asked for a slot
+        while the window is still shut, ``next_cycle_slot`` would answer with
+        one that falls before it opens. Returns the anchor, or None on a stop.
+        """
+        sched = self.cfg.schedule
+        window = max(activation, dt.now())
+        if sched.t_start is None:
+            anchor = japan_schedule.next_minute_boundary(window)
+            console_ui.log(f"Cycle anchored at {anchor.strftime('%H:%M:%S')}, "
+                           f"period {period:.0f} s (no t_start: not phase-locked "
+                           f"to other stations)")
+            if not self._wait_until(anchor, phase="waiting for the cycle anchor"):
+                return None
+            return anchor
+        anchor = japan_schedule.utc_cycle_anchor(sched.t_start, window)
+        slot, entry, iteration = japan_schedule.next_cycle_slot(
+            anchor, period, sched.entries, window)
+        console_ui.log(f"Cycle phase locked to t_start {sched.t_start:%H:%M:%S} UTC "
+                       f"({anchor:%H:%M:%S} local), period {period:.0f} s — first "
+                       f"slot {slot:%H:%M:%S}, filter {entry.filter} "
+                       f"(Δ{entry.delta:g} s, iteration {iteration})")
+        if not self._wait_until(window, phase="waiting for the cycle anchor"):
+            return None
+        return anchor
+
+    # ------------------------------------------------------------------
     # Main entry
     # ------------------------------------------------------------------
     def run(self):
@@ -1209,8 +1414,14 @@ class JapanWorkerConsole(threading.Thread):
             if self.setup_mode:
                 self._run_setup_mode()
             elif self._wait_for_start():
-                if self.cfg.schedule.mode == "time":
+                mode = self.cfg.schedule.mode
+                if mode == "time":
                     self._run_time_mode()
+                elif mode == "sun_cycle":
+                    # One night per call; sunrise ends a session, not the run,
+                    # exactly as on the ASI imager.
+                    while not self._stop_event.is_set():
+                        self._run_sun_cycle_mode()
                 else:
                     self._run_sun_mode()
         except Exception as exc:

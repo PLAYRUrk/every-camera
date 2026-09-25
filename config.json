@@ -98,6 +98,41 @@
       "elevation": 658
     }
   },
+  "japan": {
+    "instance_name": "",
+    "output_dir": "/data/japan",
+    "name": "HAMA1",
+    "mode": "sun_cycle",
+    "sun_max_angle": -10.0,
+    "t_start": "12:00",
+    "schedule_len": null,
+    "dark_frames": 3,
+    "dead_time": 5.0,
+    "wait_for_enter": true,
+    "schedule_file": "",
+    "schedule": [
+      { "delta": 0, "filter": 1, "exposure": 55, "binning": 1 },
+      { "delta": 60, "filter": 2, "exposure": 55, "binning": 1 }
+    ],
+    "camera": {
+      "backend": "dcam",
+      "readout_speed": 2,
+      "binning": 1,
+      "frame_timeout_ms": 1000
+    },
+    "filter_wheel": {
+      "port": "/dev/ttyUSB0",
+      "baudrate": 9600,
+      "move_timeout": 8.0
+    },
+    "location": {
+      "name": "TORY",
+      "lat": 51.810646,
+      "lon": 103.075555,
+      "elevation": 658
+    },
+    "filters": []
+  },
   "mqtt": {
     "enabled": false,
     "host": "broker.hivemq.com",

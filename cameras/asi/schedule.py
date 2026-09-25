@@ -19,6 +19,6 @@ from ..common.schedule import (          # noqa: F401
     estimate_dark_duration, load_schedule_file, next_cycle_slot,
     next_minute_boundary, next_second_slot, parse_schedule_json,
     parse_schedule_text, period_mismatch, schedule_snapshot, schedule_to_text,
-    slot_budget, slot_gap, sun_crossing_time, unique_dark_settings,
+    slot_budget, slot_gap, sun_crossing_time, unique_dark_settings, utc_cycle_anchor,
     unique_exposures,
 )

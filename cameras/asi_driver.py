@@ -34,10 +34,13 @@ Schedule modes (``asi.mode`` in config.json):
                to finish just as that window opens.
     time       One general cycle repeats, phase-locked to ``t_start``; each entry
                has its offset (``delta``), filter, exposure, binning and gain.
-    sun_cycle  The same general cycle, but anchored to the sun instead of the
+    sun_cycle  The same general cycle, but started by the sun instead of the
                clock: nothing is exposed until the altitude reaches
                ``sun_max_angle``, the pre-darks finish as that happens, and the
-               cycle runs until sunrise. This is what imagerd_rt did.
+               cycle runs until sunrise, as imagerd_rt did. Its phase stays
+               locked to ``t_start``, read as UTC here: the run joins the cycle
+               at whichever slot is due, so stations at different sites run in
+               step. No ``t_start`` → anchored to the first whole minute.
 
 Frames are filed as ``<output_dir>/YYYY/MM/DD/`` in UTC, under imagerd_rt's own
 file name — see ``cameras/asi/paths.py``.
@@ -1363,8 +1366,10 @@ class AsiWorkerConsole(threading.Thread):
         This is imagerd_rt's night (``imagerd_rt.c:531-738``): nothing is exposed
         until the solar altitude reaches ``sun_max_angle``; the only thing that
         happens before then is the pre-darks, timed to finish exactly as the
-        window opens; the cycle is then anchored to the first whole minute of
-        the window and free-runs until sunrise.
+        window opens; the cycle then free-runs until sunrise. Its phase is
+        locked to ``t_start`` in UTC — see :meth:`_sun_cycle_anchor` — so the
+        slot the run opens with is whichever one the cycle is due at, not
+        necessarily the first.
 
         With ``preflight`` enabled the session opens one setpoint earlier. The
         same slots, the same anchor and the same cycle phase run through the
@@ -1420,14 +1425,8 @@ class AsiWorkerConsole(threading.Thread):
         except Exception as exc:
             console_ui.warn(f"Could not open the shutter: {exc}")
 
-        # The anchor is waited out *before* the loop rather than handed straight
-        # to next_cycle_slot: asked for a slot while ``now`` is still ahead of
-        # the anchor, that function answers with the previous (negative)
-        # iteration, whose late entries fall before the window opens.
-        anchor = asi_schedule.next_minute_boundary(max(activation, dt.now()))
-        console_ui.log(f"Cycle anchored at {anchor.strftime('%H:%M:%S')}, "
-                       f"period {period:.0f} s")
-        if not self._wait_until(anchor, phase="waiting for the cycle anchor"):
+        anchor = self._sun_cycle_anchor(activation, period)
+        if anchor is None:
             return
 
         auto = asi_exposure.AutoExposure(pre)
@@ -1495,6 +1494,41 @@ class AsiWorkerConsole(threading.Thread):
                     console_ui.error(f"{consecutive_errors} consecutive capture "
                                      f"failures — stopping.")
                     break
+
+    def _sun_cycle_anchor(self, activation, period):
+        """Fix the cycle's phase for tonight and wait for the window to open.
+
+        With ``t_start`` set (UTC in this mode) the phase is that time of day:
+        the run joins the cycle at whichever slot is due when the window opens,
+        so the cycle reaches its slot zero at ``t_start`` — the same instant at
+        every station configured with it, whatever its sun does. Without it the
+        cycle is anchored to the first whole minute of the window, which is
+        what imagerd_rt did.
+
+        Either way the wait happens *here*, before the loop: asked for a slot
+        while the window is still shut, ``next_cycle_slot`` would answer with
+        one that falls before it opens. Returns the anchor, or None on a stop.
+        """
+        sched = self.cfg.schedule
+        window = max(activation, dt.now())
+        if sched.t_start is None:
+            anchor = asi_schedule.next_minute_boundary(window)
+            console_ui.log(f"Cycle anchored at {anchor.strftime('%H:%M:%S')}, "
+                           f"period {period:.0f} s (no t_start: not phase-locked "
+                           f"to other stations)")
+            if not self._wait_until(anchor, phase="waiting for the cycle anchor"):
+                return None
+            return anchor
+        anchor = asi_schedule.utc_cycle_anchor(sched.t_start, window)
+        slot, entry, iteration = asi_schedule.next_cycle_slot(
+            anchor, period, sched.entries, window)
+        console_ui.log(f"Cycle phase locked to t_start {sched.t_start:%H:%M:%S} UTC "
+                       f"({anchor:%H:%M:%S} local), period {period:.0f} s — first "
+                       f"slot {slot:%H:%M:%S}, filter {entry.filter} "
+                       f"(Δ{entry.delta:g} s, iteration {iteration})")
+        if not self._wait_until(window, phase="waiting for the cycle anchor"):
+            return None
+        return anchor
 
     def _enter_main_stage(self, auto, sched):
         """Hand over from the automatic twilight stage to the programme proper."""

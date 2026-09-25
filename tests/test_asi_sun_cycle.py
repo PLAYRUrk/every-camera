@@ -1,10 +1,12 @@
 """The sun-triggered general cycle, run end to end against the simulators.
 
-The point of ``sun_cycle`` is a negative one: between the moment the program
-starts and the moment the sun reaches ``sun_max_angle``, the only thing allowed
-to touch the shutter is the pre-dark run. A regression here does not crash — it
-quietly fills the archive with twilight frames the processing program will treat
-as data. So these tests watch the *order* of events, not just the outcome.
+The first point of ``sun_cycle`` is a negative one: between the moment the
+program starts and the moment the sun reaches ``sun_max_angle``, the only thing
+allowed to touch the shutter is the pre-dark run. A regression here does not
+crash — it quietly fills the archive with twilight frames the processing program
+will treat as data. So these tests watch the *order* of events, not just the
+outcome. The second is the cycle's phase: with a ``t_start`` (UTC in this mode)
+every slot lands on ``t_start + k·period + delta``, whenever the window opened.
 
 Time is not faked wholesale: the clock runs, and the schedule is squeezed into a
 few seconds so a whole night fits inside a test.
@@ -12,7 +14,7 @@ few seconds so a whole night fits inside a test.
 import sys
 import threading
 
-from datetime import datetime as dt, timedelta
+from datetime import datetime as dt, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -120,7 +122,7 @@ def test_the_darks_come_before_any_light_frame(worker, tmp_path, prompt_anchor):
 # Once it is dark, the cycle runs
 # ---------------------------------------------------------------------------
 def test_the_cycle_is_anchored_to_a_whole_minute(worker, tmp_path, monkeypatch):
-    """imagerd_rt only ever armed its cycle on a minute boundary; so do we."""
+    """Without a t_start: imagerd_rt armed its cycle on a minute boundary; so do we."""
     real = asi_driver.asi_schedule.next_minute_boundary
     asked = []
 
@@ -134,6 +136,53 @@ def test_the_cycle_is_anchored_to_a_whole_minute(worker, tmp_path, monkeypatch):
     anchor = real(asked[0])
     assert (anchor.second, anchor.microsecond) == (0, 0)
     assert anchor >= asked[0]
+
+
+def test_with_a_t_start_the_slots_are_phase_locked_to_it_in_utc(tmp_path):
+    """Each light lands on t_start (UTC) + k·period + delta, with its filter.
+
+    What lets two stations with different sunsets run the same cycle in step:
+    the run joins the cycle at whichever slot is due, rather than starting it
+    over when its own window opens.
+    """
+    from astropy.io import fits
+
+    period = 4.0
+    t0 = (dt.now(timezone.utc) + timedelta(seconds=2.4)).replace(tzinfo=None)
+    conf = make_config(
+        tmp_path, t_start=t0.time(), schedule_len=period,
+        schedule=[{"delta": 0.0, "filter": 1, "exposure": 0.05, "binning": 4,
+                   "gain": 3, "readout": 0.5},
+                  {"delta": 2.0, "filter": 3, "exposure": 0.05, "binning": 4,
+                   "gain": 3, "readout": 0.5}])
+    assert conf.errors == []
+    cam = asi_driver.AsiCamera(conf)
+    cam.cam = devices.make_camera(conf)
+    cam.wheel = devices.make_wheel(conf)
+    worker = asi_driver.AsiWorkerConsole(
+        cam=cam, cfg=conf, output_dir=str(tmp_path), instance_name="test",
+        status_dir=str(tmp_path))
+    run_cycle(worker, lambda when: -20.0, seconds=13.0)
+
+    def date_obs(path):
+        stamp = dt.strptime(fits.getheader(path)["DATE-OBS"],
+                            "%Y-%m-%dT%H:%M:%S.%f")
+        return stamp.replace(tzinfo=timezone.utc)
+
+    lights = sorted((p for p in tmp_path.rglob("*.fits")
+                     if not p.name.endswith("_DARK.fits")), key=date_obs)
+    assert len(lights) >= 4, "the cycle took too few frames to judge its phase"
+    anchor = t0.replace(tzinfo=timezone.utc)
+    # The first frame follows the wheel's first move out of home, which the
+    # simulator makes take a whole second; every frame after it is on its slot.
+    for path in lights[1:]:
+        phase = (date_obs(path) - anchor).total_seconds() % period
+        header = fits.getheader(path)
+        if abs(phase) < 0.3 or abs(phase - period) < 0.3:
+            assert header["FILTER"] == 1, path.name
+        else:
+            assert abs(phase - 2.0) < 0.3, f"{path.name}: phase {phase:.2f} s"
+            assert header["FILTER"] == 3, path.name
 
 
 def test_frames_land_in_a_utc_date_tree_with_legacy_names(worker, tmp_path,
