@@ -16,11 +16,16 @@ lives — which schedule modes it runs, which readout speeds and binnings the se
 takes — since ``cameras/common/schedule.py`` deliberately carries the union of both
 imagers' vocabularies and does not know who is asking.
 
-The ``sun_cycle`` mode brings three settings of its own, because its frames are
-filed in the ASI imager's archive layout: ``name`` (the instrument name, written
-into the ``NAME`` card and into the file name), ``location.name`` (the observing
-site's name, the file name's site field and the ``SiteID`` record) and
-``filters`` (the wheel table whose wavelength tags go into the name).
+The ``sun_cycle`` mode brings five settings of its own, because it is the ASI
+imager's night run on this camera: its frames are filed in that archive layout,
+so ``name`` (the instrument name, written into the ``NAME`` card and into the
+file name), ``location.name`` (the observing site's name, the file name's site
+field and the ``SiteID`` record) and ``filters`` (the wheel table whose
+wavelength tags go into the name); and it runs that mode's two intensity-control
+loops, so ``preflight`` and ``overexposure`` as well. Those last two are parsed
+by ``cameras/common/exposure_config.py``, shared with the ASI imager, with one
+difference this module imposes: the split guard here runs in ``sun_cycle`` only,
+while on the ASI imager it also runs in ``time``.
 """
 from __future__ import annotations
 
@@ -28,7 +33,11 @@ from dataclasses import dataclass, field
 from datetime import time
 
 from ..common import cfgparse
+from ..common import exposure_config
 from ..common import filters as common_filters
+# Only for ``default_port``; the module pulls in pyserial when it opens a port,
+# never at import, so reading a config still costs nothing.
+from ..common import filterwheel as common_filterwheel
 from ..common import schedule as schedule_mod
 
 DEFAULT_MODE = "sun"
@@ -36,9 +45,21 @@ DEFAULT_MODE = "sun"
 # The two schedule shapes the Hamamatsu program had, plus ``sun_cycle``: the
 # general cycle of ``time`` mode, started by the sun and phase-locked to
 # ``t_start`` in UTC, so that this camera and the ASI imager — or two stations
-# far apart — run the same cycle in step. The ASI imager's automatic exposure
-# and slot splitting are not part of it here.
+# far apart — run the same cycle in step, with the same automatic twilight
+# exposure and the same slot splitting.
 JAPAN_MODES = ("sun", "time", "sun_cycle")
+
+# Where the split guard is allowed to drive. On the ASI imager it runs in every
+# mode that has slots; here it is a ``sun_cycle`` feature only, so that the
+# ``time`` mode this camera came with keeps shooting exactly what its schedule
+# says, one frame per slot, as the standalone program did.
+SPLIT_MODES = ("sun_cycle",)
+
+# The intensity-control blocks are shared with the ASI imager; re-exported so
+# ``japan_config.PreflightCfg`` reads as naturally as ``asi_config``'s does.
+PreflightCfg = exposure_config.PreflightCfg
+OverexposureCfg = exposure_config.OverexposureCfg
+SATURATION_ADU = exposure_config.SATURATION_ADU
 
 # Characters a name may not carry into the ``sun_cycle`` file name: ``_``
 # separates its fields, and the rest would make a path or a broken name.
@@ -68,7 +89,9 @@ class CameraCfg:
 
 @dataclass
 class FilterWheelCfg:
-    port: str = "/dev/ttyUSB0"        # "sim" selects the simulator
+    # Filled in by ``from_dict`` from config.json; the dataclass default is this
+    # platform's usual name. "sim" selects the simulator.
+    port: str = field(default_factory=common_filterwheel.default_port)
     baudrate: int = 9600
     move_timeout: float = 8.0
 
@@ -118,6 +141,8 @@ class JapanConfig:
     location: LocationCfg = field(default_factory=LocationCfg)
     filters: list = field(default_factory=list)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
+    preflight: PreflightCfg = field(default_factory=PreflightCfg)
+    overexposure: OverexposureCfg = field(default_factory=OverexposureCfg)
     wait_for_enter: bool = True
     errors: list = field(default_factory=list)
 
@@ -193,7 +218,7 @@ def from_dict(japan_cfg):
 
     wheel_cfg = cfgparse.sub(japan_cfg, "filter_wheel")
     wheel = FilterWheelCfg(
-        port=str(wheel_cfg.get("port", "/dev/ttyUSB0")),
+        port=str(wheel_cfg.get("port") or common_filterwheel.default_port()),
         baudrate=cfgparse.as_int(wheel_cfg, "baudrate", 9600),
         move_timeout=cfgparse.as_float(wheel_cfg, "move_timeout", 8.0),
     )
@@ -291,6 +316,23 @@ def from_dict(japan_cfg):
                       f"{sched.dark_frames}; using 0")
         sched.dark_frames = 0
 
+    # The two intensity-control loops. Both are ``sun_cycle`` features on this
+    # camera — see SPLIT_MODES for why the guard is narrower here than on the
+    # ASI imager — and both switch themselves off rather than run misconfigured.
+    preflight = exposure_config.parse_preflight(
+        cfgparse.sub(japan_cfg, "preflight"), sched.mode, sched.sun_max_angle,
+        errors, prefix="japan")
+    if preflight.binning and not BINNING_MIN <= preflight.binning <= BINNING_MAX:
+        errors.append(f"japan.preflight.binning must be between {BINNING_MIN} and "
+                      f"{BINNING_MAX}, got {preflight.binning}; each slot keeps "
+                      f"its own binning instead")
+        preflight.binning = None
+    overexposure = exposure_config.parse_overexposure(
+        cfgparse.sub(japan_cfg, "overexposure"), errors, prefix="japan",
+        mode=sched.mode, modes=SPLIT_MODES)
+    exposure_config.check_threshold_above_target(
+        preflight, overexposure, errors, prefix="japan")
+
     filters, filter_errors = common_filters.parse_filters(
         japan_cfg.get("filters"), what="japan.filters")
     errors.extend(filter_errors)
@@ -317,6 +359,8 @@ def from_dict(japan_cfg):
         location=location,
         filters=filters,
         schedule=sched,
+        preflight=preflight,
+        overexposure=overexposure,
         wait_for_enter=cfgparse.as_bool(japan_cfg, "wait_for_enter", True),
         errors=errors,
     )

@@ -17,11 +17,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import time
 
-import intensity
-
 from . import schedule as schedule_mod
 from ..common import cfgparse
+from ..common import exposure_config
 from ..common import filters as common_filters
+# Only for ``default_port``; the module pulls in pyserial when it opens a port,
+# never at import, so reading a config still costs nothing.
+from ..common import filterwheel as common_filterwheel
 
 DEFAULT_MODE = "sun"
 
@@ -30,17 +32,13 @@ DEFAULT_MODE = "sun"
 # astropy.
 DEFAULT_LEGACY_VERSION = "3.0"
 
-# Full scale of this 16-bit instrument, the range every intensity setting is
-# expressed in. ``intensity`` is safe to import here for the same reason the
-# version above is spelled out: it carries no numpy import of its own, so
-# reading a config still does not drag one in.
-SATURATION_ADU = float(intensity.FULL_SCALE)
-
-# The archive file name resolves to one second (``paths.frame_name``), so two
-# frames closer together than this cannot both be filed under the name the
-# station's processing program expects. The overexposure guard therefore never
-# plans sub-frames tighter than this, whatever the config asks for.
-ARCHIVE_NAME_RESOLUTION = 1.0
+# The intensity-control blocks are shared with the japan imager and live in
+# cameras/common/exposure_config.py; re-exported under the old names, which the
+# driver and its tests use.
+SATURATION_ADU = exposure_config.SATURATION_ADU
+ARCHIVE_NAME_RESOLUTION = exposure_config.ARCHIVE_NAME_RESOLUTION
+PreflightCfg = exposure_config.PreflightCfg
+OverexposureCfg = exposure_config.OverexposureCfg
 
 # The Tory instrument's wheel lives in cameras/common/filters.py now, shared
 # with the japan imager's sun_cycle mode; re-exported under the old names.
@@ -77,7 +75,9 @@ class CoolingCfg:
 
 @dataclass
 class FilterWheelCfg:
-    port: str = "/dev/ttyUSB0"        # "sim" selects the simulator
+    # Filled in by ``from_dict`` from config.json; the dataclass default is this
+    # platform's usual name. "sim" selects the simulator.
+    port: str = field(default_factory=common_filterwheel.default_port)
     baudrate: int = 9600
     move_timeout: float = 8.0
 
@@ -119,40 +119,6 @@ class ScheduleCfg:
         if self.schedule_len:
             return float(self.schedule_len)
         return schedule_mod.cycle_period(self.entries, self.dead_time)
-
-
-@dataclass
-class PreflightCfg:
-    """The bright-twilight stage of ``sun_cycle``, with automatic exposure.
-
-    ``sun_start_angle`` is the first setpoint and must sit *above*
-    ``ScheduleCfg.sun_max_angle``: the sun descends through them in that order,
-    and the stage lives in the gap between the two.
-    """
-
-    enabled: bool = False
-    sun_start_angle: float = -6.0
-    target_mean: float = 20000.0      # ADU, 0..65535
-    tolerance: float = 0.15           # deadband, as a fraction of the target
-    min_exposure: float = 0.05        # s
-    max_exposure: float = None        # None: no longer than the slot's own
-    max_step: float = 4.0             # largest exposure change per measurement
-    bias: float = 0.0                 # pedestal, ADU; used when there are no darks
-    binning: int = None                # None: each slot keeps its own schedule binning
-
-
-@dataclass
-class OverexposureCfg:
-    """Dividing a slot's frame into shorter sub-frames when it over-exposes."""
-
-    enabled: bool = False
-    threshold: float = 55000.0        # mean ADU above which the slot divides
-    release: float = 0.85             # hysteresis on the way back down
-    max_splits: int = 4
-    min_exposure: float = 0.05        # shortest sub-frame, s
-    margin: float = 0.5               # slack kept inside the slot budget, s
-    min_frame_gap: float = 1.0        # sub-frames stay this far apart, s
-    bias: float = 0.0                 # pedestal, ADU; used when there are no darks
 
 
 @dataclass
@@ -248,7 +214,7 @@ def from_dict(asi_cfg):
 
     wheel_cfg = _sub(asi_cfg, "filter_wheel")
     wheel = FilterWheelCfg(
-        port=str(wheel_cfg.get("port", "/dev/ttyUSB0")),
+        port=str(wheel_cfg.get("port") or common_filterwheel.default_port()),
         baudrate=_int(wheel_cfg, "baudrate", 9600),
         move_timeout=_float(wheel_cfg, "move_timeout", 8.0),
     )
@@ -333,14 +299,15 @@ def from_dict(asi_cfg):
         schedule_len=schedule_len,
     )
 
-    preflight = _preflight(_sub(asi_cfg, "preflight"), sched, errors)
-    overexposure = _overexposure(_sub(asi_cfg, "overexposure"), errors)
-    if (preflight.enabled and overexposure.enabled
-            and overexposure.threshold <= preflight.target_mean):
-        errors.append(
-            f"asi.overexposure.threshold ({overexposure.threshold:g}) is at or "
-            f"below asi.preflight.target_mean ({preflight.target_mean:g}); the "
-            f"two loops would work against each other")
+    # The ASI imager drives the split guard in every mode that has slots, so no
+    # ``modes`` is passed: there is nothing to restrict it to.
+    preflight = exposure_config.parse_preflight(
+        _sub(asi_cfg, "preflight"), sched.mode, sched.sun_max_angle, errors,
+        prefix="asi")
+    overexposure = exposure_config.parse_overexposure(
+        _sub(asi_cfg, "overexposure"), errors, prefix="asi")
+    exposure_config.check_threshold_above_target(
+        preflight, overexposure, errors, prefix="asi")
 
     fw_temp = settings.get("fw_temp")
     station = StationCfg(
@@ -365,105 +332,6 @@ def from_dict(asi_cfg):
         wait_for_enter=_bool(asi_cfg, "wait_for_enter", True),
         errors=errors,
     )
-
-
-def _preflight(raw, sched, errors):
-    """The preflight block, validated against the schedule it has to fit inside.
-
-    A misconfigured stage is switched off rather than corrected into something
-    the operator did not ask for: shooting the twilight at the wrong exposure is
-    worse than not shooting it.
-    """
-    cfg = PreflightCfg(
-        enabled=_bool(raw, "enabled", False),
-        sun_start_angle=_float(raw, "sun_start_angle", -6.0),
-        target_mean=_float(raw, "target_mean", 20000.0),
-        tolerance=_float(raw, "tolerance", 0.15),
-        min_exposure=_float(raw, "min_exposure", 0.05),
-        max_exposure=None,
-        max_step=_float(raw, "max_step", 4.0),
-        bias=_float(raw, "bias", 0.0),
-        binning=None,
-    )
-    raw_max = raw.get("max_exposure")
-    if raw_max not in (None, "", 0, 0.0):
-        cfg.max_exposure = _float(raw, "max_exposure", 0.0) or None
-    raw_binning = raw.get("binning")
-    if raw_binning not in (None, "", 0):
-        cfg.binning = _int(raw, "binning", 0) or None
-
-    if cfg.enabled and sched.mode != "sun_cycle":
-        errors.append(f"asi.preflight works only in 'sun_cycle' mode (mode is "
-                      f"{sched.mode!r}); the preflight stage is off")
-        cfg.enabled = False
-    if cfg.enabled and cfg.sun_start_angle <= sched.sun_max_angle:
-        errors.append(f"asi.preflight.sun_start_angle ({cfg.sun_start_angle:g}) "
-                      f"must be above asi.sun_max_angle "
-                      f"({sched.sun_max_angle:g}); the preflight stage is off")
-        cfg.enabled = False
-    if not 0.0 < cfg.target_mean < SATURATION_ADU:
-        errors.append(f"asi.preflight.target_mean must be between 0 and "
-                      f"{SATURATION_ADU:.0f} ADU, got "
-                      f"{cfg.target_mean:g}; the preflight stage is off")
-        cfg.enabled = False
-    if cfg.min_exposure <= 0:
-        errors.append(f"asi.preflight.min_exposure must be positive, got "
-                      f"{cfg.min_exposure:g}; using 0.05")
-        cfg.min_exposure = 0.05
-    if not 0.0 <= cfg.tolerance < 1.0:
-        errors.append(f"asi.preflight.tolerance must be between 0 and 1, got "
-                      f"{cfg.tolerance:g}; using 0.15")
-        cfg.tolerance = 0.15
-    if cfg.max_step <= 1.0:
-        errors.append(f"asi.preflight.max_step must be greater than 1, got "
-                      f"{cfg.max_step:g}; using 4.0")
-        cfg.max_step = 4.0
-    return cfg
-
-
-def _overexposure(raw, errors):
-    """The overexposure block. Same rule: unusable settings switch it off."""
-    cfg = OverexposureCfg(
-        enabled=_bool(raw, "enabled", False),
-        threshold=_float(raw, "threshold", 55000.0),
-        release=_float(raw, "release", 0.85),
-        max_splits=_int(raw, "max_splits", 4),
-        min_exposure=_float(raw, "min_exposure", 0.05),
-        margin=_float(raw, "margin", 0.5),
-        min_frame_gap=_float(raw, "min_frame_gap", 1.0),
-        bias=_float(raw, "bias", 0.0),
-    )
-    if not 0.0 < cfg.threshold <= SATURATION_ADU:
-        errors.append(f"asi.overexposure.threshold must be between 0 and "
-                      f"{SATURATION_ADU:.0f} ADU, got "
-                      f"{cfg.threshold:g}; the overexposure guard is off")
-        cfg.enabled = False
-    if cfg.enabled and cfg.max_splits < 2:
-        errors.append(f"asi.overexposure.max_splits must be at least 2, got "
-                      f"{cfg.max_splits}; the overexposure guard is off")
-        cfg.enabled = False
-    if cfg.min_exposure <= 0:
-        errors.append(f"asi.overexposure.min_exposure must be positive, got "
-                      f"{cfg.min_exposure:g}; using 0.05")
-        cfg.min_exposure = 0.05
-    if not 0.0 < cfg.release <= 1.0:
-        errors.append(f"asi.overexposure.release must be between 0 and 1, got "
-                      f"{cfg.release:g}; using 0.85")
-        cfg.release = 0.85
-    if cfg.margin < 0:
-        errors.append(f"asi.overexposure.margin must not be negative, got "
-                      f"{cfg.margin:g}; using 0.0")
-        cfg.margin = 0.0
-    # Not negotiable: sub-frames packed tighter than the archive's own name
-    # resolution would overwrite each other, and a frame taken is a frame that
-    # has to reach the disk. A config asking for less is raised, with a note.
-    if cfg.min_frame_gap < ARCHIVE_NAME_RESOLUTION:
-        errors.append(f"asi.overexposure.min_frame_gap must be at least "
-                      f"{ARCHIVE_NAME_RESOLUTION:g} s — the archive file name "
-                      f"resolves to one second — got {cfg.min_frame_gap:g}; "
-                      f"using {ARCHIVE_NAME_RESOLUTION:g}")
-        cfg.min_frame_gap = ARCHIVE_NAME_RESOLUTION
-    return cfg
 
 
 def _filters(raw):

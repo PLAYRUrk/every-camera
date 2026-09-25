@@ -58,12 +58,32 @@ from utils import (                                              # noqa: E402
 )
 
 STATE_FILE = str(Path.home() / ".every_camera" / "sentinel.json")
-# Where the services keep their configs (systemd/install.sh). The sentinel
-# is one per machine while the cameras are one per type, so it has no config
-# of its own to be pointed at — it reads theirs. That is deliberate: the
-# addresses to notify are a fact about the station, and asking for them
-# twice is asking for two answers.
-SERVICE_CONFIG_DIR = "/etc/every-camera"
+
+
+def _service_config_dir():
+    """Where the services keep their configs (``systemd/install.sh``).
+
+    The sentinel is one per machine while the cameras are one per type, so it
+    has no config of its own to be pointed at — it reads theirs. That is
+    deliberate: the addresses to notify are a fact about the station, and asking
+    for them twice is asking for two answers.
+
+    Windows has no systemd and therefore no installer writing this directory;
+    the machine-wide place a station *would* put it is under ``%PROGRAMDATA%``,
+    so that is where it looks. Finding nothing there is normal and not an error
+    — :func:`find_config` then falls back to the checkout's own config.json,
+    which is how a Windows station is set up anyway.
+    """
+    if os.name == "nt":
+        base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+        # os.path.join, not pathlib: on the machine this runs on it joins with
+        # that machine's separator, which is the whole point, and pathlib would
+        # have to be told which flavour of path it is being handed.
+        return os.path.join(base, "every-camera")
+    return "/etc/every-camera"
+
+
+SERVICE_CONFIG_DIR = _service_config_dir()
 DEFAULT_INTERVAL = 15.0
 # A worker publishes its status at least every STATUS_MIN_INTERVAL (5 s) and
 # the monitor calls it stale at 30. This is deliberately far looser than
@@ -86,6 +106,14 @@ def _boot_id():
     Without this, the first pass after a reboot would find every PID it knew
     about gone and report each one as a crash. A reboot is one event, not six
     dead cameras, and the letters about it would be six lies.
+
+    Linux states it outright. Everywhere else — Windows included — the fallback
+    is the wall-clock moment the machine booted, derived from the difference
+    between the two clocks. It drifts by a second or two as NTP corrects the
+    wall clock, which is why it is the fallback: it is compared for equality, so
+    a drifting value can claim a reboot that never happened. That costs a
+    spurious letter, where the alternative — no boot id at all — costs one
+    letter per camera after every real reboot.
     """
     try:
         with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as handle:

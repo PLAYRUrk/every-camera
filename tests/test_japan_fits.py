@@ -215,3 +215,83 @@ def test_a_failed_capture_is_refused_rather_than_filed_as_an_empty_frame(tmp_pat
             lat=0.0, lon=0.0, elevation=0.0,
         )
     assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
+# The sun_cycle writer: the same core, plus what the intensity loops decided
+# ---------------------------------------------------------------------------
+# write_fits above is the sun/time writer and must stay clear of these cards —
+# nothing in those modes chooses an exposure, so there is nothing to record.
+# sun_cycle does run both loops, and its frames land in the ASI archive, which
+# is read by the same processing program that reads the ASI station's. So the
+# cards have to be spelled exactly as cameras/asi/fits.py spells them.
+def write_cycle_frame(path, **overrides):
+    from cameras.japan.fits import write_sun_cycle_fits
+
+    kwargs = dict(
+        timestamp=EVENING_LOCAL, exposure_sec=30.0, binning=1, readout_speed=2,
+        readout_speed_text="2 (fast)", filter_num=3, ccd_temp=-10.25,
+        image_type="LIGHT", obs_mode="sun_cycle", name="HAMA1",
+        site_name="TORY", lat=53.324236, lon=107.741264, elevation=515.0,
+        seqno=7, filter_wavelength="OH__", filter_description="Broadband OH",
+    )
+    kwargs.update(overrides)
+    write_sun_cycle_fits(path, np.zeros((4, 4), dtype="<u2"), **kwargs)
+    return fits.getheader(path)
+
+
+def test_the_measured_mean_is_recorded_on_every_frame(tmp_path):
+    """One pass over an array already in memory, and it answers the first
+    question anyone asks of an archived frame."""
+    header = write_cycle_frame(tmp_path / "a.fits", sky_mean=1234.567)
+    assert header["SKYMEAN"] == pytest.approx(1234.57)
+
+
+def test_a_frame_with_nothing_measured_leaves_the_card_out(tmp_path):
+    """Absent, not zero: a frame claiming 0 ADU reads as a shutter that stuck."""
+    header = write_cycle_frame(tmp_path / "a.fits", sky_mean=None)
+    assert "SKYMEAN" not in header
+
+
+def test_an_undivided_slot_carries_no_split_cards(tmp_path):
+    """The pair says "this frame is a part"; a whole frame must not claim it."""
+    header = write_cycle_frame(tmp_path / "a.fits", sky_mean=100.0)
+    assert "SPLITNUM" not in header
+    assert "SPLITIDX" not in header
+
+
+def test_a_divided_slot_says_how_far_and_which_part(tmp_path):
+    header = write_cycle_frame(tmp_path / "a.fits", sky_mean=100.0,
+                               split_count=3, split_index=2)
+    assert header["SPLITNUM"] == 3
+    assert header["SPLITIDX"] == 2
+
+
+def test_the_split_cards_are_spelled_as_the_asi_writer_spells_them(tmp_path):
+    """Two archives, one reader. A rename here is a silent data loss there."""
+    from cameras.asi.fits import write_fits as asi_write
+
+    japan = write_cycle_frame(tmp_path / "japan.fits", sky_mean=1234.567,
+                              split_count=3, split_index=2)
+    asi_write(
+        tmp_path / "asi.fits", np.zeros((4, 4), dtype="<u2"),
+        timestamp=EVENING_LOCAL, exposure_sec=30.0, binning=1,
+        readout_speed=2.0, gain=1, filter_num=3, ccd_temp=-10.25,
+        set_temp=-60.0, image_type="LIGHT", obs_mode="sun_cycle",
+        camera_vendor="Princeton Instruments", camera_model="Pixis2048B",
+        camera_sn="S/N 000123", camera_version="1.20",
+        driver_version="4.0.1", dcam_version="4.10",
+        lat=53.324236, lon=107.741264, elevation=515.0,
+        site_id="TORY", device_id="ASI0", seqno=7,
+        sky_mean=1234.567, split_count=3, split_index=2)
+    asi = fits.getheader(tmp_path / "asi.fits")
+
+    for key in ("SKYMEAN", "SPLITNUM", "SPLITIDX"):
+        assert japan[key] == asi[key], key
+        assert japan.comments[key] == asi.comments[key], key
+
+
+def test_a_preflight_frame_says_so_in_its_observation_mode(tmp_path):
+    """The name carries _pf; the header has to agree with the name."""
+    header = write_cycle_frame(tmp_path / "a.fits", obs_mode="sun_cycle_auto")
+    assert header["OBSMODE"] == "sun_cycle_auto"

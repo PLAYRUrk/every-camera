@@ -215,6 +215,10 @@ def test_the_status_payload_is_what_the_monitor_reads(worker, monkeypatch):
     The absent keys matter as much as the present ones: ``set_temp`` and
     ``temp_locked`` would make ``monitor_app`` draw a setpoint this camera does
     not have, and ``gain`` would name a control it does not have either.
+
+    The intensity-control keys are present, and spelled as the ASI imager
+    spells them, because ``sun_cycle`` runs the same two loops here — one
+    monitor has to read both cameras off one set of names.
     """
     captured = {}
     monkeypatch.setattr(worker._bus, "publish_status",
@@ -223,10 +227,10 @@ def test_the_status_payload_is_what_the_monitor_reads(worker, monkeypatch):
 
     assert captured["camera_type"] == "japan"
     for key in ("status", "phase", "mode", "exposure", "binning",
-                "readout_speed", "filter", "shutter", "ccd_temp"):
+                "readout_speed", "filter", "shutter", "ccd_temp",
+                "stage", "auto_exposure", "split_frames", "last_mean"):
         assert key in captured, key
-    for key in ("set_temp", "temp_locked", "gain", "stage", "auto_exposure",
-                "split_frames"):
+    for key in ("set_temp", "temp_locked", "gain"):
         assert key not in captured, key
 
 

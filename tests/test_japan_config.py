@@ -498,3 +498,63 @@ def test_one_slot_per_cycle_is_all_tail_and_still_fine():
         "schedule_len": 1440,
         "schedule": [{"delta": 0, "filter": 1, "exposure": 55}]})
     assert conf.errors == []
+
+
+# ---------------------------------------------------------------------------
+# Intensity control
+# ---------------------------------------------------------------------------
+# The blocks themselves are the ASI imager's, parsed by the shared
+# cameras/common/exposure_config.py and exercised at length in
+# test_japan_preflight and test_japan_split. What is pinned here is what this
+# camera's config module adds on top: the section names, the defaults a station
+# that never touched them gets, and the one rule that differs between the two
+# imagers.
+def test_both_blocks_exist_and_are_off_by_default():
+    """A station that has never heard of either loop runs the cycle it always did."""
+    conf = japan_config.from_dict({"mode": "sun_cycle", "name": "HAMA1",
+                                   "location": {"name": "TORY"}})
+    assert conf.preflight.enabled is False
+    assert conf.overexposure.enabled is False
+    assert conf.preflight.target_mean == 20000.0
+    assert conf.overexposure.threshold == 55000.0
+    assert conf.errors == [], "leaving both loops alone is not worth a word"
+
+
+def test_the_defaults_match_the_asi_imagers():
+    """One set of numbers, or the two stations drift apart a night at a time."""
+    from cameras.asi import config as asi_config
+
+    japan = japan_config.from_dict({"mode": "sun_cycle", "name": "HAMA1"})
+    asi = asi_config.from_dict({"mode": "sun_cycle"})
+    assert japan.preflight == asi.preflight
+    assert japan.overexposure == asi.overexposure
+
+
+def test_the_split_guard_is_a_sun_cycle_feature_on_this_camera():
+    """The one deliberate difference from the ASI imager, in both directions."""
+    from cameras.asi import config as asi_config
+
+    in_time = japan_config.from_dict({
+        "mode": "time", "t_start": "20:00",
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 55}],
+        "overexposure": {"enabled": True}})
+    assert in_time.overexposure.enabled is False
+    assert any("overexposure" in e and "sun_cycle" in e for e in in_time.errors)
+
+    # The ASI imager runs the guard in time mode, and must go on doing so.
+    asi_in_time = asi_config.from_dict({
+        "mode": "time", "t_start": "20:00",
+        "schedule": [{"delta": 0, "filter": 1, "exposure": 55}],
+        "overexposure": {"enabled": True}})
+    assert asi_in_time.overexposure.enabled is True
+
+
+def test_the_messages_name_the_japan_section_not_the_asi_one():
+    """An operator reading the error has to know which section to open."""
+    conf = japan_config.from_dict({
+        "mode": "sun_cycle", "name": "HAMA1",
+        "preflight": {"enabled": True, "sun_start_angle": -20.0}})
+    complaint = [e for e in conf.errors if "sun_start_angle" in e]
+    assert complaint
+    assert complaint[0].startswith("japan.preflight")
+    assert "asi." not in complaint[0]

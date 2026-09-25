@@ -264,6 +264,39 @@ def test_the_header_names_the_instrument_and_nothing_else_about_it(
     assert "SEQNO" in header
 
 
+def test_a_plain_night_measures_but_does_not_divide(worker, tmp_path,
+                                                    prompt_anchor):
+    """With both intensity loops off, the mode is the cycle and nothing else.
+
+    ``SKYMEAN`` is still written — it costs one pass over the array already made
+    and is the first thing anyone asks of an archived frame — but the ``SPLIT*``
+    pair belongs to a slot that was actually divided, and no slot is, here.
+    """
+    run_cycle(worker, lambda when: -20.0, seconds=4.0)
+    lights = light_frames(tmp_path)
+    assert lights
+    for path in lights:
+        header = fits.getheader(path)
+        assert header["SKYMEAN"] > 0
+        assert "SPLITNUM" not in header
+        assert "SPLITIDX" not in header
+        assert header["OBSMODE"] == "sun_cycle"
+        assert not path.name.endswith("_pf.fits")
+
+
+def test_the_intensity_keys_read_as_an_idle_main_stage(worker, tmp_path,
+                                                       prompt_anchor,
+                                                       monkeypatch):
+    """What the monitor sees on a station that has not enabled either loop."""
+    captured = {}
+    monkeypatch.setattr(worker._bus, "publish_status",
+                        lambda payload, force=False: captured.update(payload))
+    run_cycle(worker, lambda when: -20.0, seconds=4.0)
+    assert captured["stage"] == "main"
+    assert captured["auto_exposure"] is None
+    assert captured["split_frames"] == 1
+
+
 def test_the_darks_are_filed_and_headed_the_same_way(worker, tmp_path,
                                                      prompt_anchor):
     run_cycle(worker, lambda when: -20.0, seconds=4.0)

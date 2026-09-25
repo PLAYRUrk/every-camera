@@ -11,10 +11,10 @@ dashboard.
 
 japan-camera is the ancestor of the ``asi`` driver, so the two are deliberately
 close: the sun-mode, time-mode and sun_cycle loops here are the same loops, and the shared
-schedule arithmetic, filter wheel and FITS core live in ``cameras/common/``. What
-this driver does *not* have is most of what the PIXIS grew afterwards — no
-automatic exposure, no overexposure splitting, and no cooling control, the Hamamatsu offering a sensor temperature to read and no
-setpoint to command.
+schedule arithmetic, filter wheel, intensity control and FITS core live in
+``cameras/common/``. What this driver does *not* have is what the Hamamatsu
+itself does not offer — no analog gain, and no cooling control, the camera
+offering a sensor temperature to read and no setpoint to command.
 
 Two rules govern the threading, both inherited from the original program because
 both are load-bearing:
@@ -50,6 +50,14 @@ Schedule modes (``japan.mode`` in config.json):
            phase is locked to ``t_start`` read as **UTC**, so the run joins the
            cycle at whichever slot is due and stations at different sites run
            in step — with each other and with the ASI imager's ``sun_cycle``.
+           This mode also carries that imager's two intensity-control loops
+           (``cameras/common/exposure.py``): the ``preflight`` stage, which
+           opens the session one solar setpoint earlier and holds a mean frame
+           intensity instead of reading the exposure from the schedule, and the
+           ``overexposure`` guard, which divides an over-bright slot into
+           shorter sub-frames on its next visit. Both are off by default, and
+           both belong to this mode alone — the ``time`` mode is still the plain
+           programme the standalone application ran.
 
 In ``sun`` and ``time`` mode frames are filed flat into ``<output_dir>`` under
 the original's own name — see ``cameras/japan/paths.py``, which also explains why
@@ -86,6 +94,9 @@ from cameras.japan import config as japan_config
 from cameras.japan import devices, paths as japan_paths
 from cameras.japan.fits import write_fits, write_sun_cycle_fits
 from cameras.common import archive_paths
+# Imported as a module for the same reason as the schedule below: tests reach the
+# controllers through ``japan_driver.japan_exposure``.
+from cameras.common import exposure as japan_exposure
 from cameras.common.seqno import next_seqno
 # Imported as a module rather than by name so a test can patch the timing helpers
 # through ``japan_driver.japan_schedule``.
@@ -257,22 +268,28 @@ class JapanCamera:
     def capture(self):
         return self.cam.capture()
 
-    def prepare(self, entry):
+    def prepare(self, entry, exposure=None, binning=None):
         """Apply one schedule entry's exposure, binning and filter.
-
-        Unlike the ASI driver there is no exposure override: nothing here chooses
-        an exposure, so the entry is the only authority on what the camera should
-        hold.
 
         Returns True when everything asked for is set. A filter that did not
         arrive gives False, having already said so: the result used to be
         dropped here, and a wheel that never got where it was sent left no trace
         anywhere except a frame filed with position 0.
+
+        ``exposure`` overrides the entry's own. The ``sun_cycle`` preflight stage
+        and its overexposure guard both choose the exposure themselves, and the
+        camera has to hold exactly what the file name and ``EXPTIME`` will claim
+        — so there is one value, applied here, rather than two that could drift
+        apart. ``binning`` likewise overrides the entry's own, for the preflight
+        stage, which holds one binning from config across every slot. No gain:
+        this camera has none.
         """
-        if entry.exposure is not None and self.current_exposure != entry.exposure:
-            self.set_exposure(entry.exposure)
-        if entry.binning and self.current_binning != entry.binning:
-            self.set_binning(entry.binning)
+        wanted = entry.exposure if exposure is None else float(exposure)
+        if wanted is not None and self.current_exposure != wanted:
+            self.set_exposure(wanted)
+        wanted_binning = entry.binning if binning is None else int(binning)
+        if wanted_binning and self.current_binning != wanted_binning:
+            self.set_binning(wanted_binning)
         if entry.filter and self.current_filter != entry.filter:
             return self.select_filter(entry.filter)
         return True
@@ -324,6 +341,16 @@ class JapanWorkerConsole(threading.Thread):
         self._last_shot = None
         self._last_file = None
         self._last_frame = None
+        # Intensity control: what the last frame measured, which stage the
+        # sun_cycle is in, and what the two loops currently ask of a slot. In
+        # every other mode these keep their initial values and cost nothing.
+        self._last_mean = None
+        self._last_saturation = 0.0
+        self._stage = "main"
+        self._auto_exposure = None
+        self._split_frames = 1
+        self._dark_means = {}
+        self._warned_slots = set()
         self._phase = "starting"
         self._next_slot = None
         # Set when a focus hold swallowed the slot we were waiting for, so the
@@ -367,7 +394,7 @@ class JapanWorkerConsole(threading.Thread):
         temp_text = f"{temp:.2f} °C" if isinstance(temp, (int, float)) else "n/a"
         binning = self.cam.current_binning or 1
         exposure = self.cam.current_exposure
-        return [
+        rows = [
             ("Exposure / binning:",
              f"{exposure:g} s  ·  {binning}x{binning}" if exposure
              else f"-  ·  {binning}x{binning}"),
@@ -377,6 +404,30 @@ class JapanWorkerConsole(threading.Thread):
             ("Shutter:", _shutter_text(self.cam.shutter_open)),
             ("Sensor temperature:", temp_text),
         ]
+        # Only shown while something is actually driving the intensity, so the
+        # block keeps its usual five rows on an ordinary run.
+        control = self._intensity_row()
+        if control:
+            rows.append(("Intensity control:", control))
+        return rows
+
+    def _intensity_row(self):
+        """The dashboard's intensity line; empty when neither loop is driving.
+
+        Word for word the ASI driver's, so an operator watching the two consoles
+        side by side reads one thing, not two.
+        """
+        mean = ("" if self._last_mean is None
+                else f"  ·  last mean {self._last_mean:.0f} ADU")
+        if self._stage == "preflight":
+            if self._auto_exposure is None:
+                return f"preflight{mean}"
+            return (f"preflight, auto {self._auto_exposure:g} s"
+                    f"  ·  target {self.cfg.preflight.target_mean:.0f} ADU{mean}")
+        if self._split_frames > 1:
+            return (f"split ×{self._split_frames}"
+                    f"  ·  limit {self.cfg.overexposure.threshold:.0f} ADU{mean}")
+        return ""
 
     def _refresh_camera_section(self, readings=None):
         if self._dash is None:
@@ -412,6 +463,15 @@ class JapanWorkerConsole(threading.Thread):
             "shutter": self.cam.shutter_open,
             "next_slot": self._next_slot.isoformat() if self._next_slot else None,
             "setup_mode": self.setup_mode,
+            # Intensity control, for the monitor: which sun_cycle stage is
+            # running, what the automatic exposure settled on, how far the
+            # current slot is divided, and what the last frame measured. Same
+            # keys as the ASI imager publishes, so one monitor reads both.
+            "stage": self._stage,
+            "auto_exposure": self._auto_exposure,
+            "split_frames": self._split_frames,
+            "last_mean": (round(self._last_mean, 2)
+                          if self._last_mean is not None else None),
             "last_update": dt.now().isoformat(),
         }
         # No ``set_temp``/``temp_locked``: this camera has no setpoint, so the
@@ -715,7 +775,7 @@ class JapanWorkerConsole(threading.Thread):
             return False
         return self._session_shots > 0
 
-    def _prepare_entry(self, entry):
+    def _prepare_entry(self, entry, **kwargs):
         """Apply one schedule entry; False if the preparation itself broke.
 
         A filter that simply did not arrive is not that: the frame is still
@@ -725,7 +785,7 @@ class JapanWorkerConsole(threading.Thread):
         way of failing.
         """
         try:
-            arrived = self.cam.prepare(entry)
+            arrived = self.cam.prepare(entry, **kwargs)
         except Exception as exc:
             console_ui.error(f"Could not prepare filter {entry.filter}: {exc}")
             self._errors += 1
@@ -791,7 +851,7 @@ class JapanWorkerConsole(threading.Thread):
         return self.cfg.schedule.mode == "sun_cycle"
 
     def _write_frame(self, path, image, timestamp, exposure, image_type, obs_mode,
-                     readings=None):
+                     readings=None, sky_mean=None, split_count=1, split_index=1):
         readings = readings or {}
         if self._archive_layout:
             filt = self.cfg.filter_info(self.cam.filter_number)
@@ -815,8 +875,13 @@ class JapanWorkerConsole(threading.Thread):
                 seqno=next_seqno(self.output_dir),
                 filter_wavelength=filt.wavelength,
                 filter_description=filt.description,
+                sky_mean=sky_mean,
+                split_count=split_count,
+                split_index=split_index,
             )
             return
+        # The flat layout is the standalone program's, and nothing in ``sun`` or
+        # ``time`` mode drives the intensity — so the measurement is not written.
         write_fits(
             Path(path), image,
             timestamp=timestamp,
@@ -838,7 +903,7 @@ class JapanWorkerConsole(threading.Thread):
             elevation=self.cfg.location.elevation,
         )
 
-    def _unique_frame_path(self, now, dark=False, exposure=None):
+    def _unique_frame_path(self, now, dark=False, exposure=None, preflight=False):
         """A free path for this frame, or None when the second is hopelessly full.
 
         The name resolves to one second and ``write_fits`` refuses to overwrite, so
@@ -852,8 +917,10 @@ class JapanWorkerConsole(threading.Thread):
         second or two; the header is the one to believe.
 
         In ``sun_cycle`` mode the name is the ASI archive's instead —
-        ``YYYY/MM/DD/YYYYMMDD_hhmmss_SITE_NAME_WAVE_EEEEEEms[_DARK].fits`` — with
-        the site name and the instrument name from config.json.
+        ``YYYY/MM/DD/YYYYMMDD_hhmmss_SITE_NAME_WAVE_EEEEEEms[_DARK][_pf].fits`` —
+        with the site name and the instrument name from config.json. ``_pf``
+        marks a frame shot by the preflight stage, so the automatic twilight can
+        be told from the main programme without opening the file.
         """
         for offset in range(self.NAME_ATTEMPTS):
             when = now + timedelta(seconds=offset)
@@ -865,7 +932,7 @@ class JapanWorkerConsole(threading.Thread):
                     wavelength=self.cfg.filter_info(
                         self.cam.filter_number).wavelength,
                     exposure_sec=exposure or 0.0,
-                    dark=dark)
+                    dark=dark, preflight=preflight)
             else:
                 path = japan_paths.frame_path(self.output_dir, when,
                                               self.cam.filter_number, dark=dark)
@@ -874,7 +941,7 @@ class JapanWorkerConsole(threading.Thread):
         return None
 
     def _capture_one(self, now, exposure, image_type="LIGHT", obs_mode=None,
-                     label=None):
+                     label=None, split_count=1, split_index=1):
         """Take, save and publish one frame. Returns True on success."""
         obs_mode = obs_mode or self.cfg.schedule.mode
         readings = self._refresh_camera_section()
@@ -897,8 +964,11 @@ class JapanWorkerConsole(threading.Thread):
                                     ts_iso=now.isoformat())
             return False
 
+        self._last_mean, self._last_saturation = japan_exposure.frame_stats(image)
+
         path = self._unique_frame_path(now, dark=(image_type == "DARK"),
-                                       exposure=exposure)
+                                       exposure=exposure,
+                                       preflight=(obs_mode == "sun_cycle_auto"))
         if path is None:
             self._errors += 1
             self._dash_update(errors=self._errors)
@@ -914,7 +984,8 @@ class JapanWorkerConsole(threading.Thread):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._write_frame(path, image, now, exposure, image_type, obs_mode,
-                              readings)
+                              readings, sky_mean=self._last_mean,
+                              split_count=split_count, split_index=split_index)
         except Exception as exc:
             self._errors += 1
             self._dash_update(errors=self._errors)
@@ -928,6 +999,10 @@ class JapanWorkerConsole(threading.Thread):
         self._last_file = name
         if image_type == "DARK":
             self._darks += 1
+            # The pedestal the intensity loops extrapolate against: bias plus
+            # whatever dark current this exposure collects.
+            if self._last_mean is not None:
+                self._dark_means.setdefault(exposure, []).append(self._last_mean)
         else:
             self._shots += 1
             self._session_shots += 1
@@ -943,9 +1018,177 @@ class JapanWorkerConsole(threading.Thread):
                                                      "path": str(path)})
         self._dash_update(frames=self._shots, darks=self._darks,
                           last_file=name, errors=self._errors)
-        console_ui.log(f"Saved {name}")
+        detail = "" if self._last_mean is None else f"  mean {self._last_mean:.0f} ADU"
+        if split_count > 1:
+            detail += f"  ({split_index}/{split_count})"
+        console_ui.log(f"Saved {name}{detail}")
         self._save_status("running", force=True, readings=readings)
         return True
+
+    def _capture_slot(self, entry, exposure, frames, obs_mode):
+        """Shoot one cycle slot: ``frames`` back-to-back sub-frames.
+
+        Returns ``(ok, mean)``. ``ok`` is False only when *every* sub-frame
+        failed, so one bad read inside a split does not cost the whole slot and
+        does not push the run towards its consecutive-failure limit.
+
+        The ASI driver's method, word for word, minus its gain.
+        """
+        # The camera is the authority on what was actually applied: if
+        # ``prepare`` threw halfway through, filing the frame under the exposure
+        # we merely intended would put a lie in the name and in EXPTIME.
+        applied = self.cam.current_exposure
+        if applied and abs(float(applied) - float(exposure)) > 1e-6:
+            console_ui.warn(f"Camera holds {applied:g} s but {exposure:g} s was "
+                            f"planned — filing the frame as {applied:g} s")
+            exposure = applied
+
+        means, ok_any = [], False
+        for index in range(frames):
+            if self._stop_event.is_set():
+                break
+            label = f"LIGHT filter={_filter_text(self.cam.current_filter)}"
+            if frames > 1:
+                label += f"  {index + 1}/{frames}"
+            if self._capture_one(dt.now(), exposure, "LIGHT", obs_mode,
+                                 label=label, split_count=frames,
+                                 split_index=index + 1):
+                ok_any = True
+                means.append(self._last_mean)
+        return ok_any, japan_exposure.combine_means(means)
+
+    # ------------------------------------------------------------------
+    # Intensity control
+    # ------------------------------------------------------------------
+    def _bias_for(self, exposure, fallback=0.0):
+        """The pedestal to extrapolate an intensity against, in ADU.
+
+        Taken from the pre-darks, which are already shot per unique exposure, so
+        this costs nothing extra: the nearest exposure's darks are what a frame
+        of this length would sit on. Falls back to the configured value when the
+        run has no darks — a late start, or ``dark_frames`` set to zero.
+        """
+        if not self._dark_means:
+            return float(fallback)
+        nearest = min(self._dark_means,
+                      key=lambda e: abs(float(e) - float(exposure)))
+        means = self._dark_means[nearest]
+        return sum(means) / len(means) if means else float(fallback)
+
+    def _enter_main_stage(self, auto, sched):
+        """Hand over from the automatic twilight stage to the programme proper."""
+        self._stage = "main"
+        self._auto_exposure = None
+        auto.reset()
+        console_ui.log(f"Sun at {sched.sun_max_angle:g}° — main cycle, "
+                       f"scheduled exposures.")
+
+    def _slot_binning(self):
+        """The binning to force on this slot, or ``None`` to keep the entry's own.
+
+        Every preflight slot holds one binning from config, whatever filter or
+        exposure the schedule entry itself carries, right up to the handover
+        to the main programme.
+        """
+        if self._stage == "preflight" and self.cfg.preflight.binning:
+            return self.cfg.preflight.binning
+        return None
+
+    def _split_guard_runs(self):
+        """True where this camera drives the overexposure guard.
+
+        ``sun_cycle`` only — see ``japan_config.SPLIT_MODES``. The ASI imager
+        runs the same guard in ``time`` as well; here that mode is the standalone
+        program's plain cycle, one frame per slot, and stays that way.
+        """
+        return (self.cfg.overexposure.enabled
+                and self.cfg.schedule.mode in japan_config.SPLIT_MODES)
+
+    def _plan_slot(self, entry, auto, guard):
+        """``(exposure, frames)`` for this visit to ``entry``.
+
+        With both features off this is ``(entry.exposure, 1)``, so the camera
+        gets exactly the calls it always got.
+        """
+        sched = self.cfg.schedule
+        if self._stage == "preflight":
+            budget = japan_schedule.slot_budget(sched.entries, sched.period, entry,
+                                                sched.dead_time)
+            exposure = auto.exposure_for(entry, budget)
+            self._auto_exposure = exposure
+            self._split_frames = 1
+            return exposure, 1
+        # The split guard owns the exposure in the main stage; a slot it has not
+        # divided keeps the scheduled one untouched.
+        frames, exposure = guard.plan(entry, self._slot_dead_time(entry))
+        self._auto_exposure = None
+        self._split_frames = frames
+        return exposure, frames
+
+    def _feed_controllers(self, entry, exposure, mean, auto, guard):
+        """Give the slot's measured intensity to whichever loop is driving it."""
+        if mean is None:
+            return
+        if self._stage == "preflight":
+            bias = self._bias_for(exposure, self.cfg.preflight.bias)
+            budget = japan_schedule.slot_budget(
+                self.cfg.schedule.entries, self.cfg.schedule.period, entry,
+                self.cfg.schedule.dead_time)
+            old, new = auto.update(entry, exposure, mean, budget, bias=bias,
+                                   saturated_fraction=self._last_saturation)
+            if abs(new - old) > 1e-6:
+                console_ui.log(f"Preflight {japan_exposure.slot_label(entry)}: "
+                               f"mean {mean:.0f} ADU → exposure {new:g} s")
+            return
+        if not self._split_guard_runs():
+            return
+        dead = self._slot_dead_time(entry)
+        bias = self._bias_for(exposure, self.cfg.overexposure.bias)
+        old, new = guard.update(entry, dead, mean, bias=bias)
+        if new == old:
+            # A slot whose dead time swallows the whole budget cannot be divided
+            # at all. Saying so once matters: otherwise it over-exposes all night
+            # with nothing in the log to explain why the guard did nothing.
+            if guard.impossible(entry) and mean >= self.cfg.overexposure.threshold:
+                key = japan_exposure.slot_key(entry)
+                if key not in self._warned_slots:
+                    self._warned_slots.add(key)
+                    console_ui.warn(
+                        f"{japan_exposure.slot_label(entry)}: mean {mean:.0f} ADU "
+                        f"over {self.cfg.overexposure.threshold:.0f}, but "
+                        f"{entry.exposure:g} s against {dead:g} s of dead time "
+                        f"leaves no room to divide it")
+            return
+        if new > old:
+            sub = japan_exposure.sub_exposure(entry.exposure, dead, new,
+                                              self.cfg.overexposure.margin)
+            console_ui.warn(
+                f"{japan_exposure.slot_label(entry)}: mean {mean:.0f} ADU over "
+                f"{self.cfg.overexposure.threshold:.0f} — next visit takes "
+                f"{new} frames of {sub:g} s")
+        elif new == 1:
+            console_ui.log(f"{japan_exposure.slot_label(entry)}: back to one "
+                           f"{entry.exposure:g} s frame")
+        else:
+            sub = japan_exposure.sub_exposure(entry.exposure, dead, new,
+                                              self.cfg.overexposure.margin)
+            console_ui.log(f"{japan_exposure.slot_label(entry)}: down to {new} "
+                           f"frames of {sub:g} s")
+
+    def _slot_dead_time(self, entry):
+        """The save/readout time this slot budgets for, in seconds."""
+        if entry.readout is not None:
+            return float(entry.readout)
+        return float(self.cfg.schedule.dead_time)
+
+    def _intensity_text(self, exposure, frames):
+        """The bit of the dashboard detail line the two loops own."""
+        if self._stage == "preflight":
+            return (f"  ·  auto {exposure:g} s "
+                    f"(target {self.cfg.preflight.target_mean:.0f} ADU)")
+        if frames > 1:
+            return f"  ·  split ×{frames} of {exposure:g} s"
+        return ""
 
     # ------------------------------------------------------------------
     # Dark frames
@@ -967,6 +1210,10 @@ class JapanWorkerConsole(threading.Thread):
         if not combos or cancelled() or not self.cfg.schedule.dark_frames:
             return
         total = self.cfg.schedule.dark_frames * len(combos)
+        # Neither loop drives a dark, so the dashboard must not go on claiming
+        # an automatic exposure or a split while the closing darks run.
+        self._auto_exposure = None
+        self._split_frames = 1
         self._set_phase(f"dark frames ({phase})", detail=f"0/{total}")
         console_ui.log(f"Dark frames ({phase}): {self.cfg.schedule.dark_frames} × "
                        f"{len(combos)} exposure(s)")
@@ -1259,14 +1506,22 @@ class JapanWorkerConsole(threading.Thread):
     def _run_sun_cycle_mode(self):
         """The general cycle of ``time`` mode, started by the sun rather than the clock.
 
-        The same night the ASI imager's ``sun_cycle`` runs, without its
-        automatic exposure and slot splitting: nothing is exposed until the solar
-        altitude reaches ``sun_max_angle``; the pre-darks are timed to finish as
-        the window opens; the cycle then runs until sunrise. Its phase is locked
+        The same night the ASI imager's ``sun_cycle`` runs, down to its two
+        intensity-control loops: nothing is exposed until the solar altitude
+        reaches ``sun_max_angle``; the pre-darks are timed to finish as the
+        window opens; the cycle then runs until sunrise. Its phase is locked
         to ``t_start`` in UTC — see :meth:`_sun_cycle_anchor` — so the run opens
         with whichever slot the cycle is due at, and two stations far apart,
         whose windows open at different moments, shoot the same filter at the
         same instant.
+
+        With ``preflight`` enabled the session opens one setpoint earlier. The
+        same slots, the same anchor and the same cycle phase run through the
+        bright twilight, but with the exposure chosen to hold a mean intensity
+        rather than read from the schedule; at ``sun_max_angle`` the automation
+        stops and the programme above resumes exactly as written. Sunrise still
+        ends the run at ``sun_max_angle``, so the automatic stage is an evening
+        prelude and never a morning encore.
 
         Called once per night by :meth:`run`, and returns when that night's
         session is over.
@@ -1275,16 +1530,30 @@ class JapanWorkerConsole(threading.Thread):
         # reset as the next night is planned.
         self._session_shots = 0
         sched = self.cfg.schedule
+        pre = self.cfg.preflight
+        guard_cfg = self.cfg.overexposure
         angle_fn = self._sun_angle_fn()
         period = sched.period
 
-        activation = japan_schedule.sun_crossing_time(angle_fn, sched.sun_max_angle)
+        # The angle that opens the session. With the preflight stage off this is
+        # sun_max_angle, and everything below is what it always was.
+        open_angle = pre.sun_start_angle if pre.enabled else sched.sun_max_angle
+        activation = japan_schedule.sun_crossing_time(angle_fn, open_angle)
         dark_seconds = japan_schedule.estimate_cycle_dark_duration(
             sched.entries, sched.dark_frames, sched.dead_time)
         dark_start = activation - timedelta(seconds=dark_seconds)
-        self._dash_update(schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle "
-                                   f"{period:.0f} s, window "
-                                   f"~{activation.strftime('%H:%M')}")
+        if pre.enabled:
+            self._dash_update(
+                schedule=f"preflight ≤ {pre.sun_start_angle:g}° → main ≤ "
+                         f"{sched.sun_max_angle:g}°, cycle {period:.0f} s, "
+                         f"window ~{activation.strftime('%H:%M')}")
+            console_ui.log(f"Preflight stage from {pre.sun_start_angle:g}° to "
+                           f"{sched.sun_max_angle:g}°, holding "
+                           f"{pre.target_mean:.0f} ADU")
+        else:
+            self._dash_update(schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle "
+                                       f"{period:.0f} s, window "
+                                       f"~{activation.strftime('%H:%M')}")
         if dark_start > dt.now():
             console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
                            f"measurements ~{activation.strftime('%H:%M:%S')}")
@@ -1303,14 +1572,32 @@ class JapanWorkerConsole(threading.Thread):
         if anchor is None:
             return
 
+        auto = japan_exposure.AutoExposure(pre)
+        guard = japan_exposure.SplitGuard(guard_cfg)
+        # A run started mid-night has already missed the twilight; it goes
+        # straight to the main programme rather than automating a dark sky.
+        self._stage = ("preflight"
+                       if pre.enabled and angle_fn(dt.now()) > sched.sun_max_angle
+                       else "main")
+
         consecutive_errors = 0
         in_session = False
         while not self._stop_event.is_set():
             now = dt.now()
             angle = angle_fn(now)
-            if angle > sched.sun_max_angle:
+            if self._stage == "preflight" and angle <= sched.sun_max_angle:
+                self._enter_main_stage(auto, sched)
+            # The angle that closes the session is the one this stage runs down
+            # to. Sunrise therefore ends the main programme at sun_max_angle and
+            # never hands the morning twilight back to the automatic stage.
+            close_angle = (sched.sun_max_angle if self._stage == "main"
+                           else pre.sun_start_angle)
+            if angle > close_angle:
                 if in_session:
-                    console_ui.log("Sun above the threshold — measurements done.")
+                    console_ui.log("Sun above the threshold — measurements done."
+                                   if self._stage == "main" else
+                                   "Sun above the preflight angle — "
+                                   "measurements done.")
                     break
                 # The window was predicted but has not opened — a crossing
                 # estimate a few seconds early. Wait rather than end the night.
@@ -1323,31 +1610,42 @@ class JapanWorkerConsole(threading.Thread):
 
             slot, entry, iteration = japan_schedule.next_cycle_slot(
                 anchor, period, sched.entries, now)
+            exposure, frames = self._plan_slot(entry, auto, guard)
             self._dash_update(
-                detail=f"cycle {iteration}, Δ{entry.delta:g} s",
+                detail=f"cycle {iteration}, Δ{entry.delta:g} s"
+                       f"{self._intensity_text(exposure, frames)}",
                 schedule=f"sun {angle:+.1f}° (threshold {sched.sun_max_angle:g}°)"
-                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}")
+                         f"  ·  cycle {period:.0f} s  ·  iteration {iteration}"
+                         f"{'  ·  preflight' if self._stage == 'preflight' else ''}")
 
-            self._prepare_entry(entry)
+            self._prepare_entry(entry, exposure=exposure,
+                                binning=self._slot_binning())
             self._refresh_camera_section()
 
-            if not self._wait_until(slot, phase="measuring"):
+            phase = "measuring" if self._stage == "main" else "measuring (preflight)"
+            if not self._wait_until(slot, phase=phase):
                 break
             if self._take_schedule_dirty():
                 continue           # the anchor still holds; the slot does not
-            if angle_fn(dt.now()) > sched.sun_max_angle:
+
+            # The sun moved while we waited. In the main stage that can only
+            # close the window; in the preflight stage it can also hand over to
+            # the main programme, and this same slot then shoots the scheduled
+            # exposure instead of the automatic one.
+            angle = angle_fn(dt.now())
+            if self._stage == "preflight" and angle <= sched.sun_max_angle:
+                self._enter_main_stage(auto, sched)
+                exposure, frames = self._plan_slot(entry, auto, guard)
+                self._prepare_entry(entry, exposure=exposure)
+            elif angle > (sched.sun_max_angle if self._stage == "main"
+                          else pre.sun_start_angle):
                 console_ui.log("Window closed while waiting — skipping frame.")
                 continue
 
-            # As in time mode, the camera is the authority on what was applied.
-            exposure = entry.exposure
-            applied = self.cam.current_exposure
-            if applied and abs(float(applied) - float(exposure)) > 1e-6:
-                console_ui.warn(f"Camera holds {applied:g} s but {exposure:g} s was "
-                                f"planned — filing the frame as {applied:g} s")
-                exposure = applied
-
-            if self._capture_one(dt.now(), exposure, "LIGHT", "sun_cycle"):
+            obs_mode = "sun_cycle_auto" if self._stage == "preflight" else "sun_cycle"
+            ok, mean = self._capture_slot(entry, exposure, frames, obs_mode)
+            self._feed_controllers(entry, exposure, mean, auto, guard)
+            if ok:
                 consecutive_errors = 0
             else:
                 consecutive_errors += 1

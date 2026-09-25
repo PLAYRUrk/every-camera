@@ -21,19 +21,32 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils import load_config, save_config, DEFAULT_CONFIG, can_use_gui, LOCAL_CONFIG_FILE
+from utils import (load_config, save_config, DEFAULT_CONFIG, can_use_gui,
+                   LOCAL_CONFIG_FILE, _default_wheel_port)
 
 
 # Said in both filter-wheel tabs, and worth saying: a wheel whose port name
-# moved is indistinguishable, from inside the program, from a dead one.
-_WHEEL_PORT_TIP = (
-    "Serial port of the SmartMotor controller, or 'sim' for the simulator.\n"
-    "Prefer a stable name \u2014 /dev/serial/by-id/usb-...-if00-port0 \u2014 to\n"
-    "/dev/ttyUSB0: ttyUSB* is numbered in the order devices turn up, so a\n"
-    "reboot or a replug can hand ttyUSB0 to a different adapter. That port\n"
-    "still opens and nothing answers on it, which costs the night its\n"
-    "filter tags."
-)
+# moved is indistinguishable, from inside the program, from a dead one. The
+# hazard is the same on both platforms and the remedy is not, so the tip is
+# written for whichever one the operator is sitting at.
+if os.name == "nt":
+    _WHEEL_PORT_TIP = (
+        "Serial port of the SmartMotor controller, or 'sim' for the simulator.\n"
+        "COM numbers are handed out per adapter, and a replug into a different\n"
+        "USB socket can move one: find the wheel in Device Manager under\n"
+        "\u00abPorts (COM & LPT)\u00bb and check the number after any rewiring.\n"
+        "A stale COM port still opens and nothing answers on it, which costs\n"
+        "the night its filter tags."
+    )
+else:
+    _WHEEL_PORT_TIP = (
+        "Serial port of the SmartMotor controller, or 'sim' for the simulator.\n"
+        "Prefer a stable name \u2014 /dev/serial/by-id/usb-...-if00-port0 \u2014 to\n"
+        "/dev/ttyUSB0: ttyUSB* is numbered in the order devices turn up, so a\n"
+        "reboot or a replug can hand ttyUSB0 to a different adapter. That port\n"
+        "still opens and nothing answers on it, which costs the night its\n"
+        "filter tags."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +812,7 @@ class AsiConfigTab:
         # ── Filter wheel + site ────────────────────────────────────────────
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
-        self.le_port = QLineEdit(wheel.get("port", "/dev/ttyUSB0"))
+        self.le_port = QLineEdit(wheel.get("port") or _default_wheel_port())
         self.le_port.setToolTip(_WHEEL_PORT_TIP)
         _add_label_row(hgrid, row, "Serial port:", self.le_port); row += 1
 
@@ -1164,12 +1177,14 @@ class AsiConfigTab:
 class JapanConfigTab:
     """Builds and reads the Japan (Hamamatsu) all-sky imager configuration form.
 
-    Deliberately smaller than :class:`AsiConfigTab`: this camera has no cooling to
-    configure, no automatic exposure and no overexposure guard. The slot table
-    has no gain or readout column for the same reason — nothing here would read
-    them. What it has that the ASI tab does not is the instrument name (the
-    ``NAME`` card) and the site's name, which ``sun_cycle`` puts into every
-    file name.
+    Deliberately smaller than :class:`AsiConfigTab`: this camera has no cooling
+    to configure and no analog gain, so the slot table has no gain or readout
+    column — nothing here would read them. The intensity-control group is the
+    same one, with one difference stated in its caption and its tooltip: both
+    loops belong to ``sun_cycle`` here, where on the ASI imager the split guard
+    also drives ``time``. What this tab has that the ASI one does not is the
+    instrument name (the ``NAME`` card) and the site's name, which ``sun_cycle``
+    puts into every file name.
     """
 
     SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
@@ -1251,7 +1266,7 @@ class JapanConfigTab:
         # ── Filter wheel + site ────────────────────────────────────────────
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
-        self.le_port = QLineEdit(wheel.get("port", "/dev/ttyUSB0"))
+        self.le_port = QLineEdit(wheel.get("port") or _default_wheel_port())
         self.le_port.setToolTip(_WHEEL_PORT_TIP)
         _add_label_row(hgrid, row, "Serial port:", self.le_port); row += 1
 
@@ -1379,6 +1394,97 @@ class JapanConfigTab:
 
         root.addWidget(sched_box)
 
+        # ── Intensity control ──────────────────────────────────────────────
+        # Both loops belong to sun_cycle on this camera. As on the asi tab, only
+        # the settings an operator changes between nights are on screen; the
+        # pedestal, the deadband and the step limits stay in the file and are
+        # carried through by get_config().
+        pre = c.get("preflight") or {}
+        guard = c.get("overexposure") or {}
+        int_box, igrid = _group_grid("Intensity control  (sun_cycle mode only)")
+        row = 0
+        self.cb_preflight = QCheckBox("sun_cycle: shoot the bright twilight "
+                                      "first, with automatic exposure")
+        self.cb_preflight.setChecked(bool(pre.get("enabled", False)))
+        self.cb_preflight.setToolTip(
+            "Starts the cycle one solar setpoint earlier and holds a mean frame "
+            "intensity instead of using the slot exposures. At the angle above "
+            "the automation stops and the normal cycle takes over.")
+        igrid.addWidget(self.cb_preflight, row, 0, 1, 2); row += 1
+
+        self.sb_pre_angle = QDoubleSpinBox()
+        self.sb_pre_angle.setRange(-90.0, 90.0)
+        self.sb_pre_angle.setDecimals(1)
+        self.sb_pre_angle.setSuffix("°")
+        self.sb_pre_angle.setToolTip("The first setpoint. Must be ABOVE the "
+                                     "solar altitude above: the sun passes it "
+                                     "first on the way down.")
+        self.sb_pre_angle.setValue(float(pre.get("sun_start_angle", -6.0)))
+        _add_label_row(igrid, row, "Automatic stage below:", self.sb_pre_angle)
+        row += 1
+
+        self.sb_pre_target = QDoubleSpinBox()
+        self.sb_pre_target.setRange(0.0, 65535.0)
+        self.sb_pre_target.setDecimals(0)
+        self.sb_pre_target.setSuffix(" ADU")
+        self.sb_pre_target.setToolTip("Mean frame intensity the automatic stage "
+                                      "holds, in 16-bit counts (0-65535)")
+        self.sb_pre_target.setValue(float(pre.get("target_mean", 20000.0)))
+        _add_label_row(igrid, row, "Target mean intensity:", self.sb_pre_target)
+        row += 1
+
+        self.sb_pre_min_exp = QDoubleSpinBox()
+        self.sb_pre_min_exp.setRange(0.001, 3600.0)
+        self.sb_pre_min_exp.setDecimals(3)
+        self.sb_pre_min_exp.setSuffix(" s")
+        self.sb_pre_min_exp.setToolTip("Shortest exposure the loop may pick; it "
+                                       "never goes longer than the slot's own")
+        self.sb_pre_min_exp.setValue(float(pre.get("min_exposure", 0.05)))
+        _add_label_row(igrid, row, "Shortest automatic exposure:",
+                       self.sb_pre_min_exp)
+        row += 1
+
+        self.cb_overexp = QCheckBox("sun_cycle: split a slot's frame when it "
+                                    "over-exposes")
+        self.cb_overexp.setChecked(bool(guard.get("enabled", False)))
+        self.cb_overexp.setToolTip(
+            "When a slot comes back brighter than the threshold, its next visit "
+            "takes several shorter frames instead of one — enough of them that "
+            "none saturates, and never more time than the slot already had.\n"
+            "Unlike the asi camera, this camera runs the guard in sun_cycle "
+            "only: its time mode stays the plain cycle it always was.")
+        igrid.addWidget(self.cb_overexp, row, 0, 1, 2); row += 1
+
+        self.sb_overexp_limit = QDoubleSpinBox()
+        self.sb_overexp_limit.setRange(0.0, 65535.0)
+        self.sb_overexp_limit.setDecimals(0)
+        self.sb_overexp_limit.setSuffix(" ADU")
+        self.sb_overexp_limit.setToolTip("Mean frame intensity above which the "
+                                         "slot divides, in 16-bit counts")
+        self.sb_overexp_limit.setValue(float(guard.get("threshold", 55000.0)))
+        _add_label_row(igrid, row, "Split above:", self.sb_overexp_limit)
+        row += 1
+
+        self.sb_overexp_max = QSpinBox()
+        self.sb_overexp_max.setRange(2, 16)
+        self.sb_overexp_max.setToolTip("Most sub-frames one slot may be divided "
+                                       "into. The slot's own timing may allow "
+                                       "fewer.")
+        self.sb_overexp_max.setValue(int(guard.get("max_splits", 4)))
+        _add_label_row(igrid, row, "Most sub-frames:", self.sb_overexp_max)
+        row += 1
+
+        for box, widgets in ((self.cb_preflight, (self.sb_pre_angle,
+                                                  self.sb_pre_target,
+                                                  self.sb_pre_min_exp)),
+                             (self.cb_overexp, (self.sb_overexp_limit,
+                                                self.sb_overexp_max))):
+            for widget in widgets:
+                box.toggled.connect(widget.setEnabled)
+                widget.setEnabled(box.isChecked())
+
+        root.addWidget(int_box)
+
         # ── Slot table ─────────────────────────────────────────────────────
         slot_box = QGroupBox("Schedule slots  (delta+binning: time/sun_cycle "
                              "mode · seconds: sun mode)")
@@ -1456,12 +1562,15 @@ class JapanConfigTab:
         """The edited section, layered over whatever was already in the file.
 
         The caller replaces ``japan`` wholesale with what comes back, so anything
-        this form does not put on screen has to be carried through rather than
+        this form does not put on screen — the filter wavelength table, and the
+        intensity-control settings a station tuned by hand (the pedestal, the
+        deadband, the step limits) — has to be carried through rather than
         dropped on the first save.
         """
         merged = copy.deepcopy(self._orig)
         merged.update(self._edited())
-        for section in ("camera", "filter_wheel", "location"):
+        for section in ("camera", "filter_wheel", "location",
+                        "preflight", "overexposure"):
             base = self._orig.get(section)
             if isinstance(base, dict):
                 merged[section] = {**base, **merged[section]}
@@ -1497,6 +1606,17 @@ class JapanConfigTab:
                 "lat": self.sb_lat.value(),
                 "lon": self.sb_lon.value(),
                 "elevation": self.sb_elev.value(),
+            },
+            "preflight": {
+                "enabled": self.cb_preflight.isChecked(),
+                "sun_start_angle": self.sb_pre_angle.value(),
+                "target_mean": self.sb_pre_target.value(),
+                "min_exposure": self.sb_pre_min_exp.value(),
+            },
+            "overexposure": {
+                "enabled": self.cb_overexp.isChecked(),
+                "threshold": self.sb_overexp_limit.value(),
+                "max_splits": self.sb_overexp_max.value(),
             },
         }
 

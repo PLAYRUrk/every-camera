@@ -4,6 +4,7 @@ Shared utilities: config, schedule, instance naming, status files.
 import os
 import re
 import json
+import shutil
 import socket
 from datetime import datetime as dt
 from dataclasses import dataclass
@@ -93,7 +94,13 @@ class InstanceClaim:
         self._path = path
 
     def release(self):
-        """Give the name back. Closing the descriptor is what drops the flock.
+        """Give the name back. Closing the descriptor is what drops the lock.
+
+        True on both platforms: a POSIX ``flock`` and a Windows ``msvcrt``
+        byte-range lock are both dropped when the last descriptor onto the file
+        is closed, and both are dropped by the kernel when the process dies —
+        which is the property the whole scheme rests on, since a crashed run must
+        not leave its name reserved.
 
         The file itself stays: unlinking it would let a third process create a
         fresh file at the same path and lock *that* inode while a second process
@@ -116,25 +123,61 @@ class InstanceClaim:
         return False
 
 
+def _lock_file_exclusive(fd):
+    """Take a non-blocking exclusive lock on ``fd``. False when someone holds it.
+
+    Two implementations of one idea, because the two platforms spell it
+    differently and both are stations we run cameras on:
+
+    * POSIX ``fcntl.flock`` — whole-file advisory lock, dropped on close and on
+      process death.
+    * Windows ``msvcrt.locking(LK_NBLCK)`` — a *mandatory* byte-range lock, so
+      one byte is enough; also dropped on close and on process death. It needs a
+      byte to lock, and the file is created empty, so the range is taken at
+      offset 0 over a length of one whether or not that byte exists yet.
+
+    Raises ``NotImplementedError`` where neither module is available, which is
+    the caller's signal to run without a reservation rather than not run.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        pass
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    try:
+        import msvcrt
+    except ImportError:
+        raise NotImplementedError("no file locking on this platform")
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
 def claim_instance_name(base_name, lock_dir=None):
     """Reserve ``base_name`` for this process. Returns an :class:`InstanceClaim`.
 
     While another *live* process on this machine holds the name, ``-2``, ``-3``
     … are appended, so several copies of every-camera can run from one
     identical config.json without sharing log files or preview
-    files. The reservation is a ``flock`` on a file in ``~/.every_camera/instances``:
-    the kernel drops it when the process dies, so a crashed run frees its name
-    without leaving anything to clean up.
+    files. The reservation is a lock on a file in ``~/.every_camera/instances``
+    — ``flock`` on POSIX, an ``msvcrt`` byte-range lock on Windows: the kernel
+    drops either when the process dies, so a crashed run frees its name without
+    leaving anything to clean up.
 
-    Platforms without ``fcntl`` (Windows, where only the observer tools run)
-    get the name unchanged and no reservation.
+    A platform with neither gets the name unchanged and no reservation. That is
+    a real loss, not a formality — two copies would then share status, log and
+    preview file names — so it is worth a warning rather than a silent pass.
     """
     base_name = sanitize_name(base_name, fallback="camera")
-    try:
-        import fcntl
-    except ImportError:
-        return InstanceClaim(base_name)
-
     directory = lock_dir or INSTANCE_LOCK_DIR
     try:
         os.makedirs(directory, exist_ok=True)
@@ -151,8 +194,14 @@ def claim_instance_name(base_name, lock_dir=None):
         except OSError:
             continue
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+            locked = _lock_file_exclusive(fd)
+        except NotImplementedError:
+            os.close(fd)
+            console_ui.warn(f"This platform offers no file locking; instance "
+                            f"name '{base_name}' is not reserved. Run one copy "
+                            f"at a time, or set distinct instance names.")
+            return InstanceClaim(base_name)
+        if not locked:
             os.close(fd)          # held by a live process — try the next name
             continue
         try:
@@ -323,8 +372,9 @@ DEFAULT_CONFIG = {
     },
     # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor
     # filter wheel the ASI camera uses. This is the older of the two observing
-    # programmes — no cooling control, no automatic exposure — so its block is
-    # much smaller than the asi one above.
+    # programmes — no cooling control, no analog gain — so its block is smaller
+    # than the asi one above. Its sun_cycle mode is the exception: there it runs
+    # the ASI imager's night, intensity-control loops and all.
     "japan": {
         "instance_name": "",
         "output_dir": "",               # sun/time: frames land here flat, one dir
@@ -346,6 +396,33 @@ DEFAULT_CONFIG = {
         "schedule": [],                 # sun:  {"filter":3,"exposure":30,"seconds":[0,30]}
                                         # time/sun_cycle: {"delta":100,"filter":3,
                                         #        "exposure":25,"binning":1}
+        # sun_cycle only: shoot the bright twilight between two solar setpoints,
+        # on the main schedule but with the exposure chosen automatically to
+        # hold a mean frame intensity. Off by default. Same keys as asi.preflight.
+        "preflight": {
+            "enabled": False,
+            "sun_start_angle": -6.0,    # first setpoint; must be ABOVE sun_max_angle
+            "target_mean": 20000.0,     # mean frame intensity to hold, ADU 0..65535
+            "tolerance": 0.15,          # deadband, as a fraction of the target
+            "min_exposure": 0.05,       # shortest exposure the loop may pick, s
+            "max_exposure": None,       # None = no longer than the slot's own
+            "max_step": 4.0,            # largest exposure change per measurement
+            "bias": 0.0,                # pedestal, ADU; used when there are no darks
+            "binning": None,            # None: each slot keeps its schedule binning
+        },
+        # sun_cycle only — unlike asi.overexposure, which also drives the time
+        # mode: divide a slot's frame into shorter sub-frames when it comes back
+        # over the threshold, so a filter cannot saturate. Off by default.
+        "overexposure": {
+            "enabled": False,
+            "threshold": 55000.0,       # mean ADU above which the slot divides
+            "release": 0.85,            # hysteresis on the way back to one frame
+            "max_splits": 4,
+            "min_exposure": 0.05,       # shortest sub-frame, s
+            "margin": 0.5,              # slack kept inside the slot budget, s
+            "min_frame_gap": 1.0,       # sub-frames stay this far apart, s
+            "bias": 0.0,                # pedestal, ADU; used when there are no darks
+        },
         "camera": {
             "backend": "dcam",          # "dcam" (real SDK) or "sim"
             "readout_speed": 2,         # 1 slow / low noise, 2 fast
@@ -427,6 +504,32 @@ DEFAULT_CONFIG = {
     "node_name": "",
     "status_dir": "",
 }
+
+
+def _default_wheel_port():
+    """This platform's usual filter-wheel port name.
+
+    Imported here rather than at module scope: ``utils`` is what the observer
+    tools import to find their config, and they carry no ``cameras`` package
+    requirements at all. The module it reaches into pulls in pyserial only when
+    a port is opened, so the import itself is free wherever it does happen.
+    """
+    try:
+        from cameras.common.filterwheel import default_port
+    except ImportError:
+        return "COM3" if os.name == "nt" else "/dev/ttyUSB0"
+    return default_port()
+
+
+# The literals above are written the way a Linux station reads, because that is
+# what most of them are and a schema is easier to read spelled one way. On
+# Windows they would be a port that cannot exist, so both are replaced here —
+# and the wizard and the setup GUI ask the same function, so a fresh config.json
+# offers ``COM3`` there and ``/dev/ttyUSB0`` here.
+for _camera_with_a_wheel in ("asi", "japan"):
+    DEFAULT_CONFIG[_camera_with_a_wheel]["filter_wheel"]["port"] = \
+        _default_wheel_port()
+del _camera_with_a_wheel
 
 
 def _drop_retired_keys(cfg):
@@ -650,15 +753,50 @@ def cleanup_stale_status_files(status_dir):
 # ---------------------------------------------------------------------------
 # System info for monitoring
 # ---------------------------------------------------------------------------
+def _windows_mem_used_pct():
+    """Memory in use, as a percentage, from ``GlobalMemoryStatusEx``.
+
+    The Windows counterpart of ``/proc/meminfo``. ``dwMemoryLoad`` is exactly
+    the number wanted — the percentage of physical memory in use — so there is
+    no arithmetic to get wrong here.
+    """
+    import ctypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return float(status.dwMemoryLoad)
+
+
 def get_system_info(output_dir=None):
-    """Collect system metrics for monitoring payload."""
+    """Collect system metrics for monitoring payload.
+
+    Every metric below is optional and every reader treats it so: a key that
+    cannot be produced on this platform is left out rather than faked. On
+    Windows that is ``load_avg_1m``, which has no counterpart there — the
+    monitor shows the row it can fill and drops the one it cannot.
+    """
     import platform
     info = {
         "hostname": platform.node(),
         "ip": get_local_ip(),
         "platform": platform.system(),
     }
-    # CPU usage (non-blocking, quick)
+    # CPU usage (non-blocking, quick). POSIX only: Windows keeps no load
+    # average, and the nearest thing — a CPU-time sample over an interval —
+    # would make this call block, which it must not.
     try:
         with open("/proc/loadavg") as f:
             info["load_avg_1m"] = float(f.read().split()[0])
@@ -666,23 +804,29 @@ def get_system_info(output_dir=None):
         pass
     # Memory
     try:
-        with open("/proc/meminfo") as f:
-            mem = {}
-            for line in f:
-                parts = line.split()
-                if parts[0] in ("MemTotal:", "MemAvailable:"):
-                    mem[parts[0][:-1]] = int(parts[1])
-            if "MemTotal" in mem and "MemAvailable" in mem:
-                info["mem_used_pct"] = round(
-                    100 * (1 - mem["MemAvailable"] / mem["MemTotal"]), 1
-                )
+        if os.name == "nt":
+            info["mem_used_pct"] = _windows_mem_used_pct()
+        else:
+            with open("/proc/meminfo") as f:
+                mem = {}
+                for line in f:
+                    parts = line.split()
+                    if parts[0] in ("MemTotal:", "MemAvailable:"):
+                        mem[parts[0][:-1]] = int(parts[1])
+                if "MemTotal" in mem and "MemAvailable" in mem:
+                    info["mem_used_pct"] = round(
+                        100 * (1 - mem["MemAvailable"] / mem["MemTotal"]), 1
+                    )
     except Exception:
         pass
-    # Disk free
+    # Disk free. ``shutil.disk_usage`` rather than ``os.statvfs``: the latter
+    # does not exist on Windows, and the difference the two once had here —
+    # blocks free to an unprivileged user, against blocks free outright — is
+    # not worth a station that reports no free space at all.
     if output_dir and os.path.isdir(output_dir):
         try:
-            st = os.statvfs(output_dir)
-            info["disk_free_mb"] = round(st.f_bavail * st.f_frsize / (1024 * 1024))
+            info["disk_free_mb"] = round(
+                shutil.disk_usage(output_dir).free / (1024 * 1024))
         except Exception:
             pass
     return info
@@ -931,7 +1075,7 @@ def configure_console_asi(cfg, config_path=None):
                                             cooling.get("warm_on_exit", True))
 
     wheel["port"] = _ask("Filter wheel serial port ('sim' for the simulator)",
-                         wheel.get("port", "/dev/ttyUSB0"))
+                         wheel.get("port") or _default_wheel_port())
     if wheel["port"].strip().lower() != "sim":
         wheel["baudrate"] = _ask_int("Filter wheel baudrate", wheel.get("baudrate", 9600))
 
@@ -1076,7 +1220,7 @@ def configure_console_japan(cfg, config_path=None):
     # offers no setpoint to command.
 
     wheel["port"] = _ask("Filter wheel serial port ('sim' for the simulator)",
-                         wheel.get("port", "/dev/ttyUSB0"))
+                         wheel.get("port") or _default_wheel_port())
     if wheel["port"].strip().lower() != "sim":
         wheel["baudrate"] = _ask_int("Filter wheel baudrate",
                                      wheel.get("baudrate", 9600))
@@ -1121,6 +1265,43 @@ def configure_console_japan(cfg, config_path=None):
     japan["dead_time"] = _ask_float(
         "Dead time reserved between cycles for filter/binning changes (s)",
         japan.get("dead_time", 5.0))
+
+    # Both intensity loops belong to sun_cycle on this camera, and both keep the
+    # keys they are not asked about — the pedestal, the deadband, the step
+    # limits — so a station that tuned them by hand does not lose them to a pass
+    # through the wizard.
+    if japan["mode"] == "sun_cycle":
+        preflight = _deep_copy(DEFAULT_CONFIG["japan"]["preflight"])
+        preflight.update(japan.get("preflight") or {})
+        preflight["enabled"] = _ask_bool(
+            "Shoot the bright twilight first, with automatic exposure?",
+            preflight.get("enabled", False))
+        if preflight["enabled"]:
+            preflight["sun_start_angle"] = _ask_float(
+                f"  Start the automatic stage below (degrees, above "
+                f"{japan['sun_max_angle']:g})",
+                preflight.get("sun_start_angle", -6.0))
+            preflight["target_mean"] = _ask_float(
+                "  Mean frame intensity to hold (ADU, 0-65535)",
+                preflight.get("target_mean", 20000.0))
+            preflight["min_exposure"] = _ask_float(
+                "  Shortest exposure the loop may pick (s)",
+                preflight.get("min_exposure", 0.05))
+        japan["preflight"] = preflight
+
+        guard = _deep_copy(DEFAULT_CONFIG["japan"]["overexposure"])
+        guard.update(japan.get("overexposure") or {})
+        guard["enabled"] = _ask_bool(
+            "Split a slot's frame in two when it over-exposes?",
+            guard.get("enabled", False))
+        if guard["enabled"]:
+            guard["threshold"] = _ask_float(
+                "  Mean intensity above which the slot splits (ADU, 0-65535)",
+                guard.get("threshold", 55000.0))
+            guard["max_splits"] = _ask_int(
+                "  Most sub-frames one slot may be divided into",
+                guard.get("max_splits", 4))
+        japan["overexposure"] = guard
 
     schedule_file = _ask("Schedule file path, .txt or .json "
                          "(empty = use the slots below)",

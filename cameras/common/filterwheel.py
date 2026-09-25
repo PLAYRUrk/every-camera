@@ -3,8 +3,10 @@
 One controller, one wire protocol, shared by both imagers: the legacy C daemon
 drove it (``imagerd_rt/src/imagerd_rt/src/imager_ctrl.c``, ``FW_Control()``), the
 PIXIS (``asi``) drives it, and the Hamamatsu (``japan``) drives it. Only the port
-name differs (``/dev/ttyUSB0`` on Linux instead of ``COM1``), which is why this
-module lives in ``cameras/common/`` and not under either camera.
+name differs — ``/dev/ttyUSB0`` on Linux, ``COM3`` on Windows, and see
+:func:`default_port` — which is why this module lives in ``cameras/common/`` and
+not under either camera. The code below never looks at the name: it opens what
+config.json gives it.
 
     GOSUB5      home the wheel
     g=<n>       select filter n (1..6)
@@ -46,6 +48,8 @@ that talks while it refuses to turn is a different fault, and the retries and
 the rebuild are still the answer to that one.
 """
 from __future__ import annotations
+import os
+
 from time import monotonic, sleep
 from typing import TYPE_CHECKING
 
@@ -57,6 +61,18 @@ if TYPE_CHECKING:
 FILTER_MIN = 1
 FILTER_MAX = 6
 HOME = 0            # the position GOSUB5 parks the wheel at
+
+# What the port is likely to be called before anyone has looked. The wheel is a
+# USB-serial adapter on both platforms, so neither of these is more than a first
+# guess — the point is to offer a guess in the right *notation*, since a Windows
+# station asked for ``/dev/ttyUSB0`` has to be told twice what it wants.
+DEFAULT_PORT_POSIX = "/dev/ttyUSB0"
+DEFAULT_PORT_WINDOWS = "COM3"
+
+
+def default_port() -> str:
+    """The port name to offer as a default on this platform."""
+    return DEFAULT_PORT_WINDOWS if os.name == "nt" else DEFAULT_PORT_POSIX
 
 # How long a single read of the port may block. Real waiting is done against the
 # caller's deadline, so this only bounds how late an answer can be noticed.

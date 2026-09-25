@@ -13,6 +13,7 @@ change, and a future SDK bump that copies the file in and forgets to re-apply it
 would restore a hard-coded path. That failure would otherwise surface on the
 station, at night.
 """
+import platform
 import subprocess
 import sys
 
@@ -79,6 +80,15 @@ def test_the_simulator_backend_needs_nothing_from_the_sdk():
 # A missing runtime says what it looked for
 # ---------------------------------------------------------------------------
 def test_a_missing_runtime_names_every_path_it_tried(monkeypatch):
+    """The default in the message is this platform's, not Linux's.
+
+    The vendor hunk picks its candidates from ``platform.system()`` —
+    ``dcamapi.dll`` on Windows, ``libdcamapi.so`` elsewhere — so asserting the
+    Linux path outright would fail on the very station this camera is most
+    likely to be attached to.
+    """
+    default = ("dcamapi.dll" if platform.system() == "Windows"
+               else "/usr/local/lib/libdcamapi.so")
     monkeypatch.setenv("DCAM_LIB", "/nonexistent/libdcamapi.so")
     monkeypatch.setattr(dcamsdk, "_sdk", None)
     with pytest.raises(OSError) as excinfo:
@@ -86,7 +96,7 @@ def test_a_missing_runtime_names_every_path_it_tried(monkeypatch):
     message = str(excinfo.value)
     assert "DCAM_LIB" in message, "the override is not mentioned"
     assert "/nonexistent/libdcamapi.so" in message, "the tried path is not shown"
-    assert "/usr/local/lib/libdcamapi.so" in message, "the default is not shown"
+    assert default in message, "the platform's default is not shown"
 
 
 def test_a_failed_load_leaves_no_half_imported_module(monkeypatch):

@@ -235,22 +235,83 @@ class WorkerBus:
 
 
 
+# Kept alive for the life of the process: ``SetConsoleCtrlHandler`` stores the
+# pointer and calls back through it, and a callback the garbage collector has
+# reclaimed is a crash at the worst possible moment — the machine shutting down.
+_console_ctrl_handler = None
+
+# The console events Windows delivers that mean "this process is going away".
+# CTRL_C and CTRL_BREAK arrive as signals as well and are handled there; these
+# three do not, and are the ones that used to cost a station its closing darks.
+_WINDOWS_CLOSE_EVENTS = (2, 5, 6)      # CTRL_CLOSE, CTRL_LOGOFF, CTRL_SHUTDOWN
+
+
+def _install_windows_console_handler(handler):
+    """Give the closing darks a chance when the console window is shut.
+
+    Windows never delivers SIGTERM of its own accord, so on that platform the
+    signal handlers above cover Ctrl+C and Ctrl+Break and nothing else: closing
+    the console window, logging off or shutting the machine down would take the
+    process out mid-exposure, with the shutter open and no closing darks — the
+    exact failure ``install_stop_handler`` exists to prevent on Linux.
+
+    ``SetConsoleCtrlHandler`` is the hook for those three. It runs the callback
+    on a thread of the OS's making, so all it does is call the same handler the
+    signals call — which only sets an event — and then return True to say the
+    event was handled. Windows still ends the process after a timeout (about
+    five seconds for CTRL_CLOSE), so this buys the shutdown path a chance, not a
+    guarantee; a long closing dark run may still be cut short.
+    """
+    global _console_ctrl_handler
+    import ctypes
+
+    prototype = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+    def on_console_event(event):
+        if event in _WINDOWS_CLOSE_EVENTS:
+            handler(signal.SIGTERM, None)
+            return 1
+        return 0
+
+    _console_ctrl_handler = prototype(on_console_event)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+
+
 def install_stop_handler(handler):
-    """Route both stop signals to ``handler``: Ctrl+C and ``systemctl stop``.
+    """Route every stop signal to ``handler``: Ctrl+C and ``systemctl stop``.
 
     Every driver used to listen for SIGINT alone, which is fine at a terminal
     and wrong under a service manager: ``systemctl stop`` and a reboot send
     SIGTERM, whose default disposition kills the process outright. For a camera
     that means the closing dark frames are lost — and, on the ASI, that the
     sensor never runs its warm-up, because that lives in the shutdown path the
-    process no longer reaches. The two signals mean the same thing to us, so
-    they get the same handler.
+    process no longer reaches. The signals mean the same thing to us, so they
+    get the same handler.
+
+    On Windows two more routes lead here: ``SIGBREAK`` (Ctrl+Break), which that
+    platform has and POSIX does not, and the console-close events, which arrive
+    through :func:`_install_windows_console_handler` rather than as signals.
+    SIGTERM is still registered there — it exists, and another process may raise
+    it — but nothing in Windows itself ever sends it.
 
     Python delivers signals on the main thread only, so this has to be called
     from there; every driver does, from its ``run_*`` entry point.
     """
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    signals = [signal.SIGINT, signal.SIGTERM]
+    # Windows only; getattr rather than a platform test, because the attribute
+    # is the thing actually being asked about.
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signals.append(sigbreak)
+    for sig in signals:
         signal.signal(sig, handler)
+    if os.name == "nt":
+        try:
+            _install_windows_console_handler(handler)
+        except Exception as exc:      # pragma: no cover - Windows only
+            console_ui.warn(f"Could not hook the console close button: {exc}. "
+                            f"Closing the window will end the run without its "
+                            f"closing darks — stop it with Ctrl+C instead.")
 
 
 def stop_signal_name(sig):
@@ -259,7 +320,11 @@ def stop_signal_name(sig):
     "Ctrl+C" is what the operator did at a terminal, and nonsense in a journal
     where the request came from ``systemctl stop``.
     """
-    return "Ctrl+C" if sig == signal.SIGINT else "SIGTERM"
+    if sig == signal.SIGINT:
+        return "Ctrl+C"
+    if sig == getattr(signal, "SIGBREAK", None):
+        return "Ctrl+Break"
+    return "SIGTERM"
 
 
 def run_focus_iteration(service, grab, on_error=None):

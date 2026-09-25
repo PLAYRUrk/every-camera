@@ -2,13 +2,26 @@
 # Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
 -r requirements.txt
 
-pyserial>=3.5,<4       # колесо фильтров SmartMotor на /dev/ttyUSB*
+pyserial>=3.5,<4       # колесо фильтров SmartMotor: /dev/ttyUSB* или COM*
 astropy>=5.3,<6.2      # обязателен: запись FITS; 7.x требует numpy 2.x
 
-# Системные зависимости:
+# Системные зависимости (Linux):
 #   DCAM-API SDK — libdcamapi.so (export DCAM_LIB=... или установка в /usr/local/lib).
 #     Обёртки Hamamatsu (dcam.py, dcamapi4.py) уже лежат в
 #     cameras/japan/dcamsdk/vendor/ — отдельно ставить их не нужно, нужна
 #     только сама библиотека из установщика SDK.
 #   sudo usermod -aG dialout $USER   # и перелогиниться
-# Без SDK драйвер работает с japan.camera.backend = "sim" и filter_wheel.port = "sim".
+#
+# Системные зависимости (Windows):
+#   Эта камера — единственная, которая целиком поддерживается на Windows;
+#   см. раздел «Windows» в README.md.
+#   DCAM-API SDK — dcamapi.dll. Установщик кладёт её в System32, и тогда
+#     ничего настраивать не нужно; иначе укажите файл через DCAM_LIB
+#     (env.cmd, см. env.cmd.example).
+#   Драйвер USB-переходника колеса фильтров (FTDI/Prolific/CP210x — какой стоит
+#     в переходнике). Номер порта — «Диспетчер устройств» → «Порты (COM и LPT)»,
+#     он же japan.filter_wheel.port в config.json.
+#   Запуск: run.cmd --type japan   (аналог run.sh; systemd на Windows нет).
+#
+# Без SDK драйвер работает с japan.camera.backend = "sim" и filter_wheel.port = "sim"
+# на обеих платформах.

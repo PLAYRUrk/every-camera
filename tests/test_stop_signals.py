@@ -32,21 +32,77 @@ import worker_common                                    # noqa: E402
 # The helper itself
 # ---------------------------------------------------------------------------
 def test_both_signals_are_installed(monkeypatch):
+    """Every stop signal this platform has goes to the one handler.
+
+    On Windows that is one more than on POSIX — ``SIGBREAK``, which exists only
+    there — so the expectation is built from what the platform offers rather
+    than written out. The console-close hook is not a signal and is covered
+    separately below.
+    """
     installed = {}
     monkeypatch.setattr(signal, "signal",
                         lambda sig, handler: installed.__setitem__(sig, handler))
+    monkeypatch.setattr(worker_common.os, "name", "posix")
 
     def handler(sig, frame):
         pass
 
     worker_common.install_stop_handler(handler)
-    assert installed == {signal.SIGINT: handler, signal.SIGTERM: handler}
+    expected = {signal.SIGINT: handler, signal.SIGTERM: handler}
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        expected[sigbreak] = handler
+    assert installed == expected
+
+
+def test_the_console_close_hook_is_only_installed_on_windows(monkeypatch):
+    """Closing the console window is the Windows way to lose the closing darks.
+
+    Windows never sends SIGTERM by itself, so that path is the one and only
+    warning a driver gets that the machine is taking it away. On POSIX the hook
+    must not be reached at all — there is no kernel32 to reach it through.
+    """
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+    calls = []
+    monkeypatch.setattr(worker_common, "_install_windows_console_handler",
+                        lambda handler: calls.append(handler))
+
+    def handler(sig, frame):
+        pass
+
+    monkeypatch.setattr(worker_common.os, "name", "posix")
+    worker_common.install_stop_handler(handler)
+    assert calls == []
+
+    monkeypatch.setattr(worker_common.os, "name", "nt")
+    worker_common.install_stop_handler(handler)
+    assert calls == [handler]
+
+
+def test_a_console_hook_that_cannot_be_installed_is_not_fatal(monkeypatch):
+    """A station that cannot hook the window must still run, and be told why."""
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(worker_common.os, "name", "nt")
+
+    def explode(handler):
+        raise OSError("no console")
+
+    monkeypatch.setattr(worker_common, "_install_windows_console_handler", explode)
+    warnings = []
+    monkeypatch.setattr(worker_common.console_ui, "warn", warnings.append)
+
+    worker_common.install_stop_handler(lambda sig, frame: None)
+    assert len(warnings) == 1
+    assert "Ctrl+C" in warnings[0]
 
 
 def test_the_signal_is_named_for_the_log():
     """"Ctrl+C" in a journal, where nobody pressed anything, is a lie."""
     assert worker_common.stop_signal_name(signal.SIGINT) == "Ctrl+C"
     assert worker_common.stop_signal_name(signal.SIGTERM) == "SIGTERM"
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:                       # Windows only
+        assert worker_common.stop_signal_name(sigbreak) == "Ctrl+Break"
 
 
 # ---------------------------------------------------------------------------

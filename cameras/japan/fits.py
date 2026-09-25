@@ -7,18 +7,23 @@ instrument, and they are the whole of the difference.
 
 What is deliberately absent: ``GAIN`` and ``SETTEMP`` (no analog gain, no cooling
 setpoint — the sensor temperature is a reading only), the intensity-control cards
-``SKYMEAN``/``SPLITNUM``/``SPLITIDX`` (no loops here choose an exposure), and the
-sixteen imagerd_rt legacy records, which belong to the ASI station's archive and
-would be noise in a Hamamatsu frame.
+``SKYMEAN``/``SPLITNUM``/``SPLITIDX`` (neither of the two modes below drives a
+loop that chooses an exposure), and the sixteen imagerd_rt legacy records, which
+belong to the ASI station's archive and would be noise in a Hamamatsu frame.
 
 That is :func:`write_fits`, used by the ``sun`` and ``time`` modes. The
 ``sun_cycle`` mode files its frames into the ASI archive instead, and
-:func:`write_sun_cycle_fits` writes the ASI header set for it — the shared cards
-and the imagerd_rt records — minus every card that says which camera or which
-software took the frame (``INSTRUME``, ``VENDOR``, ``CAMSN``, ``CAMVER``,
-``DRVVER``, ``DCAMVER``, ``BitDepth``, ``CCDGain``, ``DeviceID``, ``Version``;
-``GAIN`` and ``SETTEMP`` have no Hamamatsu value anyway). In their place is one
-``NAME`` card, the instrument name set as ``japan.name`` in config.json.
+:func:`write_sun_cycle_fits` writes the ASI header set for it — the shared cards,
+the intensity-control cards, and the imagerd_rt records — minus every card that
+says which camera or which software took the frame (``INSTRUME``, ``VENDOR``,
+``CAMSN``, ``CAMVER``, ``DRVVER``, ``DCAMVER``, ``BitDepth``, ``CCDGain``,
+``DeviceID``, ``Version``; ``GAIN`` and ``SETTEMP`` have no Hamamatsu value
+anyway). In their place is one ``NAME`` card, the instrument name set as
+``japan.name`` in config.json.
+
+The intensity cards appear only in that mode because only that mode runs the
+loops: ``SKYMEAN`` on every frame, ``SPLITNUM``/``SPLITIDX`` on a slot that was
+actually divided, and ``OBSMODE = sun_cycle_auto`` on a preflight frame.
 """
 from __future__ import annotations
 
@@ -122,12 +127,19 @@ def write_sun_cycle_fits(
     filter_wavelength: str = "",
     filter_description: str = "",
     fw_temp: float | None = None,
+    sky_mean: float | None = None,
+    split_count: int = 1,
+    split_index: int = 1,
 ) -> None:
     """The ASI header set without the instrument cards, plus ``NAME``.
 
     ``readout_speed_text`` is the legacy ``ReadoutSpeed`` record, worded the way
     this camera's setting reads (``2 (fast)``): imagerd_rt's ``2 MHz`` would put
     a PIXIS figure into a Hamamatsu frame.
+
+    ``sky_mean`` and the ``split_*`` pair are what this mode's intensity-control
+    loops measured and decided, spelled exactly as ``cameras/asi/fits.py`` spells
+    them — the two archives are read by the same processing program.
     """
     hdu = fits.PrimaryHDU(data)
     h = hdu.header
@@ -155,6 +167,15 @@ def write_sun_cycle_fits(
         instrument=False,
     )
     h["NAME"] = (name, "instrument name")
+    # What the intensity-control loops measured and decided. SKYMEAN is written
+    # for every frame because it costs one pass over the array and answers the
+    # first question anyone asks of an archived frame; the SPLIT* pair appears
+    # only when a slot was actually divided.
+    if sky_mean is not None:
+        h["SKYMEAN"] = (round(float(sky_mean), 2), "[ADU] mean frame intensity")
+    if split_count and split_count > 1:
+        h["SPLITNUM"] = (int(split_count), "sub-frames this slot was divided into")
+        h["SPLITIDX"] = (int(split_index), "index of this sub-frame, 1-based")
     write_legacy_keys(
         h,
         binning=binning,
