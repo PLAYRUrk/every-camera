@@ -13,8 +13,11 @@ japan-camera is the ancestor of the ``asi`` driver, so the two are deliberately
 close: the sun-mode, time-mode and sun_cycle loops here are the same loops, and the shared
 schedule arithmetic, filter wheel, intensity control and FITS core live in
 ``cameras/common/``. What this driver does *not* have is what the Hamamatsu
-itself does not offer — no analog gain, and no cooling control, the camera
-offering a sensor temperature to read and no setpoint to command.
+itself does not offer — no analog gain, and no managed setpoint: cooling is a
+switch (``japan.cooling``), thrown ``lead_minutes`` before the pre-darks and
+again once a night is over, and only on a model that lets DCAM throw it. In the
+sun modes a night ends by returning to ``run()``, which shuts the shutter
+(``_end_night``) before planning the next one.
 
 Two rules govern the threading, both inherited from the original program because
 both are load-bearing:
@@ -163,6 +166,10 @@ class JapanCamera:
         self.wheel = None
         self._info = {}
         self._opened = False
+        # True once ``japan.cooling`` asked for the cooler to be driven *and* the
+        # camera turned out to allow it. Everything cooling-related is a no-op
+        # otherwise, and the camera keeps cooling itself as it always has.
+        self.cooling_controlled = False
 
     # -- lifecycle -----------------------------------------------------------
     def open(self):
@@ -184,7 +191,22 @@ class JapanCamera:
         except Exception as exc:
             console_ui.warn(f"Could not close the shutter at startup: {exc}")
         self._info = self.cam.info()
+        self.cooling_controlled = self._cooling_available()
         return self
+
+    def _cooling_available(self):
+        if not self.cfg.cooling.enabled:
+            return False
+        try:
+            supported = self.cam.cooler_supported()
+        except Exception as exc:
+            console_ui.warn(f"Could not ask the camera about its cooler: {exc}")
+            supported = False
+        if not supported:
+            console_ui.warn("japan.cooling is enabled, but this camera does not let "
+                            "its cooler be switched over DCAM — leaving it to "
+                            "cool itself")
+        return supported
 
     def close(self):
         if not self._opened:
@@ -246,6 +268,18 @@ class JapanCamera:
     def temperature(self):
         return self.cam.temperature()
 
+    @property
+    def target_temperature(self):
+        """The cooling target, only while this program drives the cooler."""
+        if not self.cooling_controlled:
+            return None
+        return self.cam.target_temperature
+
+    def cooler_status(self):
+        if not self.cooling_controlled:
+            return None
+        return self.cam.cooler_status()
+
     def info_rows(self):
         return self.cam.info_rows()
 
@@ -264,6 +298,16 @@ class JapanCamera:
 
     def set_shutter(self, is_open):
         self.wheel.set_shutter(bool(is_open))
+
+    def set_cooler(self, on):
+        """Switch the cooler. False when it is not this program's to switch."""
+        if not self.cooling_controlled:
+            return False
+        target = self.cfg.cooling.target_temp
+        if on and target is not None:
+            self.cam.set_target_temperature(target)
+        self.cam.set_cooler(bool(on))
+        return True
 
     def capture(self):
         return self.cam.capture()
@@ -295,8 +339,12 @@ class JapanCamera:
         return True
 
     def temperature_fields(self):
-        """The sensor reading for the console, taken on the worker thread only."""
-        return {"ccd_temp": self.temperature()}
+        """The sensor readings for the console, taken on the worker thread only."""
+        fields = {"ccd_temp": self.temperature()}
+        if self.cooling_controlled:
+            fields["cooler"] = self.cooler_status()
+            fields["setpoint"] = self.target_temperature
+        return fields
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +414,9 @@ class JapanWorkerConsole(threading.Thread):
         # True once the operator has set the shutter from focus_app: their choice
         # then stands for the rest of the session, whatever focus would prefer.
         self._focus_shutter_manual = False
+        # What this program last told the cooler: None until it has said
+        # anything, so the first command always goes out.
+        self._cooler_commanded = None
 
     # ------------------------------------------------------------------
     # Stop handling
@@ -392,6 +443,10 @@ class JapanWorkerConsole(threading.Thread):
         readings = readings if readings is not None else {}
         temp = readings.get("ccd_temp")
         temp_text = f"{temp:.2f} °C" if isinstance(temp, (int, float)) else "n/a"
+        if "cooler" in readings:
+            temp_text += f"  ·  cooler {readings['cooler'] or 'unknown'}"
+            if readings.get("setpoint") is not None:
+                temp_text += f", target {readings['setpoint']:.1f} °C"
         binning = self.cam.current_binning or 1
         exposure = self.cam.current_exposure
         rows = [
@@ -474,10 +529,15 @@ class JapanWorkerConsole(threading.Thread):
                           if self._last_mean is not None else None),
             "last_update": dt.now().isoformat(),
         }
-        # No ``set_temp``/``temp_locked``: this camera has no setpoint, so the
-        # monitor shows a reading rather than a reading against a target.
         if readings.get("ccd_temp") is not None:
             payload["ccd_temp"] = round(float(readings["ccd_temp"]), 2)
+        # A target only while this program drives the cooler; otherwise the
+        # monitor shows a reading rather than a reading against a target.
+        if "cooler" in readings:
+            payload["cooler"] = readings["cooler"]
+        if readings.get("setpoint") is not None:
+            payload["set_temp"] = readings["setpoint"]
+            payload["temp_locked"] = readings.get("cooler") == "ready"
         try:
             system = get_system_info(self.output_dir or None)
             payload["system"] = system
@@ -1191,6 +1251,105 @@ class JapanWorkerConsole(threading.Thread):
         return ""
 
     # ------------------------------------------------------------------
+    # Cooling and the day between nights
+    # ------------------------------------------------------------------
+    def _cooler_on(self):
+        if self._cooler_commanded is True:
+            return
+        try:
+            if self.cam.set_cooler(True):
+                self._cooler_commanded = True
+                target = self.cfg.cooling.target_temp
+                console_ui.log("Cooler on" + (f", target {target:g} °C"
+                                              if target is not None else ""))
+        except Exception as exc:
+            console_ui.warn(f"Could not switch the cooler on: {exc}")
+        self._refresh_camera_section()
+
+    def _cooler_off(self):
+        if self._cooler_commanded is False:
+            return
+        try:
+            if self.cam.set_cooler(False):
+                self._cooler_commanded = False
+                console_ui.log("Cooler off")
+        except Exception as exc:
+            console_ui.warn(f"Could not switch the cooler off: {exc}")
+        self._refresh_camera_section()
+
+    def _wait_for_pre_darks(self, dark_start, activation):
+        """Wait for the pre-darks, switching the cooler on ``lead_minutes`` ahead.
+
+        The darks still start on time when the sensor has not got there: they
+        are timed to finish as the window opens, and a missed window costs more
+        than darks a few degrees warm — which is said, so they can be judged.
+        Returns False on a stop.
+        """
+        if dark_start > dt.now():
+            console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
+                           f"measurements ~{activation.strftime('%H:%M:%S')}")
+        if self.cam.cooling_controlled:
+            cool_start = dark_start - timedelta(
+                minutes=self.cfg.cooling.lead_minutes)
+            if cool_start > dt.now():
+                # Started in the day: the camera powers up with its cooler
+                # running, and there is no reason to keep it so until evening.
+                if self.cfg.cooling.off_between_nights:
+                    self._cooler_off()
+                console_ui.log(f"Cooler on at {cool_start.strftime('%H:%M:%S')}")
+                if not self._wait_until(cool_start, phase="waiting for cooling"):
+                    return False
+            self._cooler_on()
+        if dark_start > dt.now():
+            phase = ("waiting for pre-darks (cooling)" if self.cam.cooling_controlled
+                     else "waiting for pre-darks")
+            if not self._wait_until(dark_start, phase=phase):
+                return False
+        self._check_cooled()
+        return True
+
+    def _check_cooled(self):
+        """Warn when the pre-darks are about to start on a sensor still cooling."""
+        if not self.cam.cooling_controlled:
+            return
+        try:
+            temp = self.cam.temperature()
+            target = self.cam.target_temperature
+            status = self.cam.cooler_status()
+        except Exception as exc:
+            console_ui.warn(f"Could not read the cooler before the darks: {exc}")
+            return
+        if target is not None and temp is not None:
+            cooled = abs(temp - target) <= self.cfg.cooling.tolerance
+        else:
+            cooled = status in (None, "ready", "always")
+        if not cooled:
+            reading = "n/a" if temp is None else f"{temp:.1f} °C"
+            console_ui.warn(
+                f"Sensor not cooled yet ({reading}"
+                + (f", target {target:g} °C" if target is not None else "")
+                + f", cooler {status or 'unknown'}) — pre-darks start anyway; "
+                  f"consider a longer japan.cooling.lead_minutes")
+
+    def _end_night(self):
+        """Put the camera to rest between nights: shutter shut, cooler off.
+
+        The sun modes end a night by returning to :meth:`run`, which plans the
+        next one straight away. The shutter used to be shut only when the whole
+        run ended, so it stood open all day waiting for the next pre-darks.
+        """
+        self._focus_opened_shutter = False
+        try:
+            self.cam.set_shutter(False)
+            console_ui.log("Night over — shutter closed until the next pre-darks")
+        except Exception as exc:
+            console_ui.warn(f"Could not close the shutter after the night: {exc}")
+        if self.cfg.cooling.off_between_nights:
+            self._cooler_off()
+        self._set_phase("waiting for the next night")
+        self._refresh_camera_section()
+
+    # ------------------------------------------------------------------
     # Dark frames
     # ------------------------------------------------------------------
     def _capture_darks(self, phase, sync_to_seconds=False, abort_on_stop=False):
@@ -1330,12 +1489,10 @@ class JapanWorkerConsole(threading.Thread):
                                                             sched.dark_frames)
         dark_start = activation - timedelta(seconds=dark_seconds)
         if dark_start > dt.now():
-            console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
-                           f"measurements ~{activation.strftime('%H:%M:%S')}")
             self._dash_update(schedule=f"sun ≤ {sched.sun_max_angle:g}°, "
                                        f"window ~{activation.strftime('%H:%M')}")
-            if not self._wait_until(dark_start, phase="waiting for pre-darks"):
-                return
+        if not self._wait_for_pre_darks(dark_start, activation):
+            return
         self._capture_darks("initial", sync_to_seconds=True, abort_on_stop=True)
         if self._stop_event.is_set():
             return
@@ -1554,11 +1711,8 @@ class JapanWorkerConsole(threading.Thread):
             self._dash_update(schedule=f"sun ≤ {sched.sun_max_angle:g}°, cycle "
                                        f"{period:.0f} s, window "
                                        f"~{activation.strftime('%H:%M')}")
-        if dark_start > dt.now():
-            console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
-                           f"measurements ~{activation.strftime('%H:%M:%S')}")
-            if not self._wait_until(dark_start, phase="waiting for pre-darks"):
-                return
+        if not self._wait_for_pre_darks(dark_start, activation):
+            return
         self._capture_darks("initial", abort_on_stop=True)
         if self._stop_event.is_set():
             return
@@ -1710,18 +1864,22 @@ class JapanWorkerConsole(threading.Thread):
 
         try:
             if self.setup_mode:
+                self._cooler_on()
                 self._run_setup_mode()
             elif self._wait_for_start():
                 mode = self.cfg.schedule.mode
                 if mode == "time":
+                    self._cooler_on()
                     self._run_time_mode()
-                elif mode == "sun_cycle":
+                else:
                     # One night per call; sunrise ends a session, not the run,
                     # exactly as on the ASI imager.
+                    run_night = (self._run_sun_cycle_mode if mode == "sun_cycle"
+                                 else self._run_sun_mode)
                     while not self._stop_event.is_set():
-                        self._run_sun_cycle_mode()
-                else:
-                    self._run_sun_mode()
+                        run_night()
+                        if not self._stop_event.is_set():
+                            self._end_night()
         except Exception as exc:
             self._errors += 1
             console_ui.error(f"Measurement loop failed: {exc}")
@@ -1738,6 +1896,9 @@ class JapanWorkerConsole(threading.Thread):
                     self._capture_darks("final")
                 except Exception as exc:
                     console_ui.error(f"Closing dark frames failed: {exc}")
+            # After the closing darks, which still want the sensor cold.
+            if self.cfg.cooling.off_on_exit:
+                self._cooler_off()
             self._set_phase("stopped")
             self._save_status("stopped", force=True)
             self._bus.shutdown()
@@ -1826,7 +1987,8 @@ def run_probe_japan(config_path=None):
 
 # The properties the driver actually sets or reads. Anything else DCAM exposes is
 # not this driver's business and would only make the table harder to read.
-_PROBE_PROPERTIES = ("EXPOSURETIME", "BINNING", "READOUTSPEED", "SENSORTEMPERATURE")
+_PROBE_PROPERTIES = ("EXPOSURETIME", "BINNING", "READOUTSPEED", "SENSORTEMPERATURE",
+                     "SENSORCOOLER", "SENSORTEMPERATURETARGET", "SENSORCOOLERSTATUS")
 
 
 def _probe_camera(conf):
@@ -1869,6 +2031,8 @@ def _probe_camera(conf):
         print()
         print("japan.camera.binning and japan.camera.readout_speed in config.json "
               "have to be values the matching rows allow.")
+        print("japan.cooling needs SENSORCOOLER to be writable (1 = off, 2 = on); "
+              "target_temp needs SENSORTEMPERATURETARGET.")
     finally:
         dcam.dev_close()
         sdk.Dcamapi.uninit()

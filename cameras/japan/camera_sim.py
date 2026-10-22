@@ -5,9 +5,10 @@ filter sequencing, the dashboard and the FITS output can be exercised end to end
 on a machine with no camera and no DCAM-API SDK installed. Exposures really do
 take the requested time, so timing behaviour matches a real run.
 
-The sensor temperature drifts on its own and cannot be commanded, exactly as on
-the real camera: DCAM reports ``SENSORTEMPERATURE`` and this instrument offers no
-setpoint to control it.
+The cooler can be switched, as ``SENSORCOOLER`` switches it on the real camera:
+on, the sensor relaxes towards the target; off, towards the room. Either way it
+wanders a little, which is what the dashboard and the CCD-TEMP header should be
+shown.
 """
 from __future__ import annotations
 
@@ -26,10 +27,13 @@ if TYPE_CHECKING:
 SENSOR_WIDTH = 2048
 SENSOR_HEIGHT = 2048
 
-# A plausible reading for a Hamamatsu sCMOS with its own cooling running: settled
-# a little below zero and wandering slowly, which is what the dashboard and the
-# CCD-TEMP header should be shown.
+# Where the sensor settles with the cooler on (unless a target is set) and off,
+# and how fast it gets there. A camera starts with its cooler running, which is
+# how the real one powers up.
 SENSOR_TEMP_C = -10.0
+AMBIENT_C = 20.0
+COOLING_TAU_S = 60.0         # time constant of the approach either way
+READY_WITHIN_C = 1.0         # "ready" once this close to the target
 DRIFT_C = 0.4                # amplitude of the slow wander
 DRIFT_PERIOD_S = 90.0        # one full swing
 
@@ -44,6 +48,11 @@ class SimCamera:
         self.current_exposure: float | None = None
         self.current_binning: int = cfg.binning
         self.current_readout_speed: int = cfg.readout_speed
+
+        self.cooler_on = True
+        self.target_temperature: float = SENSOR_TEMP_C
+        self._temp = SENSOR_TEMP_C
+        self._temp_at = monotonic()
 
     # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> SimCamera:
@@ -75,11 +84,39 @@ class SimCamera:
             value = 2
         self.current_readout_speed = value
 
+    # --- cooling ------------------------------------------------------------
+    def _settle(self) -> float:
+        """Advance the sensor towards wherever the cooler is taking it."""
+        now = monotonic()
+        goal = self.target_temperature if self.cooler_on else AMBIENT_C
+        self._temp = goal + (self._temp - goal) * float(
+            np.exp(-(now - self._temp_at) / COOLING_TAU_S))
+        self._temp_at = now
+        return self._temp
+
+    def cooler_supported(self) -> bool:
+        return True
+
+    def set_cooler(self, on: bool) -> None:
+        self._settle()
+        self.cooler_on = bool(on)
+
+    def set_target_temperature(self, celsius: float) -> float:
+        self._settle()
+        self.target_temperature = float(celsius)
+        return self.target_temperature
+
+    def cooler_status(self) -> str:
+        if not self.cooler_on:
+            return "off"
+        near = abs(self._settle() - self.target_temperature) <= READY_WITHIN_C
+        return "ready" if near else "busy"
+
     # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
         phase = (monotonic() - self._started) / DRIFT_PERIOD_S
         drift = DRIFT_C * np.sin(2.0 * np.pi * phase)
-        return SENSOR_TEMP_C + float(drift) + float(self._rng.normal(0.0, 0.02))
+        return self._settle() + float(drift) + float(self._rng.normal(0.0, 0.02))
 
     def capture(self) -> np.ndarray | None:
         sleep(self.current_exposure or 0.0)

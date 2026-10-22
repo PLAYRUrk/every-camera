@@ -88,6 +88,18 @@ class CameraCfg:
 
 
 @dataclass
+class CoolingCfg:
+    # Off by default: the camera then cools itself exactly as it always has and
+    # nothing here touches the cooler.
+    enabled: bool = False
+    lead_minutes: float = 30.0        # cooler on this long before the pre-darks
+    target_temp: float = None         # None keeps the camera's own target
+    tolerance: float = 3.0            # how far off target still counts as cooled
+    off_between_nights: bool = True   # sun modes: cooler off once a night is over
+    off_on_exit: bool = True
+
+
+@dataclass
 class FilterWheelCfg:
     # Filled in by ``from_dict`` from config.json; the dataclass default is this
     # platform's usual name. "sim" selects the simulator.
@@ -137,6 +149,7 @@ class JapanConfig:
     output_dir: str = ""
     name: str = ""                    # instrument name: NAME card, sun_cycle names
     camera: CameraCfg = field(default_factory=CameraCfg)
+    cooling: CoolingCfg = field(default_factory=CoolingCfg)
     filter_wheel: FilterWheelCfg = field(default_factory=FilterWheelCfg)
     location: LocationCfg = field(default_factory=LocationCfg)
     filters: list = field(default_factory=list)
@@ -215,6 +228,30 @@ def from_dict(japan_cfg):
         errors.append(f"japan.camera.frame_timeout_ms must be positive, got "
                       f"{camera.frame_timeout_ms}; using 1000")
         camera.frame_timeout_ms = 1000
+
+    cool_cfg = cfgparse.sub(japan_cfg, "cooling")
+    cooling = CoolingCfg(
+        enabled=cfgparse.as_bool(cool_cfg, "enabled", False),
+        lead_minutes=cfgparse.as_float(cool_cfg, "lead_minutes", 30.0),
+        tolerance=cfgparse.as_float(cool_cfg, "tolerance", 3.0),
+        off_between_nights=cfgparse.as_bool(cool_cfg, "off_between_nights", True),
+        off_on_exit=cfgparse.as_bool(cool_cfg, "off_on_exit", True),
+    )
+    raw_target = cool_cfg.get("target_temp")
+    if raw_target not in (None, ""):
+        try:
+            cooling.target_temp = float(raw_target)
+        except (TypeError, ValueError):
+            errors.append(f"japan.cooling.target_temp must be a number of °C, got "
+                          f"{raw_target!r}; keeping the camera's own target")
+    if cooling.lead_minutes < 0:
+        errors.append(f"japan.cooling.lead_minutes must not be negative, got "
+                      f"{cooling.lead_minutes}; using 30")
+        cooling.lead_minutes = 30.0
+    if cooling.tolerance <= 0:
+        errors.append(f"japan.cooling.tolerance must be positive, got "
+                      f"{cooling.tolerance}; using 3")
+        cooling.tolerance = 3.0
 
     wheel_cfg = cfgparse.sub(japan_cfg, "filter_wheel")
     wheel = FilterWheelCfg(
@@ -355,6 +392,7 @@ def from_dict(japan_cfg):
         output_dir=str(japan_cfg.get("output_dir", "") or ""),
         name=name,
         camera=camera,
+        cooling=cooling,
         filter_wheel=wheel,
         location=location,
         filters=filters,

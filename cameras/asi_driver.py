@@ -1045,6 +1045,26 @@ class AsiWorkerConsole(threading.Thread):
         return ok_any, asi_exposure.combine_means(means)
 
     # ------------------------------------------------------------------
+    # The day between nights
+    # ------------------------------------------------------------------
+    def _end_night(self):
+        """Shut the shutter once a night is over.
+
+        The sun modes end a night by returning to :meth:`run`, which plans the
+        next one straight away. The shutter used to be shut only when the whole
+        run ended, so it stood open all day waiting for the next pre-darks. The
+        japan driver says the same thing in the same words.
+        """
+        self._focus_opened_shutter = False
+        try:
+            self.cam.set_shutter(False)
+            console_ui.log("Night over — shutter closed until the next pre-darks")
+        except Exception as exc:
+            console_ui.warn(f"Could not close the shutter after the night: {exc}")
+        self._set_phase("waiting for the next night")
+        self._refresh_camera_section()
+
+    # ------------------------------------------------------------------
     # Dark frames
     # ------------------------------------------------------------------
     def _capture_darks(self, phase, sync_to_seconds=False, abort_on_stop=False):
@@ -1667,6 +1687,8 @@ class AsiWorkerConsole(threading.Thread):
                                 else self._run_sun_mode)
                     while not self._stop_event.is_set():
                         run_night()
+                        if not self._stop_event.is_set():
+                            self._end_night()
         except Exception as exc:
             self._errors += 1
             console_ui.error(f"Measurement loop failed: {exc}")

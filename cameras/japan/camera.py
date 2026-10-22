@@ -18,9 +18,12 @@ every-camera worker depends on:
 The SDK is imported inside :meth:`__enter__`, never at module scope: see
 ``cameras/japan/dcamsdk/__init__.py`` for why that matters.
 
-There is no cooling control anywhere in this module. The camera reports
-``SENSORTEMPERATURE`` and has no setpoint to command, which is the main way it
-differs from the PIXIS in ``cameras/asi/camera.py``.
+Cooling is a switch rather than the PIXIS's managed setpoint
+(``cameras/asi/camera.py``): DCAM's ``SENSORCOOLER`` turns the cooler on and off,
+and ``SENSORTEMPERATURETARGET`` moves the target on the models that have one. Not
+every model exposes either, so :meth:`HamamatsuCamera.cooler_supported` asks
+before anything relies on them; the reading, ``SENSORTEMPERATURE``, is always
+there.
 """
 from __future__ import annotations
 
@@ -117,6 +120,43 @@ class HamamatsuCamera:
                             "readout speed", int)
         if taken is not None:
             self.current_readout_speed = taken
+
+    # --- cooling ------------------------------------------------------------
+    def _writable(self, prop) -> bool:
+        attr = self._dcam.prop_getattr(prop)
+        return attr is not False and attr.is_writable()
+
+    def cooler_supported(self) -> bool:
+        """True when this model lets the cooler be switched over DCAM."""
+        return self._writable(self._sdk.DCAM_IDPROP.SENSORCOOLER)
+
+    def set_cooler(self, on: bool) -> None:
+        mode = self._sdk.DCAMPROP.SENSORCOOLER
+        self._apply(self._sdk.DCAM_IDPROP.SENSORCOOLER,
+                    mode.ON if on else mode.OFF, "sensor cooler", int)
+
+    def set_target_temperature(self, celsius: float) -> float | None:
+        """Move the cooling target; None when this model has no target to move."""
+        prop = self._sdk.DCAM_IDPROP.SENSORTEMPERATURETARGET
+        if not self._writable(prop):
+            return None
+        return self._apply(prop, celsius, "sensor temperature target (°C)", float)
+
+    @property
+    def target_temperature(self) -> float | None:
+        value = self._dcam.prop_getvalue(
+            self._sdk.DCAM_IDPROP.SENSORTEMPERATURETARGET)
+        return None if value is False else float(value)
+
+    def cooler_status(self) -> str | None:
+        """``off``, ``ready``, ``busy``… as DCAM words it, or None if it will not."""
+        value = self._dcam.prop_getvalue(self._sdk.DCAM_IDPROP.SENSORCOOLERSTATUS)
+        if value is False:
+            return None
+        try:
+            return self._sdk.DCAMPROP.SENSORCOOLERSTATUS(int(value)).name.lower()
+        except ValueError:
+            return str(int(value))
 
     # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
