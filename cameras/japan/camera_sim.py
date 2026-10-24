@@ -97,6 +97,9 @@ class SimCamera:
     def cooler_supported(self) -> bool:
         return True
 
+    def cooler_can_switch_off(self) -> bool:
+        return True
+
     def set_cooler(self, on: bool) -> bool:
         self._settle()
         self.cooler_on = bool(on)

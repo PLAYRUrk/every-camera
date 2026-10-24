@@ -268,6 +268,27 @@ def test_hamamatsu_cooler_refusal_is_named(monkeypatch):
     assert any("INVALIDPARAM" in w and "2..4" in w for w in warnings)
 
 
+def test_hamamatsu_knows_when_off_is_out_of_range():
+    cam, _ = _hamamatsu(_FakeDcam(True, True))      # accepts 2..4, as a C11090
+    assert cam.cooler_can_switch_off() is False
+
+
+def test_a_cooler_that_cannot_go_off_is_not_asked_to(tmp_path, monkeypatch):
+    logs = []
+    monkeypatch.setattr(japan_driver.console_ui, "log", logs.append)
+    monkeypatch.setattr(SimCamera, "cooler_can_switch_off", lambda self: False)
+    worker = japan_worker(tmp_path, cooling={"enabled": True})
+    assert worker.cam.cooling_controlled is True
+    assert any("cannot switch its cooler off" in m for m in logs)
+    worker._cooler_on()
+    calls = []
+    monkeypatch.setattr(worker.cam.cam, "set_cooler",
+                        lambda on: calls.append(on) or True)
+    worker._end_night()
+    assert calls == []
+    assert "Cooler off" not in logs
+
+
 def test_the_cooler_can_be_kept_on_between_nights(tmp_path):
     worker = japan_worker(tmp_path, cooling={"enabled": True,
                                              "off_between_nights": False})

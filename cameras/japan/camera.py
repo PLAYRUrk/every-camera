@@ -132,6 +132,13 @@ class HamamatsuCamera:
         """True when this model lets the cooler be switched over DCAM."""
         return self._writable(self._sdk.DCAM_IDPROP.SENSORCOOLER)
 
+    def cooler_can_switch_off(self) -> bool:
+        """True when OFF is within the modes this model's SENSORCOOLER takes."""
+        attr = self._dcam.prop_getattr(self._sdk.DCAM_IDPROP.SENSORCOOLER)
+        if attr is False:
+            return False
+        return attr.valuemin <= self._sdk.DCAMPROP.SENSORCOOLER.OFF
+
     def set_cooler(self, on: bool) -> bool:
         """Switch the cooler; True once the camera has taken the new mode.
 

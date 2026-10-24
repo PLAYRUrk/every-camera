@@ -170,6 +170,10 @@ class JapanCamera:
         # camera turned out to allow it. Everything cooling-related is a no-op
         # otherwise, and the camera keeps cooling itself as it always has.
         self.cooling_controlled = False
+        # Whether "off" is among the modes the camera accepts. Some models (a
+        # C11090-22B: SENSORCOOLER 2..4) only go between on and max, and every
+        # attempt to switch them off is refused.
+        self.cooler_off_allowed = False
 
     # -- lifecycle -----------------------------------------------------------
     def open(self):
@@ -206,7 +210,18 @@ class JapanCamera:
             console_ui.warn("japan.cooling is enabled, but this camera does not let "
                             "its cooler be switched over DCAM — leaving it to "
                             "cool itself")
-        return supported
+            return False
+        try:
+            self.cooler_off_allowed = self.cam.cooler_can_switch_off()
+        except Exception as exc:
+            console_ui.warn(f"Could not ask the camera whether its cooler can be "
+                            f"switched off: {exc}")
+            self.cooler_off_allowed = True     # try, and hear about a refusal
+        if not self.cooler_off_allowed:
+            console_ui.log("This camera cannot switch its cooler off over DCAM "
+                           "(SENSORCOOLER accepts only on/max) — it stays on "
+                           "between nights")
+        return True
 
     def close(self):
         if not self._opened:
@@ -1270,7 +1285,7 @@ class JapanWorkerConsole(threading.Thread):
         self._refresh_camera_section()
 
     def _cooler_off(self):
-        if self._cooler_commanded is False:
+        if self._cooler_commanded is False or not self.cam.cooler_off_allowed:
             return
         try:
             if self.cam.set_cooler(False):
@@ -2040,9 +2055,50 @@ def _probe_camera(conf):
               "have to be values the matching rows allow.")
         print("japan.cooling needs SENSORCOOLER to be writable (1 = off, 2 = on); "
               "target_temp needs SENSORTEMPERATURETARGET.")
+        print()
+        _probe_cooling_properties(dcam)
     finally:
         dcam.dev_close()
         sdk.Dcamapi.uninit()
+
+
+# Words in a property's name that mark it as part of the cooling. The camera is
+# asked for every property it has rather than for a fixed list: a model may
+# switch its cooling through something the table above does not name.
+_PROBE_COOLING_WORDS = ("COOL", "TEMP", "FAN", "PELTIER")
+
+
+def _probe_cooling_properties(dcam):
+    """List every cooling-related property the camera has, with each value's
+    name as the camera words it."""
+    print("Every cooling-related property this camera reports "
+          "(value = the camera's own name for it):")
+    print("-" * 80)
+    prop, found = 0, 0
+    while True:
+        prop = dcam.prop_getnextid(prop)
+        if prop is False or prop == 0:
+            break
+        name = dcam.prop_getname(prop)
+        if name is False or not any(w in name.upper()
+                                    for w in _PROBE_COOLING_WORDS):
+            continue
+        found += 1
+        attr = dcam.prop_getattr(prop)
+        access = ("?" if attr is False else
+                  ("R/W" if attr.is_writable() else "R/O"))
+        print(f"{name:<32} 0x{prop:08X}  {access:<4}"
+              f"current {_probe_current(dcam, prop)}")
+        if attr is not False and 0 < attr.valuemax - attr.valuemin <= 16:
+            values = []
+            for value in range(int(attr.valuemin), int(attr.valuemax) + 1):
+                text = dcam.prop_getvaluetext(prop, float(value))
+                if text is not False:
+                    values.append(f"{value} = {text}")
+            if values:
+                print(f"{'':<32} values: {', '.join(values)}")
+    if not found:
+        print("(none)")
 
 
 def _probe_current(dcam, prop):
