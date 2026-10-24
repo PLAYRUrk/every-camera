@@ -97,9 +97,10 @@ class SimCamera:
     def cooler_supported(self) -> bool:
         return True
 
-    def set_cooler(self, on: bool) -> None:
+    def set_cooler(self, on: bool) -> bool:
         self._settle()
         self.cooler_on = bool(on)
+        return True
 
     def set_target_temperature(self, celsius: float) -> float:
         self._settle()

@@ -300,14 +300,14 @@ class JapanCamera:
         self.wheel.set_shutter(bool(is_open))
 
     def set_cooler(self, on):
-        """Switch the cooler. False when it is not this program's to switch."""
+        """Switch the cooler. False when it is not this program's to switch, or
+        when the camera refused."""
         if not self.cooling_controlled:
             return False
         target = self.cfg.cooling.target_temp
         if on and target is not None:
             self.cam.set_target_temperature(target)
-        self.cam.set_cooler(bool(on))
-        return True
+        return bool(self.cam.set_cooler(bool(on)))
 
     def capture(self):
         return self.cam.capture()
@@ -1262,6 +1262,9 @@ class JapanWorkerConsole(threading.Thread):
                 target = self.cfg.cooling.target_temp
                 console_ui.log("Cooler on" + (f", target {target:g} °C"
                                               if target is not None else ""))
+            elif self.cam.cooling_controlled:
+                # Left uncommanded, so the next call tries again.
+                console_ui.warn("The camera refused to switch the cooler on")
         except Exception as exc:
             console_ui.warn(f"Could not switch the cooler on: {exc}")
         self._refresh_camera_section()
@@ -1273,6 +1276,10 @@ class JapanWorkerConsole(threading.Thread):
             if self.cam.set_cooler(False):
                 self._cooler_commanded = False
                 console_ui.log("Cooler off")
+            elif self.cam.cooling_controlled:
+                # Left uncommanded, so the next night's end tries again.
+                console_ui.warn("The camera refused to switch the cooler off — "
+                                "it is still cooling")
         except Exception as exc:
             console_ui.warn(f"Could not switch the cooler off: {exc}")
         self._refresh_camera_section()

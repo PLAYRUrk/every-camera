@@ -147,7 +147,7 @@ def test_the_cooler_goes_on_lead_minutes_before_the_pre_darks(tmp_path,
 
     def set_cooler(on):
         events.append(("cooler", on, dt.now()))
-        real_set(on)
+        return real_set(on)
 
     monkeypatch.setattr(worker.cam.cam, "set_cooler", set_cooler)
     dark_start = dt.now() + timedelta(seconds=2.5)
@@ -180,6 +180,92 @@ def test_the_cooler_is_switched_off_once_the_night_is_over(tmp_path):
     worker._end_night()
     assert worker.cam.cam.cooler_on is False
     assert worker.cam.shutter_open is False
+
+
+def test_a_refused_cooler_off_is_not_reported_as_done(tmp_path, monkeypatch):
+    # Seen on a japan station: the camera answered OFF with INVALIDPARAM and the
+    # log still said "Cooler off", so nothing ever tried again.
+    worker = japan_worker(tmp_path, cooling={"enabled": True})
+    worker._cooler_on()
+    logs, warnings = [], []
+    monkeypatch.setattr(japan_driver.console_ui, "log", logs.append)
+    monkeypatch.setattr(japan_driver.console_ui, "warn", warnings.append)
+    monkeypatch.setattr(worker.cam.cam, "set_cooler", lambda on: False)
+    worker._cooler_off()
+    assert "Cooler off" not in logs
+    assert any("refused" in w for w in warnings)
+    assert worker._cooler_commanded is True             # tried again next time
+
+
+class _FakeDcam:
+    """Just enough of ``Dcam`` for :meth:`HamamatsuCamera.set_cooler`."""
+
+    def __init__(self, setvalue_ok, setgetvalue_ok, err=-2147481592):
+        self._ok = (setvalue_ok, setgetvalue_ok)
+        self._err = err
+        self.value = 2.0
+
+    def prop_setvalue(self, prop, value):
+        if self._ok[0]:
+            self.value = value
+        return self._ok[0]
+
+    def prop_setgetvalue(self, prop, value):
+        if not self._ok[1]:
+            return False
+        self.value = value
+        return value
+
+    def prop_getvalue(self, prop):
+        return self.value
+
+    def prop_getattr(self, prop):
+        class Attr:
+            valuemin, valuemax = 2.0, 4.0
+        return Attr()
+
+    def lasterr(self):
+        return self._err
+
+
+def _hamamatsu(dcam):
+    # The vendor module loads the DCAM runtime on import, so the few values the
+    # cooler needs are restated here, as dcamapi4.py has them.
+    from enum import IntEnum
+
+    from cameras.japan import camera as hama
+
+    class Sdk:
+        class DCAM_IDPROP(IntEnum):
+            SENSORCOOLER = 0x00200320
+
+        class DCAMPROP:
+            class SENSORCOOLER(IntEnum):
+                OFF = 1
+                ON = 2
+
+        class DCAMERR(IntEnum):
+            INVALIDPARAM = -2147481592
+
+    cam = hama.HamamatsuCamera.__new__(hama.HamamatsuCamera)
+    cam._sdk, cam._dcam = Sdk, dcam
+    return cam, hama
+
+
+@pytest.mark.parametrize("setvalue_ok, setgetvalue_ok",
+                         [(True, False), (False, True)])
+def test_hamamatsu_cooler_switches_by_either_set(setvalue_ok, setgetvalue_ok):
+    cam, _ = _hamamatsu(_FakeDcam(setvalue_ok, setgetvalue_ok))
+    assert cam.set_cooler(False) is True
+    assert cam._dcam.value == 1
+
+
+def test_hamamatsu_cooler_refusal_is_named(monkeypatch):
+    cam, hama = _hamamatsu(_FakeDcam(False, False))
+    warnings = []
+    monkeypatch.setattr(hama.console_ui, "warn", warnings.append)
+    assert cam.set_cooler(False) is False
+    assert any("INVALIDPARAM" in w and "2..4" in w for w in warnings)
 
 
 def test_the_cooler_can_be_kept_on_between_nights(tmp_path):

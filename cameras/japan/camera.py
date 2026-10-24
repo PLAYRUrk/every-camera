@@ -20,7 +20,9 @@ The SDK is imported inside :meth:`__enter__`, never at module scope: see
 
 Cooling is a switch rather than the PIXIS's managed setpoint
 (``cameras/asi/camera.py``): DCAM's ``SENSORCOOLER`` turns the cooler on and off,
-and ``SENSORTEMPERATURETARGET`` moves the target on the models that have one. Not
+and ``SENSORTEMPERATURETARGET`` moves the target on the models that have one. The
+switch reports whether the camera took it, so a refused "off" is never logged as
+done. Not
 every model exposes either, so :meth:`HamamatsuCamera.cooler_supported` asks
 before anything relies on them; the reading, ``SENSORTEMPERATURE``, is always
 there.
@@ -130,10 +132,45 @@ class HamamatsuCamera:
         """True when this model lets the cooler be switched over DCAM."""
         return self._writable(self._sdk.DCAM_IDPROP.SENSORCOOLER)
 
-    def set_cooler(self, on: bool) -> None:
+    def set_cooler(self, on: bool) -> bool:
+        """Switch the cooler; True once the camera has taken the new mode.
+
+        A plain set comes first: some models answer the set-and-read-back that
+        :meth:`_apply` uses with INVALIDPARAM for SENSORCOOLER, though a mode
+        switch needs no read-back. The set-get is still tried after it, so a model
+        that only takes that one is not lost. A refusal is said with the error's
+        name and the range the camera accepts — the caller must not then claim
+        the cooler was switched.
+        """
+        prop = self._sdk.DCAM_IDPROP.SENSORCOOLER
         mode = self._sdk.DCAMPROP.SENSORCOOLER
-        self._apply(self._sdk.DCAM_IDPROP.SENSORCOOLER,
-                    mode.ON if on else mode.OFF, "sensor cooler", int)
+        value = mode.ON if on else mode.OFF
+        word = "on" if on else "off"
+        if not self._dcam.prop_setvalue(prop, float(value)):
+            first = self._dcam.lasterr()
+            if self._dcam.prop_setgetvalue(prop, float(value)) is False:
+                console_ui.warn(f"Could not switch the sensor cooler {word}: "
+                                f"{self._error_name(first)}"
+                                f"{self._accepted_text(prop)}")
+                return False
+        now = self._dcam.prop_getvalue(prop)
+        if now is not False and int(now) != int(value):
+            console_ui.warn(f"Sensor cooler: asked for {word} ({int(value)}), "
+                            f"camera reports {int(now)}")
+            return False
+        return True
+
+    def _error_name(self, err) -> str:
+        try:
+            return f"{self._sdk.DCAMERR(err).name} ({int(err)})"
+        except (ValueError, TypeError):
+            return str(err)
+
+    def _accepted_text(self, prop) -> str:
+        attr = self._dcam.prop_getattr(prop)
+        if attr is False:
+            return ""
+        return f" (camera accepts {attr.valuemin:g}..{attr.valuemax:g})"
 
     def set_target_temperature(self, celsius: float) -> float | None:
         """Move the cooling target; None when this model has no target to move."""
