@@ -487,17 +487,71 @@ def test_an_empty_fifo_is_still_reset_after_a_read(streaming):
     assert not hw.fifo
 
 
-def test_an_overflowed_fifo_is_dropped_not_read(streaming):
+def test_an_overflowed_fifo_restarts_the_run(streaming):
+    """Nothing in an overflowed FIFO can be trusted to start at a frame; the
+    first frame after a restart always does."""
     cam, hw = streaming(frame_size=8, full=True)
     hw.emit()
     hw.fifo += bytes([9]) * 3                   # a frame torn by the overflow
-    original_rearm = cam._rearm
+    original_start = cam._start
 
-    def rearm():
-        original_rearm()
+    def start(retries):
+        original_start(retries)                 # stop, FIFO_INIT, start
         hw.emit()                               # the camera's next whole frame
-    cam._rearm = rearm
+    cam._start = start
     assert _frame_number(cam.grab_frame()) == 2
+
+
+def test_a_camera_that_outruns_its_reads_is_slowed_down(streaming, monkeypatch):
+    """A 285C frame took longer to come over USB than the 0.955 s period:
+    the first frame was whole, the next shifted, then noise."""
+    cam, hw = streaming(frame_size=8)
+    cam.exposure = 0.88
+    clock = [100.0]
+    monkeypatch.setattr(sptt_driver.time, "monotonic", lambda: clock[0])
+    slow_read = hw.read_data
+
+    def read_data(size):
+        clock[0] += 1.2                         # one frame takes 1.2 s to read
+        return slow_read(size)
+    cam.ep_tr.read = lambda size_or_buffer=512, timeout=None: read_data(size_or_buffer)
+    restarts = []
+    original_start = cam._start
+    cam._start = lambda retries: (restarts.append(1), original_start(retries))
+
+    hw.emit()
+    assert _frame_number(cam.grab_frame()) == 1          # the frame read is kept
+    assert cam.period_us >= int(1.2e6 * sptt_driver.TRANSFER_SLACK)
+    assert cam.transfer_floor_us == cam.period_us
+    assert restarts == [1]                               # back in step
+
+    # Once the period fits, frames are not slowed or restarted again.
+    hw.emit()
+    cam.grab_frame()
+    assert restarts == [1]
+
+
+def test_an_operator_period_is_not_overridden(streaming, monkeypatch):
+    cam, hw = streaming(frame_size=8)
+    cam.exposure, cam.period_override_us = 0.88, 955_000
+    clock = [100.0]
+    monkeypatch.setattr(sptt_driver.time, "monotonic", lambda: clock[0])
+    slow_read = hw.read_data
+
+    def read_data(size):
+        clock[0] += 1.2
+        return slow_read(size)
+    cam.ep_tr.read = lambda size_or_buffer=512, timeout=None: read_data(size_or_buffer)
+    hw.emit()
+    cam.grab_frame()
+    assert cam.period_us == 955_000 and cam.transfer_floor_us == 0
+
+
+def test_a_new_frame_size_relearns_the_transfer_time():
+    cam = SpttCamera(None, CSDU285C)
+    cam.w, cam.h, cam.transfer_floor_us = 1392, 1032, 1_500_000
+    cam._set_frame_size(696, 516)
+    assert cam.transfer_floor_us == 0
 
 
 def test_a_frame_is_read_in_large_requests():

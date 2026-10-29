@@ -92,6 +92,15 @@ STATUS_FIFO_FULL = 0x10
 # a multiple of 512 so a request never ends inside a packet.
 BULK_CHUNK = 64 * 1024
 
+# When a frame takes longer to collect than the camera takes to produce the
+# next one, the period is raised to the time it took times this, plus the pad.
+TRANSFER_SLACK = 1.25
+TRANSFER_PAD_US = 50_000
+# The gap between two frames of a live stream that counts towards that: the
+# debayer, JPEG and publish of the focus loop. Capped so that a stream paused
+# for a scheduled capture does not read as seconds of processing.
+PROCESSING_CAP_S = 0.5
+
 # Default capture seconds (can be overridden in config)
 SPTT_CAPTURE_SECONDS = [0, 30]
 
@@ -354,6 +363,13 @@ class SpttCamera:
         # frame period means the camera outruns the reads (see _read_one_frame).
         self.last_read_s = None
         self._slow_read_warned_at = None
+        # The shortest period at which this camera's frames can be collected
+        # here, learnt from the transfers (see _keep_up_with_transfer); 0 until
+        # one has been too slow. And, for a live stream, the time between the
+        # end of one read and the request for the next.
+        self.transfer_floor_us = 0
+        self._read_done_at = None
+        self._processing_s = 0.0
         self._armed_at = None
         # Bumped by every setting change, so a frame wait that a change from
         # another thread overtook can tell its frame is no longer wanted.
@@ -491,6 +507,9 @@ class SpttCamera:
         elif expected and (w, h) != expected and (w, h) != (self.w, self.h):
             console_ui.log(f"SPTT frame size {w}x{h} at binning {self.binning} "
                            f"(full sensor would be {expected[0]}x{expected[1]})")
+        if (int(w), int(h)) != (self.w, self.h):
+            # A different frame takes a different time to collect; learn anew.
+            self.transfer_floor_us = 0
         self.w, self.h = int(w), int(h)
 
     def _apply_period(self, verify=True):
@@ -503,7 +522,7 @@ class SpttCamera:
         exposure_us = exposure_to_us(self.exposure)
         period = derive_period_us(
             self.exposure,
-            min_period_us=self.min_period_us,
+            min_period_us=max(self.min_period_us or 0, self.transfer_floor_us),
             override=self.period_override_us,
             # Outside continuous mode the period does not gate the integration,
             # so an operator asking for a short one gets it.
@@ -578,6 +597,7 @@ class SpttCamera:
                 self._params_dirty = False
                 self.last_frame_started = dt.now(timezone.utc)
                 self._armed_at = time.monotonic()
+                self._read_done_at = None
                 time.sleep(0.1)
                 sb, _ = read_crb(self.ep_wr, self.ep_rd)
                 if sb & 0x01:
@@ -620,6 +640,7 @@ class SpttCamera:
 
     def _rearm(self):
         """Drop whatever is queued and note when the next frame may start."""
+        self._read_done_at = None
         _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
         self.last_frame_started = dt.now(timezone.utc)
         self._armed_at = time.monotonic()
@@ -666,10 +687,47 @@ class SpttCamera:
         sb, _ = read_crb(self.ep_wr, self.ep_rd)
         if sb & STATUS_FIFO_EMPTY:
             _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
+        self._read_done_at = time.monotonic()
         if self._armed_at is not None:
             self.last_frame_lag = time.monotonic() - self._armed_at
         return (raw_chunks, w, h, self.encoding, self.binning,
                 self.model.interlaced)
+
+    def _keep_up_with_transfer(self):
+        """Slow the camera down to the pace its frames can be collected at.
+
+        In continuous mode the camera starts the next frame one period after
+        the last, whether or not that one has been read. A CSDU-285C frame can
+        take longer than that to come over USB, and the bytes that do not fit
+        are lost at the join: the first frame after a start is fine, the next
+        is shifted sideways with a strip of another on its edge, and once the
+        loss is not a whole number of pixels everything decodes as noise.
+
+        So when collecting a frame (plus, in a live stream, handling it) took
+        longer than the period, the period is raised to fit with room to spare
+        and the run is restarted, which puts the FIFO back in step. Returns
+        True when it did. A period the operator set, or a trigger mode, is
+        theirs: that only gets the warning.
+        """
+        if self.last_read_s is None or not self.period_us:
+            return False
+        busy_s = self.last_read_s + min(self._processing_s, PROCESSING_CAP_S)
+        if busy_s * 1e6 <= self.period_us:
+            return False
+        if self.trigmode != 0 or self.period_override_us is not None:
+            self._check_read_time()
+            return False
+        self.transfer_floor_us = int(busy_s * 1e6 * TRANSFER_SLACK) + TRANSFER_PAD_US
+        old_period = self.period_us
+        self._apply_period(verify=False)
+        console_ui.warn(
+            f"SPTT frames take {busy_s:.2f} s to collect"
+            f"{f' and handle' if self._processing_s else ''}, more than the "
+            f"{old_period / 1e6:.3f} s frame period — the camera was outrunning "
+            f"the reads. Frame period raised to {self.period_us / 1e6:.3f} s; "
+            "restarting the run to get back in step.")
+        self._start(1)
+        return True
 
     def _check_read_time(self):
         """Say so, once a minute at most, when a transfer outlasts the period."""
@@ -696,6 +754,10 @@ class SpttCamera:
         """
         while True:
             with self._lock:
+                # Time since the last read finished: the live loop's own work,
+                # which the camera does not wait for either.
+                self._processing_s = (time.monotonic() - self._read_done_at
+                                      if self._read_done_at is not None else 0.0)
                 discard = self._params_dirty
                 if discard:
                     self._rearm()
@@ -707,13 +769,16 @@ class SpttCamera:
                     continue                # overtaken by a change
                 if sb & STATUS_FIFO_FULL:
                     # Frames piled up faster than they were read and the FIFO
-                    # ran over: what follows the first one is no longer in
-                    # step. Start clean, as a scheduled capture does.
-                    console_ui.warn("SPTT FIFO overflowed — dropping the "
-                                    "queued frames and starting afresh")
-                    self._rearm()
+                    # ran over: nothing in it can be trusted to start at a
+                    # frame. A restart is what reliably puts it back in step
+                    # (the first frame after one is always whole).
+                    console_ui.warn("SPTT FIFO overflowed — restarting the run")
+                    self._start(1)
                     continue
                 raw = self._read_one_frame()
+                # The frame just read is whole; what the camera does next may
+                # not be. Slowing it down restarts the run for the next one.
+                self._keep_up_with_transfer()
             if not discard:                 # else it was the old-settings frame
                 return decode_frame(*raw)
 
@@ -773,6 +838,7 @@ class SpttCamera:
                 "frame_h": sl[18],
                 "fifo_cnt": sl[13],
                 "read_s": self.last_read_s,
+                "transfer_floor_us": self.transfer_floor_us,
                 "temp_sink": sl[23],
                 "temp_ccd": sl[24],
                 "temp_target": sl[25],
