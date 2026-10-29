@@ -11,6 +11,8 @@
 #     paths of this checkout filled in;
 #   * copies config.json to /etc/every-camera/<type>.json if that file does not
 #     exist yet, so the service has a config of its own to edit;
+#   * for sptt, installs the udev rules that give the camera's USB device to
+#     ordinary users, so the program also runs without root by hand;
 #   * enables and starts every-camera@<type>;
 #   * installs the alert watchdog, every-camera-sentinel, which is one per
 #     machine rather than one per camera. It is what sends the mail, and what
@@ -131,6 +133,9 @@ if [[ $DRY_RUN -eq 1 ]]; then
         -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
         -e "s|@USER_HOME@|$USER_HOME|g" \
         "$SENTINEL_TEMPLATE"
+    if [[ "$CAMERA" == sptt ]]; then
+        echo "--- would copy $APP_DIR/systemd/99-every-camera-sptt.rules to /etc/udev/rules.d/ and reload udev ---"
+    fi
     echo "--- would run: systemctl enable --now every-camera@$CAMERA ---"
     echo "--- would run: systemctl enable --now every-camera-sentinel ---"
     exit 0
@@ -169,6 +174,16 @@ if [[ -f "$SENTINEL_TEMPLATE" ]]; then
         "$SENTINEL_TEMPLATE" > "$SENTINEL_UNIT"
     chmod 644 "$SENTINEL_UNIT"
     echo "installed $SENTINEL_UNIT"
+fi
+
+# The SPTT camera is a plain libusb device: without a rule only root may open
+# it. Installed here so the hand-run program works as the operator too.
+if [[ "$CAMERA" == sptt ]]; then
+    RULES="$APP_DIR/systemd/99-every-camera-sptt.rules"
+    install -m 644 "$RULES" /etc/udev/rules.d/
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=usb --attr-match=idVendor=dcdc || true
+    echo "installed /etc/udev/rules.d/$(basename "$RULES") — replug the camera"
 fi
 
 systemctl daemon-reload

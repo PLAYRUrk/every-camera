@@ -78,14 +78,35 @@ CSDU429 = SpttModel(
     spt_name="c2-429.spt", interlaced=True, color=False,
     nominal_sizes={0: (744, 576), 1: (372, 288), 3: (186, 144)})
 
-# ICX285AQ: progressive scan, RGB Bayer, 1392x1040. IDs and script from the
-# vendor's csdu285.inf / CSDU285.SPT.
+# ICX285AQ: progressive scan, RGB Bayer. IDs and script from the vendor's
+# csdu285.inf / CSDU285.SPT. The firmware reads out 1392x1032 of the chip's
+# 1040 lines — what the camera reported on site, and the ROI every vendor
+# config and the vendor's own TIFFs use.
 CSDU285C = SpttModel(
     name="CSDU-285C", pid_raw=0xD285, pid_configured=0xC285,
     spt_name="csdu285.spt", interlaced=False, color=True,
-    nominal_sizes={0: (1392, 1040), 1: (696, 520), 3: (348, 260)})
+    nominal_sizes={0: (1392, 1032), 1: (696, 516), 3: (348, 258)})
 
 MODELS = (CSDU429, CSDU285C)
+
+
+UDEV_RULES = "systemd/99-every-camera-sptt.rules"
+
+
+def explain_usb_error(exc):
+    """``exc`` as a message an operator can act on.
+
+    Finding the camera needs no rights at all, so a program not run as root
+    gets as far as the first transfer and then fails with a bare
+    ``[Errno 13] Access denied``. That case gets the fix spelled out.
+    """
+    if getattr(exc, "errno", None) == 13 or "Access denied" in str(exc):
+        return (f"No permission to use the camera's USB device ({exc}). "
+                f"Install the udev rules so it works without root: "
+                f"sudo cp {UDEV_RULES} /etc/udev/rules.d/ && "
+                "sudo udevadm control --reload-rules && sudo udevadm trigger, "
+                "then replug the camera.")
+    return str(exc)
 
 
 def detect_model(backend):

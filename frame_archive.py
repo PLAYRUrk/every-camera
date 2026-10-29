@@ -244,16 +244,29 @@ def read_frame_with_scale(path):
 
 
 def read_fits(path):
-    """Read the primary HDU of a FITS file as a numpy array."""
+    """Read the primary HDU of a FITS file as a numpy array.
+
+    A colour FITS (the SPTT CSDU-285C with ``sptt.debayer``) is an R, G, B
+    cube, which numpy sees plane-first as (3, H, W). Everything that displays
+    or measures a frame here takes colour as (H, W, 3) — the way Canon's and
+    the infra camera's images already arrive — so the planes are moved last.
+    Handing the cube on as it was made the archive refuse it outright.
+    """
     try:
         from astropy.io import fits
-        with fits.open(path, memmap=False) as hdul:
-            for hdu in hdul:
-                if getattr(hdu, "data", None) is not None:
-                    return np.asarray(hdu.data)
-        raise ValueError(f"No image data in {path}")
     except ImportError:
-        return read_fits_minimal(path)
+        return _planes_last(read_fits_minimal(path))
+    with fits.open(path, memmap=False) as hdul:
+        for hdu in hdul:
+            if getattr(hdu, "data", None) is not None:
+                return _planes_last(np.asarray(hdu.data))
+    raise ValueError(f"No image data in {path}")
+
+
+def _planes_last(arr):
+    if arr.ndim == 3 and arr.shape[0] in (3, 4):
+        return np.ascontiguousarray(np.moveaxis(arr, 0, -1))
+    return arr
 
 
 def read_fits_minimal(path):
@@ -279,8 +292,10 @@ def read_fits_minimal(path):
             raise ValueError(f"Unsupported FITS (NAXIS={naxis}): {path}")
         naxis1 = int(header.get("NAXIS1", 0))
         naxis2 = int(header.get("NAXIS2", 0))
+        # A colour cube's planes; 1 for an ordinary 2-D frame.
+        naxis3 = int(header.get("NAXIS3", 1)) if naxis >= 3 else 1
         bitpix = int(header.get("BITPIX", 16))
-        nbytes = abs(bitpix) // 8 * naxis1 * naxis2
+        nbytes = abs(bitpix) // 8 * naxis1 * naxis2 * naxis3
         data = f.read(nbytes)
         if len(data) < nbytes:
             raise ValueError(f"Truncated FITS data: {path}")
@@ -301,6 +316,8 @@ def read_fits_minimal(path):
             arr = np.frombuffer(data, dtype=">f8")
         else:
             raise ValueError(f"Unsupported BITPIX={bitpix}: {path}")
+        if naxis3 > 1:
+            return arr.reshape(naxis3, naxis2, naxis1)
         return arr.reshape(naxis2, naxis1)
 
 

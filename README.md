@@ -636,7 +636,7 @@ python setup_app.py --console --config /path/to/config.json
 | Модель | USB ID (до → после прошивки) | Сенсор | Кадр 1×1 |
 |---|---|---|---|
 | CSDU-429 / CSDU-423 | `DCDC:F429` → `DCDC:E429` | ICX429, чересстрочный, ч/б | 744×576 |
-| CSDU-285C | `DCDC:D285` → `DCDC:C285` | ICX285AQ, прогрессивный, Bayer | 1392×1040 |
+| CSDU-285C | `DCDC:D285` → `DCDC:C285` | ICX285AQ, прогрессивный, Bayer (RGGB) | 1392×1032 |
 
 В заголовке FITS `INSTRUME` — имя модели. «CSDU Gray», «CSDU Color», «Um_2» из
 вендорского дистрибутива — это программы, а не отдельные камеры.
@@ -3026,13 +3026,46 @@ WantedBy=multi-user.target
 sudo pkill gvfsd-gphoto2
 ```
 
-### SPTT (CSDU-429)
+### SPTT (CSDU-429/423, CSDU-285C)
+
+Кроме доступа к USB, root программе не нужен: порт LAN-сервера (8765) выше 1024,
+логи и статус пишутся в `~/.every_camera/`. Правило для udev лежит в репозитории:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="04b4", MODE="0666"' \
-    | sudo tee /etc/udev/rules.d/99-sptt.rules
-sudo udevadm control --reload-rules
+sudo cp systemd/99-every-camera-sptt.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+# затем отключить и снова подключить камеру
 ```
+
+`sudo systemd/install.sh sptt` ставит это правило сам.
+
+Камера видна на шине под двумя ID — до загрузки прошивки и после, — и правило
+покрывает оба для каждой модели. Vendor ID у камер `dcdc`, а не `04b4`
+(стандартный у Cypress): прежнее правило из этого раздела было записано на `04b4`
+и не срабатывало ни на одну камеру, отсюда и необходимость запускать от root.
+Без правила программа теперь не падает с голым `[Errno 13] Access denied`, а
+пишет, какое правило поставить.
+
+Проверка — права должны быть `crw-rw-rw-`:
+
+```bash
+lsusb -d dcdc:                                   # Bus 001 Device 007: ID dcdc:e429
+ls -l /dev/bus/usb/001/007
+python3 main.py --type sptt --preview            # без sudo
+```
+
+Служба (`every-camera@.service`) по умолчанию тоже запускается от root. Чтобы
+служба SPTT работала от имени оператора, переопределите пользователя только
+для неё:
+
+```bash
+sudo systemctl edit every-camera@sptt
+#   [Service]
+#   User=alex
+sudo systemctl restart every-camera@sptt
+```
+
+Каталог `sptt.output_dir` должен быть доступен этому пользователю на запись.
 
 ### Infra (SW1300)
 

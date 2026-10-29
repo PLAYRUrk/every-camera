@@ -1,0 +1,23 @@
+# SPTT cameras (STT, CSDU family) — USB access without root.
+#
+#   sudo cp systemd/99-every-camera-sptt.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# then unplug and replug the camera (systemd/install.sh sptt does all of it).
+#
+# Every camera appears twice: as a bare Cypress FX2 before the program loads its
+# firmware, and under a second ID after it re-enumerates. Both have to be
+# covered, or the firmware loads and the camera is then out of reach. The vendor
+# ID is the STT's own 0xDCDC, not Cypress's 0x04B4.
+#
+# No firmware is loaded from here: every-camera does that itself, from the
+# vendor's .spt script. (The vendor's setup_csdu429.sh hands the .spt to fxload,
+# which does not read that format.)
+
+# CSDU-429 / CSDU-423: unconfigured, configured
+SUBSYSTEM=="usb", ATTR{idVendor}=="dcdc", ATTR{idProduct}=="f429", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="dcdc", ATTR{idProduct}=="e429", MODE="0666"
+
+# CSDU-285C: unconfigured, configured
+SUBSYSTEM=="usb", ATTR{idVendor}=="dcdc", ATTR{idProduct}=="d285", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="dcdc", ATTR{idProduct}=="c285", MODE="0666"

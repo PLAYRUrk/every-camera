@@ -241,3 +241,45 @@ def test_astropy_reads_the_cube_back(tmp_path):
     with fits.open(path) as hdul:
         assert np.array_equal(hdul[0].data, cube)
         assert hdul[0].header["COLORTYP"] == "RGB"
+
+
+@pytest.mark.parametrize("writer", ["astropy", "minimal"])
+def test_the_archive_shows_a_saved_rgb_frame_in_colour(tmp_path, writer):
+    """The cube is (3, H, W) on disk; the viewer and the LAN archive take
+    colour as (H, W, 3) and used to refuse the file outright."""
+    import frame_archive
+    from cameras.sptt_driver import save_fits
+    cube = debayer(_flat_mosaic("RGGB"), "RGGB")
+    path = tmp_path / "rgb.fit"
+    if writer == "astropy":
+        pytest.importorskip("astropy")
+        save_fits(str(path), cube, {"COLORTYP": "RGB", "ADCFULL": 65535})
+    else:
+        _save_fits_minimal(str(path), cube, {"COLORTYP": "RGB", "ADCFULL": 65535})
+    arr, _ = frame_archive.read_frame_with_scale(str(path))
+    assert arr.shape == (8, 10, 3)
+    assert [int(arr[4, 4, i]) for i in range(3)] == [CELL["R"], CELL["G"], CELL["B"]]
+    assert frame_archive.read_fits_minimal(str(path)).shape == (3, 8, 10)
+    assert frame_archive.to_jpeg_bytes(arr)[:2] == b"\xff\xd8"
+
+
+# ---------------------------------------------------------------------------
+# Running without root
+# ---------------------------------------------------------------------------
+def test_the_udev_rules_cover_every_id_of_every_model():
+    """The old README rule named Cypress's 04b4, which no CSDU camera uses."""
+    import re
+    rules = (ROOT / loader.UDEV_RULES).read_text(encoding="utf-8")
+    pairs = set(re.findall(r'idVendor\}=="([0-9a-f]{4})".*idProduct\}=="([0-9a-f]{4})"', rules))
+    for model in loader.MODELS:
+        for pid in (model.pid_raw, model.pid_configured):
+            assert (f"{loader.VID:04x}", f"{pid:04x}") in pairs, model.name
+
+
+def test_a_permission_error_says_how_to_fix_it():
+    import usb.core
+    message = loader.explain_usb_error(
+        usb.core.USBError("Access denied (insufficient permissions)", errno=13))
+    assert loader.UDEV_RULES in message and "udevadm" in message
+    other = usb.core.USBError("Pipe error", errno=32)
+    assert loader.explain_usb_error(other) == str(other)

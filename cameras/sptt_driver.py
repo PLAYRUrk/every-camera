@@ -34,7 +34,7 @@ from worker_common import (
 )
 
 from .sptt_load_firmware import (
-    VID, CSDU429, CSDU285C, MODELS, detect_model,
+    VID, CSDU429, CSDU285C, MODELS, detect_model, explain_usb_error,
     find_libusb_backend, load_firmware_files, detach_kernel_driver,
     load_fx2_firmware, wait_for_configured_device, load_fpga_bitstream,
 )
@@ -365,7 +365,10 @@ class SpttCamera:
                 raise RuntimeError("Device lost after reset!")
         except usb.core.USBError:
             pass
-        self.dev.set_configuration()
+        try:
+            self.dev.set_configuration()
+        except usb.core.USBError as exc:
+            raise RuntimeError(explain_usb_error(exc)) from exc
         cfg = self.dev.get_active_configuration()
         self.ep_wr = cfg.interfaces()[0][0]
         self.ep_rd = cfg.interfaces()[0][1]
@@ -762,6 +765,15 @@ def ensure_firmware_loaded(backend, firmware_dir=None):
         console_ui.error(str(exc))
         return None
 
+    try:
+        return _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data)
+    except usb.core.USBError as exc:
+        console_ui.error(explain_usb_error(exc))
+        return None
+
+
+def _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data):
+    """The USB half of :func:`ensure_firmware_loaded`."""
     console_ui.log(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
     load_fx2_firmware(dev_raw, fx2_blocks)
