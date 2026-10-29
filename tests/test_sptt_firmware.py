@@ -42,8 +42,8 @@ def test_the_shipped_firmware_is_where_the_loader_looks():
 
 
 def test_the_shipped_firmware_actually_loads():
-    fx2, fpga = load_firmware_files()
-    assert len(fx2) == 6936
+    fx2_blocks, fpga = load_firmware_files()
+    assert [(addr, len(block)) for addr, block in fx2_blocks] ==         [(0x0000, 4064), (0x0FE0, 2872)]
     assert len(fpga) == 54908
 
 

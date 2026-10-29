@@ -245,7 +245,11 @@ class CannonConfigTab:
 # SPTT config tab
 # ---------------------------------------------------------------------------
 class SpttConfigTab:
-    """Builds and reads the SPTT (CSDU-429) camera configuration form."""
+    """Builds and reads the SPTT (CSDU-429/423/285C) camera configuration form."""
+
+    # As in cameras/sptt_driver.BAYER_PATTERNS; repeated here because this
+    # dialog has to open on machines with no libusb.
+    BAYER_PATTERNS = ["RGGB", "GRBG", "GBRG", "BGGR"]
 
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
@@ -257,7 +261,8 @@ class SpttConfigTab:
         root = QVBoxLayout(self.widget)
         root.setContentsMargins(8, 8, 8, 8)
 
-        box, grid = _group_grid("SPTT Camera (CSDU-429)")
+        # The model is not chosen here: the driver tells it from the USB ID.
+        box, grid = _group_grid("SPTT Camera (CSDU-429/423/285C)")
         row = 0
 
         self.le_output = QLineEdit(c.get("output_dir", ""))
@@ -339,7 +344,8 @@ class SpttConfigTab:
         temp_lay.setContentsMargins(0, 0, 0, 0)
         self.cb_temp_none = QCheckBox("None (no cooling)")
         self.sb_temp = QDoubleSpinBox()
-        self.sb_temp.setRange(-60.0, 40.0)
+        # The Peltier range the vendor documents; the driver refuses the rest.
+        self.sb_temp.setRange(-30.0, 30.0)
         self.sb_temp.setSuffix(" °C")
         tt = c.get("target_temp")
         if tt is None:
@@ -362,6 +368,33 @@ class SpttConfigTab:
         _add_label_row(grid, row, "Capture seconds:", self.le_capture_secs); row += 1
 
         root.addWidget(box)
+
+        # Only the CSDU-285C reads these; a grey camera ignores them.
+        cbox, cgrid = _group_grid("Colour camera (CSDU-285C only)")
+        row = 0
+
+        self.cb_debayer = QCheckBox("Save RGB (demosaiced) instead of raw Bayer")
+        self.cb_debayer.setChecked(bool(c.get("debayer", False)))
+        _add_label_row(cgrid, row, "Debayer:", self.cb_debayer); row += 1
+
+        self.cb_bayer = QComboBox()
+        self.cb_bayer.addItems(self.BAYER_PATTERNS)
+        pattern = str(c.get("bayer_pattern") or "RGGB").upper()
+        self.cb_bayer.setCurrentIndex(
+            self.BAYER_PATTERNS.index(pattern) if pattern in self.BAYER_PATTERNS else 0)
+        _add_label_row(cgrid, row, "Bayer pattern:", self.cb_bayer); row += 1
+
+        # -1 shows as "camera default": nothing is sent, the camera keeps its own.
+        self.sb_r_offset = QSpinBox()
+        self.sb_g_offset = QSpinBox()
+        for spin, key, label in ((self.sb_r_offset, "r_offset", "Red offset:"),
+                                 (self.sb_g_offset, "g_offset", "Green offset:")):
+            spin.setRange(-1, 1023)
+            spin.setSpecialValueText("camera default")
+            spin.setValue(-1 if c.get(key) is None else int(c[key]))
+            _add_label_row(cgrid, row, label, spin); row += 1
+
+        root.addWidget(cbox)
         root.addStretch()
 
     def _auto_period(self):
@@ -400,6 +433,10 @@ class SpttConfigTab:
             "encoding":      self.cb_encoding.currentIndex(),
             "target_temp":   None if self.cb_temp_none.isChecked() else self.sb_temp.value(),
             "capture_seconds": secs,
+            "debayer":       self.cb_debayer.isChecked(),
+            "bayer_pattern": self.BAYER_PATTERNS[self.cb_bayer.currentIndex()],
+            "r_offset":      None if self.sb_r_offset.value() < 0 else self.sb_r_offset.value(),
+            "g_offset":      None if self.sb_g_offset.value() < 0 else self.sb_g_offset.value(),
         }
 
 

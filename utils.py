@@ -921,7 +921,7 @@ def configure_console_cannon(cfg, config_path=None):
 def configure_console_sptt(cfg, config_path=None):
     """Interactive configuration for SPTT camera console mode."""
     sptt = cfg.get("sptt", {})
-    print("\n--- SPTT (CSDU-429) Camera Configuration ---\n")
+    print("\n--- SPTT (CSDU-429/423/285C) Camera Configuration ---\n")
 
     sptt["output_dir"] = _ask("Output directory for FITS files", sptt.get("output_dir", ""))
     sptt["instance_name"] = _ask("Instance name (auto if empty)",
@@ -940,6 +940,15 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["binning"] = _ask_int("Binning (0=1x1, 1=2x2, 3=4x4)", sptt.get("binning", 0))
     enc = _ask_int("Encoding (0=8bit, 1=12bit)", sptt.get("encoding", 1))
     sptt["encoding"] = enc if enc in (0, 1) else 1
+
+    # The model comes from the USB ID; these only matter on a CSDU-285C.
+    print("\n  Colour camera (CSDU-285C) only — a grey camera ignores these.")
+    sptt["debayer"] = _ask_bool("Save RGB instead of raw Bayer",
+                                bool(sptt.get("debayer", False)))
+    pattern = _ask("Bayer pattern (RGGB/GRBG/GBRG/BGGR)",
+                   sptt.get("bayer_pattern") or "RGGB").upper()
+    sptt["bayer_pattern"] = (pattern if pattern in ("RGGB", "GRBG", "GBRG", "BGGR")
+                             else "RGGB")
 
     cfg["sptt"] = sptt
     _configure_server(cfg)

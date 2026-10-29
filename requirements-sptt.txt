@@ -1,4 +1,4 @@
-# Узел с камерой SPTT (CSDU-429). Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
+# Узел с камерой SPTT (CSDU-429/423, CSDU-285C). Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
 -r requirements.txt
 
 pyusb>=1.2,<2          # чистый Python, нужна системная libusb-1.0

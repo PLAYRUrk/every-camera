@@ -1,6 +1,6 @@
 # Every Camera
 
-Программа управления камерами Canon (gphoto2), SPTT (CSDU-429), Infra (Tanho SW1300 SWIR),
+Программа управления камерами Canon (gphoto2), SPTT (CSDU-429/423, CSDU-285C), Infra (Tanho SW1300 SWIR),
 Sentry (Princeton Instruments CCD через демон imagerd_rt), ASI — всенебный имиджер
 (Princeton Instruments PIXIS через PICAM SDK + фильтровое колесо) и Japan — всенебный
 имиджер Hamamatsu (DCAM-API + то же самое фильтровое колесо).
@@ -30,8 +30,9 @@ schedule_generator.py  — генератор расписания по углу
 cameras/               — пакет драйверов камер
   __init__.py
   cannon_driver.py     — Canon DSLR: подключение, настройка, съёмка (gphoto2)
-  sptt_driver.py       — CSDU-429: USB, съёмка, FITS
-  sptt_load_firmware.py — загрузчик прошивки CSDU-429 (FX2 + FPGA)
+  sptt_driver.py       — CSDU-429/423/285C: USB, съёмка, FITS, дебайер
+  sptt_load_firmware.py — модели CSDU и загрузчик прошивки (FX2 + FPGA)
+  sptt_spt.py          — чтение вендорских скриптов прошивки .spt
   infra_driver.py      — Tanho SW1300 SWIR: USB, съёмка, TIFF/PNG/FITS
   sentry_driver.py     — Princeton CCD via imagerd_rt: супервизор демона
   asi_driver.py        — ASI (всенебный имиджер): рабочий цикл, тёмные кадры, расписание
@@ -294,7 +295,7 @@ Ctrl+Break доходят до драйвера как обычно: он доп
 # Canon DSLR
 python main.py --type cannon
 
-# SPTT (CSDU-429)
+# SPTT (CSDU-429/423/285C — модель определяется по USB ID)
 python main.py --type sptt
 
 # Infra (SW1300 SWIR)
@@ -408,7 +409,11 @@ python setup_app.py --console --config /path/to/config.json
     "encoding": 1,
     "target_temp": null,
     "firmware_dir": "",
-    "capture_seconds": [0, 30]
+    "capture_seconds": [0, 30],
+    "debayer": false,
+    "bayer_pattern": "RGGB",
+    "r_offset": null,
+    "g_offset": null
   },
   "infra": {
     "instance_name": "",
@@ -612,11 +617,29 @@ python setup_app.py --console --config /path/to/config.json
 - **encoding** — разрядность оцифровки (`0` = 8 бит, `1` = 12 бит); в кадре значения
   в любом случае приведены к общей шкале 0–65535, см. [«Шкала интенсивности»](#шкала-интенсивности-065535)
 - **target_temp** — целевая температура ПЗС в °C (`null` = охлаждение не задано)
-- **firmware_dir** — директория с файлами прошивки `fx2_firmware.bin` и `fpga_bitstream.bin`.
-  Если пусто — берётся `firmware/` в корне программы (рядом с `main.py`). Относительный
+- **firmware_dir** — директория с файлами прошивки: для CSDU-429/423 — `fx2_firmware.bin`
+  и `fpga_bitstream.bin` (или вендорский `c2-429.spt`), для CSDU-285C — `csdu285.spt`
+  (вендорский `CSDU285.SPT`, прошивка читается прямо из него). Если пусто — берётся `firmware/` в корне программы (рядом с `main.py`). Относительный
   путь отсчитывается от корня программы, абсолютный используется как есть. Если файлов
   там нет, камера не поднимется, и в журнале будет указан путь, по которому их искали
 - **capture_seconds** — секунды каждой минуты для публикации статуса
+- **debayer** — только CSDU-285C: `true` — сохранять кадр как RGB-куб (3×H×W,
+  билинейный дебайер), `false` (по умолчанию) — сырую мозаику Bayer с `BAYERPAT`
+  в заголовке. Кадры с биннингом всегда серые: биннинг смешивает цвета на матрице
+- **bayer_pattern** — только CSDU-285C: раскладка мозаики (`RGGB` по умолчанию,
+  `GRBG`, `GBRG`, `BGGR`); если на снимке красное и синее поменялись местами — это она
+- **r_offset**, **g_offset** — смещения каналов цветной камеры (`null` — не отправлять,
+  камера оставит свои; вендорские программы ставили `0` и `30`)
+
+Модели семейства различаются драйвером автоматически по USB ID:
+
+| Модель | USB ID (до → после прошивки) | Сенсор | Кадр 1×1 |
+|---|---|---|---|
+| CSDU-429 / CSDU-423 | `DCDC:F429` → `DCDC:E429` | ICX429, чересстрочный, ч/б | 744×576 |
+| CSDU-285C | `DCDC:D285` → `DCDC:C285` | ICX285AQ, прогрессивный, Bayer | 1392×1040 |
+
+В заголовке FITS `INSTRUME` — имя модели. «CSDU Gray», «CSDU Color», «Um_2» из
+вендорского дистрибутива — это программы, а не отдельные камеры.
 
 ##### Экспозиция и период кадра
 
@@ -3101,6 +3124,7 @@ python -m pytest tests -q
 | `tests/test_japan_params.py` | правка параметров из `focus_app` и отказ от чужих |
 | `tests/test_sptt_exposure.py` | экспозиция SPTT: период кадра выводится из экспозиции и следует за ней, обратное чтение из камеры сверяется, кадр от старых настроек отбрасывается, мёртвое время не раздувается опросами |
 | `tests/test_sptt_firmware.py` | поиск прошивки SPTT: каталог по умолчанию, `firmware_dir`, отсутствие файлов — ошибка, а не выход из программы |
+| `tests/test_sptt_models.py` | семейство CSDU: прошивка из `.spt` совпадает с захваченной с USB, модель по USB ID, чересстрочный и прогрессивный кадр, дебайер всех раскладок, цветные ключи FITS, RGB-куб |
 | `tests/test_cannon_exposure.py` | выдержка Canon из `config.json` доходит до камеры, а неподдерживаемая отвергается со списком допустимых |
 | `tests/test_stop_signals.py` | остановка по SIGINT/SIGTERM во всех драйверах, `run.sh`, юнит systemd, SIGBREAK и перехват закрытия консоли на Windows |
 | `tests/test_windows_portability.py` | ничего на пути станции Windows не зовёт `os.statvfs`, `fcntl` или `/proc`; имя COM-порта по умолчанию, системные метрики без `/proc`, резервирование имени экземпляра, наличие `run.cmd` |

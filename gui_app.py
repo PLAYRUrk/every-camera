@@ -633,6 +633,10 @@ class CannonTab(QWidget):
 # SPTT GUI components
 # ===========================================================================
 
+# Binning codes offered in the SPTT tab, in combo-box order.
+SPTT_BINNINGS = [0, 1, 3]
+
+
 class SpttCaptureThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
     error = pyqtSignal(str)
@@ -709,12 +713,18 @@ class SpttScheduledWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 service=None):
+                 service=None, capture_seconds=None, debayer=False):
         super().__init__()
+        from sptt_driver import SPTT_CAPTURE_SECONDS
         self.cam = cam
+        # sptt.debayer, as the console worker reads it.
+        self.debayer = bool(debayer)
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
+        # sptt.capture_seconds, as the console worker reads it; this copy used
+        # to hard-wire :00 and :30 whatever the config said.
+        self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self._service = service
         self._stop = False
         self._shots = 0
@@ -768,8 +778,7 @@ class SpttScheduledWorkerQt(QThread):
         return applied, errors
 
     def run(self):
-        from sptt_driver import (save_fits, frame_metadata, ENCODING_12BPP,
-                                 SPTT_CAPTURE_SECONDS)
+        from sptt_driver import save_fits, frame_metadata, seconds_to_next_capture
 
         last_fired = (-1, -1)
         consecutive_errors = 0
@@ -793,13 +802,11 @@ class SpttScheduledWorkerQt(QThread):
 
             now = dt.now()
 
-            sec = now.second + now.microsecond / 1_000_000
-            remaining = min((s - sec) for s in SPTT_CAPTURE_SECONDS if s > sec) if any(
-                s > sec for s in SPTT_CAPTURE_SECONDS) else (60 - sec + SPTT_CAPTURE_SECONDS[0])
+            remaining = seconds_to_next_capture(now, self.capture_seconds)
             self.countdown.emit(f"{remaining:.1f}s")
 
             fire_key = (now.minute, now.second)
-            if now.second in SPTT_CAPTURE_SECONDS and fire_key != last_fired:
+            if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
                 filepath = os.path.join(self.output_dir, f"{timestamp}.fit")
@@ -807,8 +814,11 @@ class SpttScheduledWorkerQt(QThread):
                     # A frame started at the tick, not one that has been
                     # sitting in the FIFO since the last capture.
                     frame = self.cam.grab_fresh_frame()
-                    metadata = frame_metadata(self.cam, now)
-                    save_fits(filepath, frame, metadata)
+                    debayered = self.debayer and self.cam.is_mosaic()
+                    metadata = frame_metadata(self.cam, now, debayered=debayered)
+                    save_fits(filepath,
+                              self.cam.to_rgb(frame) if debayered else frame,
+                              metadata)
                     self._last_frame = frame
                     self._push_live(frame, now)
                     self.log_msg.emit(f"Frame saved: {os.path.basename(filepath)}", "info")
@@ -827,7 +837,7 @@ class SpttScheduledWorkerQt(QThread):
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         self.log_msg.emit(f"Stopped: {consecutive_errors} consecutive errors", "error")
                         break
-            elif now.second not in SPTT_CAPTURE_SECONDS:
+            elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
                 self._handle_focus(now)
 
@@ -851,10 +861,12 @@ class SpttScheduledWorkerQt(QThread):
         capture seconds themselves, and a focus session expires by itself if
         the observer's program goes away, so it can never hold up a run.
         """
-        from sptt_driver import SPTT_CAPTURE_SECONDS
+        from sptt_driver import focus_frame_fits
         if self._service is None or not self._service.focus_active():
             return
-        if now.second in SPTT_CAPTURE_SECONDS:
+        # Not just "not on a capture second": a focus frame that runs past
+        # the next one makes the schedule miss it.
+        if not focus_frame_fits(now, self.capture_seconds, self.cam):
             return
         req_id, params = self._service.take_param_request()
         if params:
@@ -865,7 +877,7 @@ class SpttScheduledWorkerQt(QThread):
         # grab_frame drops the contaminated one either way.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: grab(),
+            self._service, lambda: self.cam.grey(grab()),
             on_error=lambda exc, stopped: self.log_msg.emit(
                 f"Focus frame failed: {exc}"
                 + (" — focus mode disabled" if stopped else ""), "warn"))
@@ -874,7 +886,7 @@ class SpttScheduledWorkerQt(QThread):
         """Hand the newest frame to the LAN service (viewer / focus tool)."""
         if self._service is not None:
             try:
-                self._service.publish_frame(frame, ts or dt.now())
+                self._service.publish_frame(self.cam.grey(frame), ts or dt.now())
             except Exception:
                 pass
 
@@ -991,17 +1003,24 @@ class SpttTab(QWidget):
         g2 = QGridLayout(grp_cap)
         g2.addWidget(QLabel("Binning:"), 0, 0)
         self.combo_binning = QComboBox()
-        self.combo_binning.addItems(["0 - 1x1", "1 - 2x2", "2 - 3x3", "3 - 4x4"])
+        # The binnings setup_app and the console wizard offer; the camera has
+        # no 3x3, and the index here is no longer the binning code itself.
+        self.combo_binning.addItems(["0 - 1x1", "1 - 2x2", "3 - 4x4"])
         g2.addWidget(self.combo_binning, 0, 1)
         g2.addWidget(QLabel("Encoding:"), 1, 0)
         self.combo_encoding = QComboBox()
         self.combo_encoding.addItems(["0 - 8 bit", "1 - 12 bit"])
         self.combo_encoding.setCurrentIndex(1)
         g2.addWidget(self.combo_encoding, 1, 1)
-        g2.addWidget(QLabel("Target Temp:"), 2, 0)
+        # A checkbox rather than "0 means off", which made 0 °C impossible
+        # to ask for.
+        self.chk_temp = QCheckBox("Target Temp:")
+        g2.addWidget(self.chk_temp, 2, 0)
         self.spin_temp = QSpinBox()
         self.spin_temp.setRange(-30, 30)
-        self.spin_temp.setValue(0)
+        self.spin_temp.setValue(-10)
+        self.spin_temp.setEnabled(False)
+        self.chk_temp.toggled.connect(self.spin_temp.setEnabled)
         g2.addWidget(self.spin_temp, 2, 1)
         self.btn_apply = QPushButton("Apply")
         self.btn_apply.setEnabled(False)
@@ -1077,11 +1096,19 @@ class SpttTab(QWidget):
         self._period_us = c.get("period_us")
         self._trigmode = c.get("trigmode")
         self._firmware_dir = c.get("firmware_dir", "")
+        # Colour settings (bayer_pattern, debayer, r/g offsets) are not on this
+        # tab either; they come from config.json via the setup form.
+        self._sptt_cfg = c
         self.spin_gain.setValue(c.get("gain", 100))
-        self.combo_binning.setCurrentIndex(c.get("binning", 0))
+        binning = c.get("binning", 0)
+        self.combo_binning.setCurrentIndex(
+            SPTT_BINNINGS.index(binning) if binning in SPTT_BINNINGS else 0)
         self.combo_encoding.setCurrentIndex(c.get("encoding", 1))
+        self._capture_seconds = c.get("capture_seconds")
         if c.get("target_temp") is not None:
-            self.spin_temp.setValue(c["target_temp"])
+            # setup_app stores it as a float; QSpinBox.setValue takes an int.
+            self.spin_temp.setValue(int(round(float(c["target_temp"]))))
+            self.chk_temp.setChecked(True)
 
     def _browse_dir(self, le):
         d = QFileDialog.getExistingDirectory(self, "Select directory")
@@ -1094,29 +1121,34 @@ class SpttTab(QWidget):
         QApplication.processEvents()
 
         try:
-            from sptt_driver import SpttCamera, ensure_firmware_loaded, find_libusb_backend
+            from sptt_driver import (
+                colour_offsets, ensure_firmware_loaded, find_libusb_backend,
+                make_camera,
+            )
             backend = find_libusb_backend()
-            if not ensure_firmware_loaded(backend, self._firmware_dir):
+            model = ensure_firmware_loaded(backend, self._firmware_dir)
+            if not model:
                 raise RuntimeError(
                     "Firmware could not be loaded — see the log for the paths "
                     "that were searched.")
             time.sleep(1.5)
-            self.cam = SpttCamera(backend)
+            self.cam = make_camera(backend, model, self._sptt_cfg)
             self.cam.open()
             self.cam.configure(
                 exposure=self.spin_exp.value(),
                 gain=self.spin_gain.value(),
-                binning=self.combo_binning.currentIndex(),
+                binning=SPTT_BINNINGS[self.combo_binning.currentIndex()],
                 encoding=self.combo_encoding.currentIndex(),
-                target_temp=self.spin_temp.value() if self.spin_temp.value() != 0 else None,
+                target_temp=self.spin_temp.value() if self.chk_temp.isChecked() else None,
                 period_us=self._period_us,
                 trigmode=self._trigmode,
+                **colour_offsets(self._sptt_cfg),
             )
             self.btn_reconnect.setEnabled(True)
             self.btn_preview_start.setEnabled(True)
             self.btn_apply.setEnabled(True)
             self.btn_meas_start.setEnabled(True)
-            self._log(f"SPTT connected: {self.cam.w}x{self.cam.h}", "info")
+            self._log(f"SPTT connected: {model.name} {self.cam.w}x{self.cam.h}", "info")
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
             self.btn_connect.setEnabled(True)
@@ -1173,10 +1205,16 @@ class SpttTab(QWidget):
 
         # The driver hands every encoding over on the program's 0..65535 scale,
         # so the preview no longer has to know which one produced the frame.
+        if self.cam is not None and self.cam.is_mosaic():
+            # (3, H, W) -> (H, W, 3), the byte order Format_RGB888 reads.
+            frame = np.moveaxis(self.cam.to_rgb(frame), 0, -1)
         display = np.ascontiguousarray(
             frame_archive.to_uint8(frame, stretch="raw"))
-        h, w = display.shape
-        qimg = QImage(display.data, w, h, w, QImage.Format_Grayscale8)
+        h, w = display.shape[:2]
+        if display.ndim == 3:
+            qimg = QImage(display.data, w, h, 3 * w, QImage.Format_RGB888)
+        else:
+            qimg = QImage(display.data, w, h, w, QImage.Format_Grayscale8)
         pixmap = QPixmap.fromImage(qimg)
         label_size = self.image_label.size()
         scaled = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1196,9 +1234,9 @@ class SpttTab(QWidget):
             self.cam.configure(
                 exposure=self.spin_exp.value(),
                 gain=self.spin_gain.value(),
-                binning=self.combo_binning.currentIndex(),
+                binning=SPTT_BINNINGS[self.combo_binning.currentIndex()],
                 encoding=self.combo_encoding.currentIndex(),
-                target_temp=self.spin_temp.value() if self.spin_temp.value() != 0 else None,
+                target_temp=self.spin_temp.value() if self.chk_temp.isChecked() else None,
                 period_us=self._period_us,
                 trigmode=self._trigmode,
             )
@@ -1255,6 +1293,8 @@ class SpttTab(QWidget):
             instance_name=instance_name,
             status_dir=status_dir,
             service=self._service,
+            capture_seconds=self._capture_seconds,
+            debayer=self._sptt_cfg.get("debayer", False),
         )
         self.scheduled_worker.log_msg.connect(self._log)
         self.scheduled_worker.shot_taken.connect(
@@ -1269,6 +1309,11 @@ class SpttTab(QWidget):
         self.btn_meas_start.setEnabled(False)
         self.btn_meas_stop.setEnabled(True)
         self.btn_preview_start.setEnabled(False)
+        # Apply stops and reconfigures the camera, which would pull it out
+        # from under the running schedule. Exposure and gain stay live: the
+        # driver serialises them against the worker's frame reads.
+        self.btn_apply.setEnabled(False)
+        self.btn_reconnect.setEnabled(False)
 
     def _on_meas_stop(self):
         if self.scheduled_worker and self.scheduled_worker.isRunning():
@@ -1288,6 +1333,8 @@ class SpttTab(QWidget):
         self.btn_meas_stop.setEnabled(False)
         self.btn_meas_start.setEnabled(self.cam is not None)
         self.btn_preview_start.setEnabled(self.cam is not None)
+        self.btn_apply.setEnabled(self.cam is not None)
+        self.btn_reconnect.setEnabled(self.cam is not None)
         self.lbl_meas_status.setText("Idle")
 
     def cleanup(self):

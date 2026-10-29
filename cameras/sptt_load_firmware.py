@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Firmware loader for CSDU-429 camera (Cypress FX2 + Xilinx FPGA).
+Firmware loader for CSDU cameras — 429/423 and 285C (Cypress FX2 + Xilinx FPGA).
 
-Loads clean firmware extracted from USB capture (no .spt file needed):
+Loads, for whichever model is on the bus:
 1. FX2 8051 firmware via vendor request 0xA0
 2. Xilinx FPGA bitstream via vendor request 0xF1
 
 Usage:
-    sudo python load_firmware.py
+    sudo python -m cameras.sptt_load_firmware
 
-Firmware files (in firmware/ directory relative to this script):
-    fx2_firmware.bin   - 6936 bytes, FX2 8051 code
-    fpga_bitstream.bin - 54908 bytes, Xilinx FPGA bitstream
+Firmware files (in the program's firmware/ directory):
+    csdu285.spt        - vendor script for the CSDU-285C (CSDU285.SPT)
+    c2-429.spt         - vendor script for the CSDU-429/423 (optional)
+    fx2_firmware.bin   - 6936 bytes, CSDU-429 FX2 8051 code (from USB capture)
+    fpga_bitstream.bin - 54908 bytes, CSDU-429 Xilinx FPGA bitstream
 
 Requires: pyusb, libusb
     pip install pyusb
@@ -24,7 +26,11 @@ import usb.core
 import usb.util
 import usb.backend.libusb1
 
+from dataclasses import dataclass
+
 from utils import APP_DIR
+
+from .sptt_spt import extract_firmware
 
 # Camera USB IDs
 VID = 0xDCDC
@@ -40,6 +46,57 @@ FX2_BLOCKS = [
 ]
 
 FPGA_CHUNK_SIZE = 64
+
+
+@dataclass(frozen=True)
+class SpttModel:
+    """One camera of the CSDU family, as far as this program has to tell them apart.
+
+    Everything else — the command set, the status block, the 12-bit packing —
+    is shared: the vendor drives all of them through the one stt_cam.dll.
+    """
+    name: str
+    pid_raw: int
+    pid_configured: int
+    # The vendor's firmware script, looked for in the firmware directory.
+    spt_name: str
+    # The sensor reads out two fields, even lines first; decode_frame has to
+    # weave them back together at full resolution.
+    interlaced: bool
+    # The sensor has a Bayer colour filter, so a full-resolution frame is a
+    # mosaic rather than a grey image.
+    color: bool
+    # Full-sensor frame size per binning code. Only for a log line when the
+    # firmware reports something else; the firmware's figure is what is used.
+    nominal_sizes: dict
+
+
+# CSDU-423 is the same camera to this driver: the vendor installs it with the
+# CSDU429 driver, the same USB IDs and the same C2-429.spt.
+CSDU429 = SpttModel(
+    name="CSDU-429", pid_raw=PID_RAW, pid_configured=PID_CONFIGURED,
+    spt_name="c2-429.spt", interlaced=True, color=False,
+    nominal_sizes={0: (744, 576), 1: (372, 288), 3: (186, 144)})
+
+# ICX285AQ: progressive scan, RGB Bayer, 1392x1040. IDs and script from the
+# vendor's csdu285.inf / CSDU285.SPT.
+CSDU285C = SpttModel(
+    name="CSDU-285C", pid_raw=0xD285, pid_configured=0xC285,
+    spt_name="csdu285.spt", interlaced=False, color=True,
+    nominal_sizes={0: (1392, 1040), 1: (696, 520), 3: (348, 260)})
+
+MODELS = (CSDU429, CSDU285C)
+
+
+def detect_model(backend):
+    """The model of the first SPTT camera on the bus, configured or not, or None."""
+    for model in MODELS:
+        for pid in (model.pid_configured, model.pid_raw):
+            dev = usb.core.find(idVendor=VID, idProduct=pid, backend=backend)
+            if dev:
+                usb.util.dispose_resources(dev)
+                return model
+    return None
 
 
 def find_libusb_backend():
@@ -79,10 +136,35 @@ def firmware_path(firmware_dir=None):
     return os.path.join(APP_DIR, "firmware")
 
 
-def load_firmware_files(firmware_dir=None):
-    """Read the FX2 firmware and the FPGA bitstream."""
-    directory = firmware_path(firmware_dir)
+def load_firmware_files(firmware_dir=None, model=CSDU429):
+    """Read the FX2 firmware and the FPGA bitstream for ``model``.
 
+    Returns ``(fx2_blocks, fpga_data)``, ``fx2_blocks`` being ``(address,
+    bytes)`` pairs. The vendor's ``.spt`` script is used when it is in the
+    directory; the CSDU-429 also still loads from the two blobs it has always
+    shipped with.
+    """
+    directory = firmware_path(firmware_dir)
+    spt_path = os.path.join(directory, model.spt_name)
+
+    if os.path.exists(spt_path):
+        with open(spt_path, 'rb') as f:
+            fx2_blocks, fpga_data = extract_firmware(f.read())
+        print(f"  Firmware script: {spt_path}")
+    elif model is CSDU429:
+        fx2_blocks, fpga_data = _load_429_blobs(directory)
+    else:
+        raise FileNotFoundError(
+            f"{model.name} firmware not found: {spt_path}. Copy the vendor's "
+            f"{model.spt_name} there, or set sptt.firmware_dir in config.json "
+            "if it lives elsewhere.")
+
+    print(f"  FX2 firmware:    {sum(len(b) for _, b in fx2_blocks)} bytes")
+    print(f"  FPGA bitstream:  {len(fpga_data)} bytes")
+    return fx2_blocks, fpga_data
+
+
+def _load_429_blobs(directory):
     fx2_path = os.path.join(directory, "fx2_firmware.bin")
     fpga_path = os.path.join(directory, "fpga_bitstream.bin")
 
@@ -106,10 +188,12 @@ def load_firmware_files(firmware_dir=None):
         print(f"WARNING: FX2 firmware size {len(fx2_data)} != expected {expected_fx2}")
 
     print(f"  Firmware directory: {directory}")
-    print(f"  FX2 firmware:    {len(fx2_data)} bytes")
-    print(f"  FPGA bitstream:  {len(fpga_data)} bytes")
-
-    return fx2_data, fpga_data
+    blocks = []
+    offset = 0
+    for addr, size in FX2_BLOCKS:
+        blocks.append((addr, fx2_data[offset:offset + size]))
+        offset += size
+    return blocks, fpga_data
 
 
 def detach_kernel_driver(dev):
@@ -122,11 +206,13 @@ def detach_kernel_driver(dev):
         pass
 
 
-def load_fx2_firmware(dev, fx2_data):
+def load_fx2_firmware(dev, fx2_blocks):
     """
     Load FX2 8051 firmware using vendor request 0xA0.
 
-    Protocol (from USB capture, frames 339-345):
+    ``fx2_blocks`` is the ``(address, bytes)`` list load_firmware_files gives.
+
+    Protocol (from USB capture, frames 339-345; CSDU-429 block sizes):
     1. Write 0x01 to CPUCS (0xE600) — assert reset
     2. Write 4064 bytes to 0x0000
     3. Write 2872 bytes to 0x0FE0
@@ -139,22 +225,18 @@ def load_fx2_firmware(dev, fx2_data):
     dev.ctrl_transfer(0x40, 0xA0, 0xE600, 0x0000, b'\x01')
 
     # Step 2: Write firmware blocks
-    offset = 0
-    for addr, size in FX2_BLOCKS:
-        block = fx2_data[offset:offset + size]
+    for addr, block in fx2_blocks:
         print(f"  Write {len(block)} bytes to 0x{addr:04X}")
         CHUNK = 4096
         for off in range(0, len(block), CHUNK):
             chunk = block[off:off + CHUNK]
             dev.ctrl_transfer(0x40, 0xA0, addr + off, 0x0000, chunk, timeout=5000)
-        offset += size
 
     # Step 3: Verify before releasing reset (CPU halted, RAM readable)
     print("  Verifying firmware in RAM...")
-    offset = 0
     verify_ok = True
-    for addr, size in FX2_BLOCKS:
-        expected = fx2_data[offset:offset + size]
+    for addr, expected in fx2_blocks:
+        size = len(expected)
         readback = b''
         for off in range(0, size, 4096):
             rlen = min(4096, size - off)
@@ -169,7 +251,6 @@ def load_fx2_firmware(dev, fx2_data):
             verify_ok = False
         else:
             print(f"  Verified {size} bytes at 0x{addr:04X} OK")
-        offset += size
 
     if not verify_ok:
         print("ERROR: Firmware verification failed! Aborting.")
@@ -182,7 +263,7 @@ def load_fx2_firmware(dev, fx2_data):
     print("FX2 firmware loaded. Device will re-enumerate.")
 
 
-def wait_for_configured_device(backend, timeout=10.0):
+def wait_for_configured_device(backend, timeout=10.0, model=CSDU429):
     """Wait for device to re-enumerate after FX2 firmware load."""
     print("Waiting for FX2 firmware to initialize...")
     time.sleep(2)
@@ -191,7 +272,7 @@ def wait_for_configured_device(backend, timeout=10.0):
     start = time.time()
     while time.time() - start < timeout:
         # After FX2 firmware loads, device may keep same PID or change
-        for pid in [PID_CONFIGURED, PID_RAW]:
+        for pid in [model.pid_configured, model.pid_raw]:
             dev = usb.core.find(idVendor=VID, idProduct=pid, backend=backend)
             if dev:
                 print(f" found {VID:04x}:{pid:04x} ({time.time() - start:.1f}s)")
@@ -245,37 +326,39 @@ def load_fpga_bitstream(dev, fpga_data):
 
 
 def main():
-    print("CSDU-429 Camera Firmware Loader")
-    print("================================")
-
-    # Load firmware files
-    print("Loading firmware files...")
-    fx2_data, fpga_data = load_firmware_files()
-    print()
+    print("CSDU Camera Firmware Loader")
+    print("===========================")
 
     backend = find_libusb_backend()
+    model = detect_model(backend)
+    if model is None:
+        print("ERROR: No camera found!")
+        for m in MODELS:
+            print(f"  {m.name}: raw {VID:04x}:{m.pid_raw:04x}, "
+                  f"configured {VID:04x}:{m.pid_configured:04x}")
+        print("  Make sure the camera is connected via USB.")
+        sys.exit(1)
+    print(f"Camera model: {model.name}")
 
     # Step 1: Check if device is already configured
-    dev = usb.core.find(idVendor=VID, idProduct=PID_CONFIGURED, backend=backend)
+    dev = usb.core.find(idVendor=VID, idProduct=model.pid_configured, backend=backend)
     if dev:
-        print(f"Camera already configured (PID=0x{PID_CONFIGURED:04x}).")
+        print(f"Camera already configured (PID=0x{model.pid_configured:04x}).")
         print("Firmware is already loaded. Ready to use.")
         return
 
-    # Step 2: Find raw (unconfigured) FX2 device
-    dev_raw = usb.core.find(idVendor=VID, idProduct=PID_RAW, backend=backend)
-    if not dev_raw:
-        print("ERROR: No camera found!")
-        print(f"  Expected raw device:  {VID:04x}:{PID_RAW:04x}")
-        print(f"  Expected configured:  {VID:04x}:{PID_CONFIGURED:04x}")
-        print("  Make sure the camera is connected via USB.")
-        sys.exit(1)
+    # Load firmware files
+    print("Loading firmware files...")
+    fx2_blocks, fpga_data = load_firmware_files(model=model)
+    print()
 
-    print(f"Found raw FX2 device: {VID:04x}:{PID_RAW:04x}")
+    # Step 2: Find raw (unconfigured) FX2 device
+    dev_raw = usb.core.find(idVendor=VID, idProduct=model.pid_raw, backend=backend)
+    print(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
 
     # Step 3: Load FX2 firmware
-    load_fx2_firmware(dev_raw, fx2_data)
+    load_fx2_firmware(dev_raw, fx2_blocks)
     print()
 
     # Step 4: USB bus reset and re-acquire device
@@ -288,7 +371,7 @@ def main():
     usb.util.dispose_resources(dev_raw)
     del dev_raw
 
-    dev = wait_for_configured_device(backend)
+    dev = wait_for_configured_device(backend, model=model)
     if not dev:
         print("ERROR: Device not found after firmware load!")
         sys.exit(1)
@@ -309,17 +392,13 @@ def main():
 
     # Wait for device to re-enumerate after FPGA configuration
     print()
-    dev_final = wait_for_configured_device(backend, timeout=10.0)
+    dev_final = wait_for_configured_device(backend, timeout=10.0, model=model)
     if dev_final:
         print("Camera initialization complete!")
-        print(f"Device ready at {VID:04x}:{PID_CONFIGURED:04x}")
+        print(f"Device ready at {VID:04x}:{model.pid_configured:04x}")
     else:
-        dev_raw2 = usb.core.find(idVendor=VID, idProduct=PID_RAW, backend=backend)
-        if dev_raw2:
-            print("Done. Device at PID=0xF429.")
-        else:
-            print("WARNING: Device not found after initialization.")
-            print("  Check: sudo dmesg | tail -30")
+        print("WARNING: Device not found after initialization.")
+        print("  Check: sudo dmesg | tail -30")
 
 
 if __name__ == '__main__':

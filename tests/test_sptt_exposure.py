@@ -18,7 +18,7 @@ it, so only the three endpoints are faked here — none of this needs a camera.
 import struct
 import sys
 
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone
 from pathlib import Path
 
 import pytest
@@ -356,7 +356,7 @@ def test_a_scheduled_capture_starts_its_own_frame():
     cam.start()
     fw.commands.clear()
 
-    started_after = dt.now()
+    started_after = dt.now(timezone.utc)
     cam.grab_fresh_frame()
 
     assert CMD_FIFO_INIT in [cid for cid, _ in fw.commands]
