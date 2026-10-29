@@ -167,6 +167,7 @@ def test_a_worker_that_cannot_start_the_camera_reports_failure(tmp_path):
 
     class DeadCamera:
         model = CSDU429
+        port = None
         exposure, gain, binning, encoding = 0.88, 100, 0, 1
         w = h = 0
         period_us = min_period_us = trigmode = 0

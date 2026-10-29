@@ -26,6 +26,7 @@ import usb.core
 import usb.util
 import usb.backend.libusb1
 
+from collections import namedtuple
 from dataclasses import dataclass
 
 from utils import APP_DIR
@@ -109,15 +110,74 @@ def explain_usb_error(exc):
     return str(exc)
 
 
-def detect_model(backend):
-    """The model of the first SPTT camera on the bus, configured or not, or None."""
+# One camera on the bus. ``port`` is the physical USB port, e.g. "1-2.3": the
+# same string Linux uses in /sys/bus/usb/devices. It is what tells two cameras
+# of one model apart — the firmware gives them no serial number to go by — and
+# it survives the re-enumeration after the firmware is loaded, which a bus
+# address does not.
+CameraLocation = namedtuple("CameraLocation", "model port configured")
+
+
+def usb_port(dev):
+    """The physical port ``dev`` is plugged into, as "bus-port.port…"."""
+    ports = getattr(dev, "port_numbers", None)
+    if ports:
+        return f"{dev.bus}-" + ".".join(str(p) for p in ports)
+    # A backend that cannot say: the bus address is unique for now, though it
+    # changes on replug, so it can be shown but is no use in a config.
+    return f"{dev.bus}:{dev.address}"
+
+
+def find_device(backend, pid, port=None):
+    """The device with ``pid`` on ``port``, or on any port when it is None."""
+    match = None if port is None else (lambda dev: usb_port(dev) == port)
+    return usb.core.find(idVendor=VID, idProduct=pid, backend=backend,
+                         custom_match=match)
+
+
+def list_cameras(backend):
+    """Every SPTT camera on the bus, configured or not, ordered by port."""
+    found = []
     for model in MODELS:
-        for pid in (model.pid_configured, model.pid_raw):
-            dev = usb.core.find(idVendor=VID, idProduct=pid, backend=backend)
-            if dev:
+        for pid, configured in ((model.pid_configured, True),
+                                (model.pid_raw, False)):
+            devices = usb.core.find(find_all=True, idVendor=VID, idProduct=pid,
+                                    backend=backend) or []
+            for dev in devices:
+                found.append(CameraLocation(model, usb_port(dev), configured))
                 usb.util.dispose_resources(dev)
-                return model
-    return None
+    return sorted(found, key=lambda cam: cam.port)
+
+
+def describe_cameras(cameras):
+    return "; ".join(f"{c.model.name} on USB port {c.port}"
+                     f"{'' if c.configured else ' (no firmware yet)'}"
+                     for c in cameras) or "none"
+
+
+def select_camera(backend, port=None):
+    """The camera this run is to drive, or LookupError saying why there is none.
+
+    With one camera on the machine ``port`` may be left empty, as before. With
+    several it has to be given: taking "the first" would let two runs pick the
+    same camera, or swap the two cameras' archives after a reboot.
+    """
+    cameras = list_cameras(backend)
+    if port:
+        chosen = [c for c in cameras if c.port == port]
+        if not chosen:
+            raise LookupError(f"No SPTT camera on USB port {port}. "
+                              f"Connected: {describe_cameras(cameras)}.")
+        return chosen[0]
+    if not cameras:
+        raise LookupError("No SPTT camera found (looked for "
+                          + ", ".join(m.name for m in MODELS) + ").")
+    if len(cameras) > 1:
+        raise LookupError(
+            f"{len(cameras)} SPTT cameras connected: {describe_cameras(cameras)}. "
+            "Set sptt.usb_port in this run's config to the one it should drive "
+            "(python main.py --type sptt --probe lists them).")
+    return cameras[0]
 
 
 def find_libusb_backend():
@@ -284,8 +344,12 @@ def load_fx2_firmware(dev, fx2_blocks):
     print("FX2 firmware loaded. Device will re-enumerate.")
 
 
-def wait_for_configured_device(backend, timeout=10.0, model=CSDU429):
-    """Wait for device to re-enumerate after FX2 firmware load."""
+def wait_for_configured_device(backend, timeout=10.0, model=CSDU429, port=None):
+    """Wait for device to re-enumerate after FX2 firmware load.
+
+    ``port`` keeps the wait on the camera being loaded: with several on the
+    machine, any other one would otherwise do.
+    """
     print("Waiting for FX2 firmware to initialize...")
     time.sleep(2)
 
@@ -294,7 +358,7 @@ def wait_for_configured_device(backend, timeout=10.0, model=CSDU429):
     while time.time() - start < timeout:
         # After FX2 firmware loads, device may keep same PID or change
         for pid in [model.pid_configured, model.pid_raw]:
-            dev = usb.core.find(idVendor=VID, idProduct=pid, backend=backend)
+            dev = find_device(backend, pid, port)
             if dev:
                 print(f" found {VID:04x}:{pid:04x} ({time.time() - start:.1f}s)")
                 return dev
@@ -347,24 +411,34 @@ def load_fpga_bitstream(dev, fpga_data):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="CSDU camera firmware loader")
+    parser.add_argument("--list", action="store_true",
+                        help="list the connected cameras and exit")
+    parser.add_argument("--port", default=None,
+                        help="USB port of the camera to load, e.g. 1-2.3 "
+                             "(needed when several are connected)")
+    args = parser.parse_args()
+
     print("CSDU Camera Firmware Loader")
     print("===========================")
 
     backend = find_libusb_backend()
-    model = detect_model(backend)
-    if model is None:
-        print("ERROR: No camera found!")
-        for m in MODELS:
-            print(f"  {m.name}: raw {VID:04x}:{m.pid_raw:04x}, "
-                  f"configured {VID:04x}:{m.pid_configured:04x}")
-        print("  Make sure the camera is connected via USB.")
+    if args.list:
+        for cam in list_cameras(backend):
+            print(f"  {cam.port:<12} {cam.model.name:<10} "
+                  f"{'configured' if cam.configured else 'no firmware'}")
+        return
+    try:
+        cam = select_camera(backend, args.port)
+    except LookupError as exc:
+        print(f"ERROR: {exc}")
         sys.exit(1)
-    print(f"Camera model: {model.name}")
+    model, port = cam.model, cam.port
+    print(f"Camera: {model.name} on USB port {port}")
 
     # Step 1: Check if device is already configured
-    dev = usb.core.find(idVendor=VID, idProduct=model.pid_configured, backend=backend)
-    if dev:
-        print(f"Camera already configured (PID=0x{model.pid_configured:04x}).")
+    if cam.configured:
         print("Firmware is already loaded. Ready to use.")
         return
 
@@ -374,7 +448,7 @@ def main():
     print()
 
     # Step 2: Find raw (unconfigured) FX2 device
-    dev_raw = usb.core.find(idVendor=VID, idProduct=model.pid_raw, backend=backend)
+    dev_raw = find_device(backend, model.pid_raw, port)
     print(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
 
@@ -392,7 +466,7 @@ def main():
     usb.util.dispose_resources(dev_raw)
     del dev_raw
 
-    dev = wait_for_configured_device(backend, model=model)
+    dev = wait_for_configured_device(backend, model=model, port=port)
     if not dev:
         print("ERROR: Device not found after firmware load!")
         sys.exit(1)
@@ -413,10 +487,11 @@ def main():
 
     # Wait for device to re-enumerate after FPGA configuration
     print()
-    dev_final = wait_for_configured_device(backend, timeout=10.0, model=model)
+    dev_final = wait_for_configured_device(backend, timeout=10.0, model=model,
+                                           port=port)
     if dev_final:
         print("Camera initialization complete!")
-        print(f"Device ready at {VID:04x}:{model.pid_configured:04x}")
+        print(f"Device ready at {VID:04x}:{model.pid_configured:04x}, port {port}")
     else:
         print("WARNING: Device not found after initialization.")
         print("  Check: sudo dmesg | tail -30")

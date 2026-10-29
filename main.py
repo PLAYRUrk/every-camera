@@ -42,6 +42,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import can_use_gui
 
+CAMERA_TYPES = ("cannon", "sptt", "infra", "sentry", "asi", "japan")
+
+
+def camera_type(value):
+    """``--type``: a camera type, optionally with a ``-label`` after it.
+
+    The systemd unit passes its instance name as the type, so a second SPTT
+    service on one machine, every-camera@sptt-north, arrives here as
+    "sptt-north". The label only tells services and their configs apart; the
+    camera itself is picked by sptt.usb_port in that config.
+    """
+    base = value.split("-", 1)[0]
+    if base not in CAMERA_TYPES:
+        raise argparse.ArgumentTypeError(
+            f"unknown camera type {value!r} (choose from {', '.join(CAMERA_TYPES)})")
+    return base
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -65,10 +82,12 @@ up, serves live frames to focus_app.py, and archives nothing. --setup asks for
 that mode explicitly, even when a schedule is configured.
         """,
     )
-    parser.add_argument("--type",
-                        choices=["cannon", "sptt", "infra", "sentry", "asi",
-                                 "japan"],
-                        help="Camera type (required for console mode)")
+    parser.add_argument("--type", type=camera_type, metavar="TYPE",
+                        help="Camera type (required for console mode): "
+                             + ", ".join(CAMERA_TYPES) + ". A label after a "
+                             "dash (sptt-north) names one of several cameras "
+                             "of a type — it is ignored here, and lets "
+                             "every-camera@sptt-north be its own service")
     parser.add_argument("--gui", action="store_true",
                         help="Force GUI mode")
     parser.add_argument("--config", default=None,
@@ -81,10 +100,12 @@ that mode explicitly, even when a schedule is configured.
                              "— no scheduled captures, nothing archived. Entered "
                              "automatically when no schedule is configured")
     parser.add_argument("--probe", action="store_true",
-                        help="ASI and Japan only: open the camera, print what it "
+                        help="ASI and Japan: open the camera, print what it "
                              "accepts for every parameter the driver sets, and "
                              "exit. Nothing is written to the camera (on Japan "
-                             "this also traces the filter wheel, which moves it)")
+                             "this also traces the filter wheel, which moves it). "
+                             "SPTT: list the connected cameras and their USB "
+                             "ports, for sptt.usb_port")
     parser.add_argument("--verbose", action="store_true",
                         help="Console mode: plain timestamped log lines instead of "
                              "the live dashboard (also the default when the output "
@@ -92,8 +113,8 @@ that mode explicitly, even when a schedule is configured.
 
     args = parser.parse_args()
 
-    if args.probe and args.type not in ("asi", "japan"):
-        print("Error: --probe is only available for --type asi and --type japan.")
+    if args.probe and args.type not in ("asi", "japan", "sptt"):
+        print("Error: --probe is only available for --type asi, japan and sptt.")
         sys.exit(1)
 
     # Determine mode
@@ -105,6 +126,10 @@ that mode explicitly, even when a schedule is configured.
                                verbose=args.verbose,
                                setup_mode=args.setup)
         elif args.type == "sptt":
+            if args.probe:
+                from cameras.sptt_driver import run_probe_sptt
+                run_probe_sptt(args.config)
+                return
             from cameras.sptt_driver import run_console_sptt
             run_console_sptt(args.config, preview=args.preview,
                              verbose=args.verbose,

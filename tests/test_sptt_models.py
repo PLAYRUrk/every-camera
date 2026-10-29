@@ -21,7 +21,7 @@ from cameras.sptt_spt import extract_firmware, parse_spt    # noqa: E402
 from cameras import sptt_driver                             # noqa: E402
 from cameras.sptt_driver import (                           # noqa: E402
     ENCODING_8BPP, SpttCamera, _save_fits_minimal, decode_frame, debayer,
-    frame_metadata, is_mosaic, luminance, bayer_pattern_setting, colour_offsets,
+    frame_metadata, is_mosaic, bayer_pattern_setting, colour_offsets,
 )
 
 FIRMWARE = ROOT / "firmware"
@@ -77,20 +77,103 @@ def test_the_429_still_loads_from_the_old_blobs_without_a_script(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Model detection
+# Model detection and choosing one of several cameras
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("present, expected", [
-    ({0xE429}, CSDU429), ({0xF429}, CSDU429),
-    ({0xC285}, CSDU285C), ({0xD285}, CSDU285C),
-    (set(), None),
-])
-def test_the_model_is_told_from_the_usb_id(monkeypatch, present, expected):
-    def find(idVendor, idProduct, backend=None):
+class FakeDev:
+    def __init__(self, pid, bus, ports):
+        self.idProduct, self.bus, self.port_numbers = pid, bus, ports
+        self.address = 9
+
+
+@pytest.fixture
+def bus(monkeypatch):
+    """A fake USB bus: append FakeDevs to the returned list."""
+    devices = []
+
+    def find(find_all=False, idVendor=None, idProduct=None, backend=None,
+             custom_match=None):
         assert idVendor == loader.VID
-        return object() if idProduct in present else None
+        hits = [d for d in devices if d.idProduct == idProduct
+                and (custom_match is None or custom_match(d))]
+        return hits if find_all else (hits[0] if hits else None)
     monkeypatch.setattr(loader.usb.core, "find", find)
     monkeypatch.setattr(loader.usb.util, "dispose_resources", lambda dev: None)
-    assert loader.detect_model(None) is expected
+    return devices
+
+
+@pytest.mark.parametrize("pid, model, configured", [
+    (0xE429, CSDU429, True), (0xF429, CSDU429, False),
+    (0xC285, CSDU285C, True), (0xD285, CSDU285C, False),
+])
+def test_the_model_is_told_from_the_usb_id(bus, pid, model, configured):
+    bus.append(FakeDev(pid, 1, (2,)))
+    assert loader.select_camera(None) == loader.CameraLocation(model, "1-2", configured)
+
+
+def test_the_port_is_named_as_linux_names_it():
+    assert loader.usb_port(FakeDev(0xE429, 3, (1, 4, 2))) == "3-1.4.2"
+
+
+def test_no_camera_is_an_error_not_a_guess(bus):
+    with pytest.raises(LookupError, match="No SPTT camera"):
+        loader.select_camera(None)
+
+
+def test_two_cameras_and_no_port_refuse_to_pick_one(bus):
+    """"The first" could be either after a reboot, or the same for two runs."""
+    bus.extend([FakeDev(0xE429, 1, (2,)), FakeDev(0xD285, 1, (3,))])
+    with pytest.raises(LookupError) as excinfo:
+        loader.select_camera(None)
+    message = str(excinfo.value)
+    assert "1-2" in message and "1-3" in message and "usb_port" in message
+
+
+def test_the_configured_port_picks_its_camera(bus):
+    bus.extend([FakeDev(0xE429, 1, (2,)), FakeDev(0xE429, 1, (3,))])
+    assert loader.select_camera(None, "1-3").port == "1-3"
+    with pytest.raises(LookupError, match="No SPTT camera on USB port 1-4"):
+        loader.select_camera(None, "1-4")
+
+
+def test_the_firmware_wait_stays_on_its_own_port(bus, monkeypatch):
+    """After a firmware load, another camera already up must not be taken
+    for the one that is re-enumerating."""
+    monkeypatch.setattr(loader.time, "sleep", lambda s: None)
+    bus.append(FakeDev(0xE429, 1, (2,)))           # the other camera, up
+    assert loader.wait_for_configured_device(None, timeout=0.01, port="1-3") is None
+    mine = FakeDev(0xE429, 1, (3,))
+    bus.append(mine)
+    assert loader.wait_for_configured_device(None, timeout=1, port="1-3") is mine
+
+
+def test_each_camera_object_opens_its_own_device(bus):
+    other, mine = FakeDev(0xE429, 1, (2,)), FakeDev(0xE429, 1, (3,))
+    bus.extend([other, mine])
+    assert sptt_driver.find_device(None, 0xE429, "1-3") is mine
+    cam = SpttCamera(None, CSDU429, port="1-3")
+    assert cam.port == "1-3"
+
+
+def test_the_usb_port_setting():
+    from cameras.sptt_driver import usb_port_setting
+    assert usb_port_setting({}) is None
+    assert usb_port_setting({"usb_port": "  "}) is None
+    assert usb_port_setting({"usb_port": " 1-2.3 "}) == "1-2.3"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("sptt", "sptt"), ("sptt-north", "sptt"), ("asi", "asi")])
+def test_a_labelled_type_is_its_camera_type(value, expected):
+    """every-camera@sptt-north passes "sptt-north" as --type."""
+    import main
+    assert main.camera_type(value) == expected
+
+
+def test_an_unknown_type_is_still_refused():
+    import argparse
+    import main
+    with pytest.raises(argparse.ArgumentTypeError):
+        main.camera_type("spt-north")
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +249,30 @@ def test_only_an_unbinned_colour_frame_is_a_mosaic():
     assert not is_mosaic(CSDU429, 0)
 
 
-def test_focus_gets_grey_not_a_checkerboard():
-    grey = luminance(_flat_mosaic("RGGB"), CSDU285C, 0, "RGGB")
-    assert grey.shape == (8, 10)
-    assert np.all(grey == 2000)
+def test_focus_and_live_view_get_colour():
+    """Setup mode, focus_app and the LAN view take colour as (H, W, 3)."""
+    cam = SpttCamera(None, CSDU285C)
+    cam.binning = 0
+    shown = cam.for_display(_flat_mosaic("RGGB"))
+    assert shown.shape == (8, 10, 3)
+    assert [int(v) for v in shown[4, 4]] == [CELL["R"], CELL["G"], CELL["B"]]
+
+
+def test_the_focus_measures_and_the_stream_take_the_colour_frame():
+    import frame_archive
+    cam = SpttCamera(None, CSDU285C)
+    shown = cam.for_display(_flat_mosaic("RGGB"))
+    assert frame_archive.to_jpeg_bytes(shown)[:2] == bytes([0xFF, 0xD8])
+    assert frame_archive.sharpness(shown) == 0.0          # flat colour, no detail
+    assert frame_archive.frame_stats(shown)["shape"] == [8, 10, 3]
+
+
+def test_grey_and_binned_frames_are_shown_as_they_are():
     frame = np.arange(6, dtype=np.uint16).reshape(2, 3)
-    assert luminance(frame, CSDU429, 0) is frame
+    assert SpttCamera(None, CSDU429).for_display(frame) is frame
+    binned = SpttCamera(None, CSDU285C)
+    binned.binning = 1
+    assert binned.for_display(frame) is frame
 
 
 def test_colour_offsets_are_sent_only_when_configured():

@@ -265,6 +265,9 @@ DEFAULT_CONFIG = {
         "encoding": 1,
         "target_temp": None,
         "firmware_dir": "",
+        # Which camera, by physical USB port ("1-2.3"), when the machine has
+        # several; empty = the only one. --type sptt --probe lists them.
+        "usb_port": "",
     },
     "infra": {
         "instance_name": "",
@@ -926,6 +929,11 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["output_dir"] = _ask("Output directory for FITS files", sptt.get("output_dir", ""))
     sptt["instance_name"] = _ask("Instance name (auto if empty)",
                                   sptt.get("instance_name", ""))
+    print("\n  With several SPTT cameras on this machine, each run needs its own")
+    print("  config and the USB port of its camera (python main.py --type sptt")
+    print("  --probe lists them). Leave empty for the only camera.")
+    sptt["usb_port"] = _ask("USB port (empty = the only camera)",
+                            sptt.get("usb_port", ""))
     sptt["exposure"] = _ask_float("Exposure (seconds)", sptt.get("exposure", 0.88))
 
     print("\n  The frame period is a separate register, and one shorter than")

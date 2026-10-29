@@ -877,7 +877,7 @@ class SpttScheduledWorkerQt(QThread):
         # grab_frame drops the contaminated one either way.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: self.cam.grey(grab()),
+            self._service, lambda: self.cam.for_display(grab()),
             on_error=lambda exc, stopped: self.log_msg.emit(
                 f"Focus frame failed: {exc}"
                 + (" — focus mode disabled" if stopped else ""), "warn"))
@@ -886,7 +886,7 @@ class SpttScheduledWorkerQt(QThread):
         """Hand the newest frame to the LAN service (viewer / focus tool)."""
         if self._service is not None:
             try:
-                self._service.publish_frame(self.cam.grey(frame), ts or dt.now())
+                self._service.publish_frame(self.cam.for_display(frame), ts or dt.now())
             except Exception:
                 pass
 
@@ -1123,16 +1123,18 @@ class SpttTab(QWidget):
         try:
             from sptt_driver import (
                 colour_offsets, ensure_firmware_loaded, find_libusb_backend,
-                make_camera,
+                make_camera, usb_port_setting,
             )
             backend = find_libusb_backend()
-            model = ensure_firmware_loaded(backend, self._firmware_dir)
-            if not model:
+            found = ensure_firmware_loaded(backend, self._firmware_dir,
+                                           usb_port_setting(self._sptt_cfg))
+            if not found:
                 raise RuntimeError(
-                    "Firmware could not be loaded — see the log for the paths "
-                    "that were searched.")
+                    "The camera could not be brought up — see the log: no "
+                    "camera, several cameras and no sptt.usb_port, or no "
+                    "firmware where it was looked for.")
             time.sleep(1.5)
-            self.cam = make_camera(backend, model, self._sptt_cfg)
+            self.cam = make_camera(backend, found, self._sptt_cfg)
             self.cam.open()
             self.cam.configure(
                 exposure=self.spin_exp.value(),
@@ -1148,7 +1150,8 @@ class SpttTab(QWidget):
             self.btn_preview_start.setEnabled(True)
             self.btn_apply.setEnabled(True)
             self.btn_meas_start.setEnabled(True)
-            self._log(f"SPTT connected: {model.name} {self.cam.w}x{self.cam.h}", "info")
+            self._log(f"SPTT connected: {found.model.name} on USB port {found.port}, "
+                      f"{self.cam.w}x{self.cam.h}", "info")
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
             self.btn_connect.setEnabled(True)
@@ -1205,9 +1208,10 @@ class SpttTab(QWidget):
 
         # The driver hands every encoding over on the program's 0..65535 scale,
         # so the preview no longer has to know which one produced the frame.
-        if self.cam is not None and self.cam.is_mosaic():
-            # (3, H, W) -> (H, W, 3), the byte order Format_RGB888 reads.
-            frame = np.moveaxis(self.cam.to_rgb(frame), 0, -1)
+        if self.cam is not None:
+            # A colour camera's mosaic comes out as (H, W, 3) RGB, the byte
+            # order Format_RGB888 reads.
+            frame = self.cam.for_display(frame)
         display = np.ascontiguousarray(
             frame_archive.to_uint8(frame, stretch="raw"))
         h, w = display.shape[:2]

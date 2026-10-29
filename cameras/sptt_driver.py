@@ -34,7 +34,8 @@ from worker_common import (
 )
 
 from .sptt_load_firmware import (
-    VID, CSDU429, CSDU285C, MODELS, detect_model, explain_usb_error,
+    VID, CSDU429, CSDU285C, MODELS, CameraLocation, explain_usb_error,
+    find_device, list_cameras, select_camera,
     find_libusb_backend, load_firmware_files, detach_kernel_driver,
     load_fx2_firmware, wait_for_configured_device, load_fpga_bitstream,
 )
@@ -269,17 +270,6 @@ def debayer(mosaic, pattern=DEFAULT_BAYER_PATTERN):
     return cube
 
 
-def luminance(frame, model, binning, pattern=DEFAULT_BAYER_PATTERN):
-    """A grey frame for whatever only understands grey (focus, preview stats).
-
-    A raw mosaic is a checkerboard of colours, which sharpness measures read
-    as fine detail; this is the mean of the demosaiced colours instead.
-    """
-    if not is_mosaic(model, binning):
-        return frame
-    return debayer(frame, pattern).mean(axis=0).astype(frame.dtype)
-
-
 def seconds_to_next_capture(now, capture_seconds):
     """Seconds from ``now`` until the next scheduled capture second begins."""
     sec = now.second + now.microsecond / 1_000_000
@@ -305,9 +295,12 @@ def focus_frame_fits(now, capture_seconds, cam):
 class SpttCamera:
     """Manages USB connection and CSDU camera operations."""
 
-    def __init__(self, backend, model=CSDU429):
+    def __init__(self, backend, model=CSDU429, port=None):
         self.backend = backend
         self.model = model
+        # The USB port of the camera this object drives (None: the only one),
+        # so two of them on one machine never open the same device.
+        self.port = port
         # How the colour camera's mosaic is laid out (sptt.bayer_pattern). The
         # ROI origin is always even (see _configure), so a ROI never shifts it.
         self.bayer_pattern = DEFAULT_BAYER_PATTERN
@@ -349,9 +342,10 @@ class SpttCamera:
 
     def open(self):
         pid = self.model.pid_configured
-        self.dev = usb.core.find(idVendor=VID, idProduct=pid, backend=self.backend)
+        self.dev = find_device(self.backend, pid, self.port)
         if not self.dev:
-            raise RuntimeError(f"Configured {self.model.name} camera not found!")
+            where = f" on USB port {self.port}" if self.port else ""
+            raise RuntimeError(f"Configured {self.model.name} camera not found{where}!")
         try:
             if self.dev.is_kernel_driver_active(0):
                 self.dev.detach_kernel_driver(0)
@@ -360,7 +354,7 @@ class SpttCamera:
         try:
             self.dev.reset()
             time.sleep(0.5)
-            self.dev = usb.core.find(idVendor=VID, idProduct=pid, backend=self.backend)
+            self.dev = find_device(self.backend, pid, self.port)
             if not self.dev:
                 raise RuntimeError("Device lost after reset!")
         except usb.core.USBError:
@@ -682,9 +676,13 @@ class SpttCamera:
         """Whether frames grabbed now are a raw Bayer mosaic."""
         return is_mosaic(self.model, self.binning)
 
-    def grey(self, frame):
-        """``frame`` as a grey image, for displays and focus measures."""
-        return luminance(frame, self.model, self.binning, self.bayer_pattern)
+    def for_display(self, frame):
+        """``frame`` as it should be looked at: a raw mosaic demosaiced to an
+        (H, W, 3) RGB image, which is how the live view, focus_app and the
+        previews take colour; anything else unchanged."""
+        if not self.is_mosaic():
+            return frame
+        return np.moveaxis(self.to_rgb(frame), 0, -1)
 
     def to_rgb(self, frame):
         """``frame`` demosaiced to an (3, H, W) R, G, B cube."""
@@ -729,31 +727,33 @@ class SpttCamera:
 # ---------------------------------------------------------------------------
 # Firmware loading
 # ---------------------------------------------------------------------------
-def ensure_firmware_loaded(backend, firmware_dir=None):
+def ensure_firmware_loaded(backend, firmware_dir=None, usb_port=None):
     """Load firmware if the camera is not yet configured.
 
-    Returns the camera's model (an ``SpttModel``, so truthy) once it is up, or
-    ``None`` when there is no camera or it could not be brought up.
+    Returns the camera's :class:`CameraLocation` (model and USB port, truthy)
+    once it is up, or ``None`` when there is no camera or it could not be
+    brought up.
 
     ``firmware_dir`` is ``sptt.firmware_dir`` from the config; empty or absent
-    means the ``firmware/`` directory next to the program.
+    means the ``firmware/`` directory next to the program. ``usb_port`` is
+    ``sptt.usb_port``: which camera, when the machine has several.
     """
-    model = detect_model(backend)
-    if model is None:
-        console_ui.error("No SPTT camera found (looked for "
-                         + ", ".join(m.name for m in MODELS) + ").")
+    try:
+        found = select_camera(backend, usb_port)
+    except LookupError as exc:
+        console_ui.error(str(exc))
         return None
+    model, port = found.model, found.port
+    ready = found._replace(configured=True)
 
-    dev = usb.core.find(idVendor=VID, idProduct=model.pid_configured, backend=backend)
-    if dev:
-        console_ui.log(f"{model.name} already configured "
+    if found.configured:
+        console_ui.log(f"{model.name} on USB port {port} already configured "
                        f"(PID=0x{model.pid_configured:04x}), skipping firmware load.")
-        usb.util.dispose_resources(dev)
-        return model
+        return ready
 
-    dev_raw = usb.core.find(idVendor=VID, idProduct=model.pid_raw, backend=backend)
+    dev_raw = find_device(backend, model.pid_raw, port)
     if not dev_raw:
-        console_ui.error(f"{model.name} disappeared from the bus.")
+        console_ui.error(f"{model.name} disappeared from USB port {port}.")
         return None
 
     console_ui.log(f"Loading {model.name} firmware files…")
@@ -766,14 +766,16 @@ def ensure_firmware_loaded(backend, firmware_dir=None):
         return None
 
     try:
-        return _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data)
+        if _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
+            return ready
+        return None
     except usb.core.USBError as exc:
         console_ui.error(explain_usb_error(exc))
         return None
 
 
-def _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data):
-    """The USB half of :func:`ensure_firmware_loaded`."""
+def _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
+    """The USB half of :func:`ensure_firmware_loaded`; True once it is up."""
     console_ui.log(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
     load_fx2_firmware(dev_raw, fx2_blocks)
@@ -786,10 +788,10 @@ def _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data):
     usb.util.dispose_resources(dev_raw)
     del dev_raw
 
-    dev = wait_for_configured_device(backend, model=model)
+    dev = wait_for_configured_device(backend, model=model, port=port)
     if not dev:
         console_ui.error("Device not found after firmware load.")
-        return None
+        return False
 
     detach_kernel_driver(dev)
     dev.set_configuration()
@@ -801,14 +803,15 @@ def _load_firmware(backend, model, dev_raw, fx2_blocks, fpga_data):
         pass
     del dev
 
-    dev_final = wait_for_configured_device(backend, timeout=10.0, model=model)
+    dev_final = wait_for_configured_device(backend, timeout=10.0, model=model,
+                                           port=port)
     if dev_final:
         console_ui.log(f"{model.name} firmware loaded successfully.")
         usb.util.dispose_resources(dev_final)
-        return model
+        return True
 
     console_ui.warn("Device not found after initialization.")
-    return None
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1044,7 +1047,10 @@ class SpttWorkerConsole(threading.Thread):
     def _push_live_frame(self, frame, ts):
         if self._service is not None:
             try:
-                self._service.publish_frame(self.cam.grey(frame), ts)
+                # Demosaiced rather than raw: a mosaic is a checkerboard of
+                # colours, which the focus measures would read as fine detail.
+                # Sharpness and stats are taken over the mean of the colours.
+                self._service.publish_frame(self.cam.for_display(frame), ts)
             except Exception:
                 pass
 
@@ -1082,7 +1088,7 @@ class SpttWorkerConsole(threading.Thread):
         # rest of the focus loop keeps its rate.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: self.cam.grey(grab()),
+            self._service, lambda: self.cam.for_display(grab()),
             on_error=lambda exc, stopped: console_ui.warn(
                           f"Focus frame failed: {exc}"
                           f"{' — focus mode disabled' if stopped else ''}"))
@@ -1225,6 +1231,7 @@ class SpttWorkerConsole(threading.Thread):
             "instance_name": self.instance_name,
             "camera_type": "sptt",
             "camera_model": self.cam.model.name,
+            "usb_port": self.cam.port,
             "pid": os.getpid(),
             "status": status,
             "output_dir": self.output_dir,
@@ -1289,10 +1296,7 @@ def run_preview_sptt(cam, instance_name):
     try:
         while not stop.is_set():
             try:
-                frame = cam.grab_frame()
-                if cam.is_mosaic():
-                    # (3, H, W) -> (H, W, 3), which is what PIL takes as RGB.
-                    frame = np.moveaxis(cam.to_rgb(frame), 0, -1)
+                frame = cam.for_display(cam.grab_frame())
                 if frame.dtype == np.uint16:
                     fmax = int(frame.max())
                     if fmax > 0:
@@ -1325,6 +1329,33 @@ def bayer_pattern_setting(sptt_cfg):
     return pattern
 
 
+def usb_port_setting(sptt_cfg):
+    """``sptt.usb_port``; empty means "the only camera on this machine"."""
+    return str(sptt_cfg.get("usb_port") or "").strip() or None
+
+
+def run_probe_sptt(config_path=None):
+    """``--type sptt --probe``: list the SPTT cameras on this machine and exit.
+
+    Opens nothing and loads no firmware, so it is safe while other runs are
+    using their cameras. The port column is what goes into sptt.usb_port.
+    """
+    from utils import load_config
+    configured = usb_port_setting(load_config(config_path).get("sptt", {}))
+    cameras = list_cameras(find_libusb_backend())
+    if not cameras:
+        print("No SPTT camera found.")
+        return
+    print(f"{'USB port':<12} {'Model':<10} State")
+    for cam in cameras:
+        state = "firmware loaded" if cam.configured else "no firmware yet"
+        mark = "   <- sptt.usb_port of this config" if cam.port == configured else ""
+        print(f"{cam.port:<12} {cam.model.name:<10} {state}{mark}")
+    if len(cameras) > 1 and not configured:
+        print("\nSeveral cameras: give each run its own config with "
+              "sptt.usb_port set to one of the ports above.")
+
+
 def colour_offsets(sptt_cfg):
     """``sptt.r_offset`` / ``g_offset`` as configure() takes them.
 
@@ -1335,9 +1366,10 @@ def colour_offsets(sptt_cfg):
             for key in ("r_offset", "g_offset")}
 
 
-def make_camera(backend, model, sptt_cfg):
-    """An unopened SpttCamera for ``model`` with the config's colour settings."""
-    cam = SpttCamera(backend, model)
+def make_camera(backend, found, sptt_cfg):
+    """An unopened SpttCamera for ``found`` (the CameraLocation that
+    ensure_firmware_loaded returns) with the config's colour settings."""
+    cam = SpttCamera(backend, found.model, found.port)
     cam.bayer_pattern = bayer_pattern_setting(sptt_cfg)
     return cam
 
@@ -1409,13 +1441,14 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
     if preview:
         console_ui.log("Initializing SPTT camera...")
         backend = find_libusb_backend()
-        model = ensure_firmware_loaded(backend, firmware_dir)
-        if not model:
+        found = ensure_firmware_loaded(backend, firmware_dir,
+                                       usb_port_setting(sptt_cfg))
+        if not found:
             console_ui.error("Failed to initialize camera.")
             sys.exit(1)
         time.sleep(1)
         try:
-            cam = make_camera(backend, model, sptt_cfg)
+            cam = make_camera(backend, found, sptt_cfg)
             cam.open()
             cam.configure(exposure=exposure, gain=gain, binning=binning,
                           encoding=encoding, target_temp=target_temp,
@@ -1465,14 +1498,15 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
     # Load firmware and connect
     console_ui.log("Initializing SPTT camera...")
     backend = find_libusb_backend()
-    model = ensure_firmware_loaded(backend, firmware_dir)
-    if not model:
+    found = ensure_firmware_loaded(backend, firmware_dir,
+                                   usb_port_setting(sptt_cfg))
+    if not found:
         console_ui.error("Failed to initialize camera.")
         sys.exit(1)
     time.sleep(1)
 
     try:
-        cam = make_camera(backend, model, sptt_cfg)
+        cam = make_camera(backend, found, sptt_cfg)
         cam.open()
         sl = cam.configure(
             exposure=exposure, gain=gain, binning=binning, encoding=encoding,
@@ -1481,7 +1515,8 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         )
         # configure() has already refused anything the camera did not take, so
         # this line is the confirmation rather than the check.
-        console_ui.log(f"{model.name} ready: {cam.w}x{cam.h} — "
+        console_ui.log(f"{found.model.name} (USB port {found.port}) ready: "
+                       f"{cam.w}x{cam.h} — "
                        f"exposure {sl[5] / 1e6:.3f} s, period {sl[6]} us "
                        f"(firmware minimum {sl[14]} us)")
     except Exception as exc:

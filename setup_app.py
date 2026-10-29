@@ -275,6 +275,19 @@ class SpttConfigTab:
         self.le_instance.setPlaceholderText("auto")
         _add_label_row(grid, row, "Instance name:", self.le_instance); row += 1
 
+        # Which camera, when the machine has several: each run gets a config of
+        # its own with the port of its camera. Empty = the only one.
+        from PyQt5.QtWidgets import QLabel, QPushButton
+        self.le_usb_port = QLineEdit(str(c.get("usb_port") or ""))
+        self.le_usb_port.setPlaceholderText("auto — the only SPTT camera")
+        grid.addWidget(QLabel("USB port:"), row, 0)
+        grid.addWidget(self.le_usb_port, row, 1)
+        btn_find = QPushButton("Find…")
+        btn_find.setMaximumWidth(80)
+        btn_find.clicked.connect(self._find_cameras)
+        grid.addWidget(btn_find, row, 2)
+        row += 1
+
         self.sb_exposure = QDoubleSpinBox()
         self.sb_exposure.setRange(0.001, 3600.0)
         self.sb_exposure.setDecimals(3)
@@ -397,6 +410,30 @@ class SpttConfigTab:
         root.addWidget(cbox)
         root.addStretch()
 
+    def _find_cameras(self):
+        """List the connected cameras; with one free choice, fill it in.
+
+        libusb is imported only here, so the form still opens on a machine
+        without it.
+        """
+        from PyQt5.QtWidgets import QInputDialog, QMessageBox
+        try:
+            from cameras.sptt_load_firmware import find_libusb_backend, list_cameras
+            cameras = list_cameras(find_libusb_backend())
+        except Exception as exc:
+            QMessageBox.warning(self.widget, "SPTT cameras",
+                                f"Could not look at USB: {exc}")
+            return
+        if not cameras:
+            QMessageBox.information(self.widget, "SPTT cameras",
+                                    "No SPTT camera is connected.")
+            return
+        items = [f"{c.port}  —  {c.model.name}" for c in cameras]
+        choice, ok = QInputDialog.getItem(
+            self.widget, "SPTT cameras", "Camera for this config:", items, 0, False)
+        if ok:
+            self.le_usb_port.setText(cameras[items.index(choice)].port)
+
     def _auto_period(self):
         """The period the driver would derive for the exposure now in the form.
 
@@ -425,6 +462,7 @@ class SpttConfigTab:
             "output_dir":    self.le_output.text().strip(),
             "firmware_dir":  self.le_firmware.text().strip(),
             "instance_name": self.le_instance.text().strip(),
+            "usb_port":      self.le_usb_port.text().strip(),
             "exposure":      self.sb_exposure.value(),
             "period_us":     None if self.cb_period_auto.isChecked() else self.sb_period.value(),
             "trigmode":      self._trigmodes[self.cb_trigmode.currentIndex()],

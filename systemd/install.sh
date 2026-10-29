@@ -45,7 +45,8 @@ usage() {
     cat <<EOF
 Usage: sudo $0 <camera-type> [--user NAME] [--python PATH] [--config-dir DIR]
 
-  camera-type    asi | japan | sentry | cannon | sptt | infra
+  camera-type    asi | japan | sentry | cannon | sptt | infra, optionally
+                 with a label for a second camera of a type: sptt-north
   --user NAME    whose home receives the logs and status files
                  (default: the user invoking sudo)
   --python PATH  interpreter to run (default: the first python3 on PATH)
@@ -70,10 +71,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$CAMERA" ]] || { usage; exit 1; }
-case "$CAMERA" in
+# A label after the type (sptt-north) makes a separate service with a config
+# of its own, for a second camera of one type on this machine.
+case "${CAMERA%%-*}" in
     asi|japan|sentry|cannon|sptt|infra) ;;
     *) die "unknown camera type '$CAMERA'" ;;
 esac
+[[ "$CAMERA" =~ ^[a-z]+(-[A-Za-z0-9_]+)?$ ]]     || die "a label may hold only letters, digits and _: '$CAMERA'"
 [[ $DRY_RUN -eq 1 || $EUID -eq 0 ]] || die "run me with sudo — this writes to $UNIT_DIR"
 
 if [[ $UNINSTALL -eq 1 ]]; then
@@ -133,7 +137,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
         -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
         -e "s|@USER_HOME@|$USER_HOME|g" \
         "$SENTINEL_TEMPLATE"
-    if [[ "$CAMERA" == sptt ]]; then
+    if [[ "${CAMERA%%-*}" == sptt ]]; then
         echo "--- would copy $APP_DIR/systemd/99-every-camera-sptt.rules to /etc/udev/rules.d/ and reload udev ---"
     fi
     echo "--- would run: systemctl enable --now every-camera@$CAMERA ---"
@@ -178,7 +182,7 @@ fi
 
 # The SPTT camera is a plain libusb device: without a rule only root may open
 # it. Installed here so the hand-run program works as the operator too.
-if [[ "$CAMERA" == sptt ]]; then
+if [[ "${CAMERA%%-*}" == sptt ]]; then
     RULES="$APP_DIR/systemd/99-every-camera-sptt.rules"
     install -m 644 "$RULES" /etc/udev/rules.d/
     udevadm control --reload-rules
