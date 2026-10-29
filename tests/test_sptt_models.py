@@ -201,6 +201,7 @@ def test_the_camera_tells_decode_frame_which_sensor_it_has(monkeypatch, model):
     monkeypatch.setattr(sptt_driver, "_usb_write_retry", lambda *a, **k: None)
     monkeypatch.setattr(sptt_driver, "read_raw_frame",
                         lambda size, ep: [b"\x00" * size])
+    monkeypatch.setattr(sptt_driver, "read_crb", lambda wr, rd: (0x08, ()))
     cam = SpttCamera(backend=None, model=model)
     cam.w, cam.h = 4, 2
     assert cam._read_one_frame()[-1] is model.interlaced
@@ -384,3 +385,151 @@ def test_a_permission_error_says_how_to_fix_it():
     assert loader.UDEV_RULES in message and "udevadm" in message
     other = usb.core.USBError("Pipe error", errno=32)
     assert loader.explain_usb_error(other) == str(other)
+
+
+# ---------------------------------------------------------------------------
+# The live stream: frames must stay in step with the FIFO
+# ---------------------------------------------------------------------------
+class StreamingCamera:
+    """The FIFO as the byte stream it is.
+
+    Each frame's bytes all equal its number. ``head_during_read`` bytes of the
+    next frame arrive while a frame is being read — what a CSDU-285C does when
+    a transfer outlasts its frame period. ``FIFO_INIT`` throws away whatever is
+    queued, as on the camera.
+    """
+
+    def __init__(self, frame_size, head_during_read=0, full=False):
+        self.size = frame_size
+        self.head = head_during_read
+        self.full = full
+        self.fifo = bytearray()
+        self.next_frame = 1
+        self.pending = 0
+
+    def emit(self, nbytes=None):
+        n = self.size if nbytes is None else nbytes
+        self.fifo += bytes([self.next_frame]) * n
+        if nbytes is None or nbytes == self.size:
+            self.next_frame += 1
+        return n
+
+    # endpoints -----------------------------------------------------------
+    def write(self, data, timeout=None):
+        from cameras import sptt_driver as d
+        cmd = data[0]
+        value = int.from_bytes(bytes(data[1:5]), "little")
+        if cmd == d.CMD_FIFO_INIT:
+            self.fifo.clear()
+            self.full = False
+        elif cmd == d.CMD_READ_PREPARE:
+            self.pending = value
+
+    def read_status(self):
+        sb = 0x01 | (0 if self.fifo else 0x08) | (0x10 if self.full else 0)
+        return bytes([sb]).ljust(64, b"\x00")
+
+    def read_data(self, size):
+        n = min(size, self.pending, len(self.fifo))
+        chunk, self.fifo[:] = bytes(self.fifo[:n]), self.fifo[n:]
+        self.pending -= n
+        if self.pending == 0 and self.head:
+            # The next frame starts before this one is fully collected.
+            self.fifo += bytes([self.next_frame]) * self.head
+            self.partial = True
+        return chunk
+
+
+@pytest.fixture
+def streaming(monkeypatch):
+    def make(**kw):
+        cam_hw = StreamingCamera(**kw)
+
+        class Ep:
+            def __init__(self, read):
+                self.read = read
+        wr = Ep(None)
+        wr.write = cam_hw.write
+        rd = Ep(lambda size_or_buffer=64, timeout=None: cam_hw.read_status())
+        tr = Ep(lambda size_or_buffer=512, timeout=None: cam_hw.read_data(size_or_buffer))
+        cam = SpttCamera(None, CSDU285C)
+        cam.ep_wr, cam.ep_rd, cam.ep_tr = wr, rd, tr
+        cam.w, cam.h, cam.encoding, cam.binning = 4, 2, ENCODING_8BPP, 0
+        cam.period_us = 955_000
+        monkeypatch.setattr(sptt_driver.time, "sleep", lambda s: None)
+        return cam, cam_hw
+    return make
+
+
+def _frame_number(frame):
+    values = set((frame >> 8).ravel().tolist())
+    assert len(values) == 1, f"frame mixes data of frames {sorted(values)}"
+    return values.pop()
+
+
+def test_a_frame_begun_during_the_read_is_kept_whole(streaming):
+    """The regression: the reset after each read cut the next frame's head
+    off, and every later frame started part-way through one."""
+    cam, hw = streaming(frame_size=8, head_during_read=3)
+    hw.emit()                                   # frame 1 is in the FIFO
+    assert _frame_number(cam.grab_frame()) == 1
+    # Frame 2's first 3 bytes arrived during that read; the rest follows.
+    hw.fifo += bytes([2]) * 5
+    hw.next_frame = 3
+    hw.head = 0
+    assert _frame_number(cam.grab_frame()) == 2
+
+
+def test_an_empty_fifo_is_still_reset_after_a_read(streaming):
+    cam, hw = streaming(frame_size=8)
+    hw.emit()
+    cam.grab_frame()
+    assert not hw.fifo
+
+
+def test_an_overflowed_fifo_is_dropped_not_read(streaming):
+    cam, hw = streaming(frame_size=8, full=True)
+    hw.emit()
+    hw.fifo += bytes([9]) * 3                   # a frame torn by the overflow
+    original_rearm = cam._rearm
+
+    def rearm():
+        original_rearm()
+        hw.emit()                               # the camera's next whole frame
+    cam._rearm = rearm
+    assert _frame_number(cam.grab_frame()) == 2
+
+
+def test_a_frame_is_read_in_large_requests():
+    """4209 requests of 512 bytes for one 285C frame was slower than the
+    camera's frame period."""
+    asked = []
+
+    class Ep:
+        def read(self, size_or_buffer, timeout=None):
+            asked.append(size_or_buffer)
+            return b"\x00" * size_or_buffer
+    size = 1392 * 1032 * 3 // 2
+    chunks = sptt_driver.read_raw_frame(size, Ep())
+    assert sum(len(c) for c in chunks) >= size
+    assert len(asked) <= size // sptt_driver.BULK_CHUNK + 1
+    assert all(n % 512 == 0 for n in asked)
+
+
+def test_a_short_read_is_counted_as_short():
+    """The old loop assumed every read returned 512 bytes."""
+    returned = iter([b"\x01" * 100, b"\x02" * 412, b""])
+
+    class Ep:
+        def read(self, size_or_buffer, timeout=None):
+            return next(returned)
+    chunks = sptt_driver.read_raw_frame(1000, Ep())
+    assert [len(c) for c in chunks] == [100, 412]
+
+
+def test_the_transfer_time_reaches_the_header(streaming):
+    cam, hw = streaming(frame_size=8)
+    hw.emit()
+    cam.grab_frame()
+    meta = frame_metadata(cam, sptt_driver.dt.now(), {"exposure_s": 0.88})
+    assert "READTIME" in meta and meta["READTIME"] >= 0

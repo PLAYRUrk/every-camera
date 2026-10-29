@@ -81,6 +81,17 @@ USB_READ_TIMEOUT = 10000
 # vendor's own program polls at 5 ms; this driver used to poll at 50 ms.
 FIFO_POLL_INTERVAL = 0.005
 
+# Status byte bits (SPTT-CAM/capture.py print_status).
+STATUS_FIFO_EMPTY = 0x08
+STATUS_FIFO_FULL = 0x10
+
+# Bytes asked for per bulk read of a frame. The driver used to ask for 512 at
+# a time — 4209 USB calls for one CSDU-285C frame, which took longer than the
+# camera's frame period, so the next frame was already pouring into the FIFO
+# when this one was done. Large requests let libusb queue the packets itself;
+# a multiple of 512 so a request never ends inside a packet.
+BULK_CHUNK = 64 * 1024
+
 # Default capture seconds (can be overridden in config)
 SPTT_CAPTURE_SECONDS = [0, 30]
 
@@ -172,12 +183,20 @@ def read_crb(ep_wr, ep_rd):
 
 
 def read_raw_frame(size, ep_tr):
+    """Read one frame of ``size`` bytes off the transfer endpoint.
+
+    Counted by what each read actually returned: the endpoint may hand back
+    less than was asked for, and assuming otherwise loses the frame's tail.
+    """
     chunks = []
     remaining = size
     while remaining > 0:
-        length = min(512, remaining)
-        chunks.append(_usb_read_retry(ep_tr, 512))
-        remaining -= length
+        want = min(BULK_CHUNK, -(-remaining // 512) * 512)
+        chunk = _usb_read_retry(ep_tr, want)
+        if not len(chunk):
+            break                       # decode_frame leaves the rest black
+        chunks.append(chunk)
+        remaining -= len(chunk)
     return chunks
 
 
@@ -331,6 +350,10 @@ class SpttCamera:
         # comes from the first of these.
         self.last_frame_started = None
         self.last_frame_lag = None
+        # How long the USB transfer of the last frame took. Longer than the
+        # frame period means the camera outruns the reads (see _read_one_frame).
+        self.last_read_s = None
+        self._slow_read_warned_at = None
         self._armed_at = None
         # Bumped by every setting change, so a frame wait that a change from
         # another thread overtook can tell its frame is no longer wanted.
@@ -612,8 +635,8 @@ class SpttCamera:
             except usb.core.USBError:
                 time.sleep(0.01)
                 continue
-            if not (sb & 0x08):
-                return
+            if not (sb & STATUS_FIFO_EMPTY):
+                return sb
             time.sleep(FIFO_POLL_INTERVAL)
         raise RuntimeError("FIFO timeout — no frame data")
 
@@ -629,13 +652,38 @@ class SpttCamera:
         else:
             frame_size = w * h
 
+        t0 = time.monotonic()
         _usb_write_retry(self.ep_wr, make_command(CMD_READ_PREPARE, frame_size))
         raw_chunks = read_raw_frame(frame_size, self.ep_tr)
-        _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
+        self.last_read_s = time.monotonic() - t0
+        self._check_read_time()
+        # Reset the FIFO only if it is empty. When the camera has already begun
+        # the next frame, what is in the FIFO is that frame from its first
+        # byte; resetting cut its head off, the next read started part-way
+        # through it, and with three bytes to every two pixels every frame from
+        # then on decoded as noise — the live view that "swims" after a good
+        # first frame. Left alone it is read whole, in step, next time.
+        sb, _ = read_crb(self.ep_wr, self.ep_rd)
+        if sb & STATUS_FIFO_EMPTY:
+            _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
         if self._armed_at is not None:
             self.last_frame_lag = time.monotonic() - self._armed_at
         return (raw_chunks, w, h, self.encoding, self.binning,
                 self.model.interlaced)
+
+    def _check_read_time(self):
+        """Say so, once a minute at most, when a transfer outlasts the period."""
+        period_s = (self.period_us or 0) / 1_000_000.0
+        if not period_s or self.last_read_s <= period_s:
+            return
+        now = time.monotonic()
+        if self._slow_read_warned_at and now - self._slow_read_warned_at < 60:
+            return
+        self._slow_read_warned_at = now
+        console_ui.warn(f"SPTT frame transfer took {self.last_read_s:.2f} s, longer "
+                        f"than the {period_s:.3f} s frame period: the camera "
+                        "outruns the USB reads, so live frames are dropped. "
+                        "A longer exposure or binning gives the reads time.")
 
     def grab_frame(self):
         """One frame, integrated under the settings currently in force.
@@ -653,10 +701,18 @@ class SpttCamera:
                     self._rearm()
                     self._params_dirty = False
                 gen = self._settings_gen
-            self._wait_for_fifo(self._frame_wait_budget())
+            sb = self._wait_for_fifo(self._frame_wait_budget())
             with self._lock:
                 if self._settings_gen != gen:
                     continue                # overtaken by a change
+                if sb & STATUS_FIFO_FULL:
+                    # Frames piled up faster than they were read and the FIFO
+                    # ran over: what follows the first one is no longer in
+                    # step. Start clean, as a scheduled capture does.
+                    console_ui.warn("SPTT FIFO overflowed — dropping the "
+                                    "queued frames and starting afresh")
+                    self._rearm()
+                    continue
                 raw = self._read_one_frame()
             if not discard:                 # else it was the old-settings frame
                 return decode_frame(*raw)
@@ -716,6 +772,7 @@ class SpttCamera:
                 "frame_w": sl[17],
                 "frame_h": sl[18],
                 "fifo_cnt": sl[13],
+                "read_s": self.last_read_s,
                 "temp_sink": sl[23],
                 "temp_ccd": sl[24],
                 "temp_target": sl[25],
@@ -866,6 +923,10 @@ def frame_metadata(cam, when, status=None, debayered=False):
             metadata["YBAYROFF"] = 0
     if cam.last_frame_lag is not None:
         metadata["FRAMELAG"] = round(cam.last_frame_lag, 3)
+    if cam.last_read_s is not None:
+        # The USB transfer alone; compared with PERIOD it says whether the
+        # reads keep up with the camera.
+        metadata["READTIME"] = round(cam.last_read_s, 3)
     if status:
         metadata["CCDTEMP"] = status.get("temp_ccd", 0)
         metadata["SINKTEMP"] = status.get("temp_sink", 0)
