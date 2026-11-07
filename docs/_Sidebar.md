@@ -37,6 +37,7 @@
 - [Службы systemd](Systemd.md)
 - [Обновление](Update.md)
 - [Оповещения](Alerts.md)
+- [Телеметрия](Telemetry.md)
 
 **Наблюдатель**
 - [Монитор](Monitor.md)

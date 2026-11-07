@@ -11,6 +11,12 @@ def make_camera(cfg):
     return PixisCamera(cfg.camera, cfg.cooling)
 
 
+def make_omega(cfg):
+    from ..common.omega import OmegaMonitor
+    return OmegaMonitor(cfg.omega.port, cfg.omega.baudrate, cfg.omega.poll_seconds,
+                        exclude=(cfg.filter_wheel.port,))
+
+
 def make_wheel(cfg):
     wheel = cfg.filter_wheel
     if str(wheel.port).strip().lower() == "sim":

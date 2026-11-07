@@ -68,6 +68,13 @@ class FilterWheelCfg:
 
 
 @dataclass
+class OmegaCfg:
+    port: str = "auto"
+    baudrate: int = 9600
+    poll_seconds: float = 10.0
+
+
+@dataclass
 class LocationCfg:
     lat: float = 0.0
     lon: float = 0.0
@@ -81,8 +88,8 @@ class StationCfg:
     site_id: str = ""
     device_id: str = ""
     legacy_version: str = DEFAULT_LEGACY_VERSION
-    # This controller has no temperature sensor; the header keeps the field so
-    # the processing program still finds it.
+    # Used only when no Omega reading is at hand; the header keeps the field so the
+    # processing program still finds it.
     fw_temp: float = None
 
 
@@ -111,6 +118,7 @@ class AsiConfig:
     camera: CameraCfg = field(default_factory=CameraCfg)
     cooling: CoolingCfg = field(default_factory=CoolingCfg)
     filter_wheel: FilterWheelCfg = field(default_factory=FilterWheelCfg)
+    omega: OmegaCfg = field(default_factory=OmegaCfg)
     location: LocationCfg = field(default_factory=LocationCfg)
     station: StationCfg = field(default_factory=StationCfg)
     filters: list = field(default_factory=list)
@@ -274,6 +282,13 @@ def from_dict(asi_cfg):
     exposure_config.check_threshold_above_target(
         preflight, overexposure, errors, prefix="asi")
 
+    omega_cfg = _sub(asi_cfg, "omega")
+    omega = OmegaCfg(
+        port=str(omega_cfg.get("port", "auto") or ""),
+        baudrate=_int(omega_cfg, "baudrate", 9600),
+        poll_seconds=_float(omega_cfg, "poll_seconds", 10.0),
+    )
+
     fw_temp = settings.get("fw_temp")
     station = StationCfg(
         site_id=str(settings.get("site_id", "") or ""),
@@ -288,6 +303,7 @@ def from_dict(asi_cfg):
         camera=camera,
         cooling=cooling,
         filter_wheel=wheel,
+        omega=omega,
         location=location,
         station=station,
         filters=filters,

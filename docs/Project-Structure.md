@@ -22,6 +22,8 @@
 |---|---|
 | `utils.py` | `DEFAULT_CONFIG`, чтение и сохранение конфига, расписание, сеть, системная информация |
 | `console_ui.py` | живой экран и лог |
+| `telemetry.py` | автоматическая запись [телеметрии](Telemetry.md) в CSV |
+| `filterwheel_bench.py` | [проверка колеса и Omega на столе](Camera-ASI.md#проверка-колеса-на-столе) |
 | `worker_common.py` | обвязка воркеров: статусы, публикация кадров |
 | `camera_service.py` | потокобезопасная прослойка между воркером и сетью, `PARAM_SCHEMAS` |
 | `frame_server.py` | HTTP-сервер кадров |
@@ -59,7 +61,7 @@ cameras/
     devices.py          выбор бэкенда
     config.py           секция asi в виде объектов
     fits.py             запись FITS
-    filterwheel.py, filterwheel_sim.py, schedule.py, sun.py, timeutil.py,
+    filterwheel.py, filterwheel_sim.py, omega.py, schedule.py, sun.py, timeutil.py,
     paths.py, seqno.py, exposure.py   реэкспорт из common/
   japan/                оборудование Japan
     dcamsdk/            обёртки DCAM-API и ленивая загрузка библиотеки

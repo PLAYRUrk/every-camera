@@ -2,7 +2,7 @@
 # Диапазоны версий — под CentOS 7.8 / Python 3.11.7.
 -r requirements.txt
 
-pyserial>=3.5,<4       # колесо фильтров SmartMotor на /dev/ttyUSB*
+pyserial>=3.5,<4       # колесо фильтров SmartMotor и Omega на /dev/ttyUSB*
 astropy>=5.3,<6.2      # обязателен: запись FITS; 7.x требует numpy 2.x
 
 # Системные зависимости:

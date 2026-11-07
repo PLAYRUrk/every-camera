@@ -65,6 +65,8 @@ CMD_READ_PREPARE    = 0xF0
 ENCODING_8BPP  = 0
 ENCODING_12BPP = 1
 
+TRIGMODE_SOFTSTART = 2
+
 USB_CMD_TIMEOUT = 10000
 USB_READ_TIMEOUT = 10000
 
@@ -101,6 +103,10 @@ TARGET_TEMP_MAX = 30
 # "Leave this as the camera has it": configure() runs again on every binning or
 # encoding change, and a plain default would revert the operator's period and trigger mode.
 KEEP = object()
+
+
+class FrameReadError(RuntimeError):
+    """The camera stopped sending before the frame was complete."""
 
 
 class ExposureNotHonoured(RuntimeError):
@@ -163,17 +169,25 @@ def _usb_read_retry(ep, size, timeout=USB_READ_TIMEOUT, retries=3, delay=0.3):
 def read_crb(ep_wr, ep_rd):
     _usb_write_retry(ep_wr, make_command(CMD_GET_STATUS))
     array = _usb_read_retry(ep_rd, 64)
-    status_list = struct.unpack_from('=BBHHHIIBHHHHBIIHIHHBBIHBBB', array)
+    status_list = struct.unpack_from('=BBHHHIIBHHHHBIIHIHHBBIHbbb', array)
     return array[0], status_list
 
 
 def read_raw_frame(size, ep_tr):
-    """The endpoint may return less than asked for: count what each read returned."""
+    """The endpoint may return less than asked for: count what each read returned.
+
+    A read is not retried: a timed-out transfer loses what it had received, so a
+    retry would shift every later byte of the frame.
+    """
     chunks = []
     remaining = size
     while remaining > 0:
         want = min(BULK_CHUNK, -(-remaining // 512) * 512)
-        chunk = _usb_read_retry(ep_tr, want)
+        try:
+            chunk = ep_tr.read(size_or_buffer=want, timeout=USB_READ_TIMEOUT)
+        except usb.core.USBError as exc:
+            raise FrameReadError(f"Camera sent {size - remaining} of {size} frame "
+                                 f"bytes: {exc}") from exc
         if not len(chunk):
             break                       # decode_frame leaves the rest black
         chunks.append(chunk)
@@ -384,6 +398,14 @@ class SpttCamera:
         # Before anything is sent, so a bad value does not leave the camera half reconfigured.
         temp_byte = target_temp_byte(target_temp)
         wr = self._write_cmd
+        if binning and not self.model.has_binning:
+            console_ui.warn(f"{self.model.name} ignores binning: using full "
+                            "resolution.")
+            binning = 0
+        if roi_size is None and not self.model.has_binning:
+            # The camera keeps an ROI across runs, and it decides the frame size here.
+            roi_org = (0, 0)
+            roi_size = self.model.nominal_sizes[0]
         self.exposure = exposure
         self.gain = gain
         self.binning = binning
@@ -400,11 +422,11 @@ class SpttCamera:
         if roi_org is not None:
             h_org = roi_org[0] & ~1
             v_org = roi_org[1] & ~1
-            wr(CMD_SET_ROI_ORG, (h_org << 16) | v_org)
+            wr(CMD_SET_ROI_ORG, (v_org << 16) | h_org)
         if roi_size is not None:
             h_size = roi_size[0] & ~3
             v_size = roi_size[1] & ~3
-            wr(CMD_SET_ROI_SIZE, (h_size << 16) | v_size)
+            wr(CMD_SET_ROI_SIZE, (v_size << 16) | h_size)
 
         wr(CMD_SET_ENCODING, encoding)
         wr(CMD_SET_EXP, exposure_us)
@@ -413,7 +435,7 @@ class SpttCamera:
             wr(CMD_SET_R_OFFSET, r_offset)
         if g_offset is not None:
             wr(CMD_SET_G_OFFSET, g_offset)
-        wr(CMD_SET_TRIGMODE, self.trigmode)
+        wr(CMD_SET_TRIGMODE, self.hardware_trigmode)
         wr(CMD_SET_DRAFT, 1 if draft else 0)
         if temp_byte is not None:
             wr(CMD_SET_TARGET_TEMP, temp_byte)
@@ -421,9 +443,21 @@ class SpttCamera:
         # Before the period is sent: the firmware's minimum period depends on the frame
         # size, so it means nothing until binning, ROI and encoding are in force.
         _, sl = read_crb(self.ep_wr, self.ep_rd)
-        self._set_frame_size(sl[17], sl[18])
+        self._set_frame_size(*self._frame_size(sl))
         self.min_period_us = sl[14]
         return self._apply_period()
+
+    def _frame_size(self, sl):
+        return (sl[17], sl[18]) if self.model.has_binning else (sl[10], sl[11])
+
+    @property
+    def single_shot(self):
+        # An operator's external trigger mode is left alone.
+        return self.model.single_shot and self.trigmode in (0, TRIGMODE_SOFTSTART)
+
+    @property
+    def hardware_trigmode(self):
+        return TRIGMODE_SOFTSTART if self.single_shot else self.trigmode
 
     def _write_cmd(self, cmd_id, value=0):
         _usb_write_retry(self.ep_wr, make_command(cmd_id, value))
@@ -466,7 +500,7 @@ class SpttCamera:
             override=self.period_override_us,
             # Outside continuous mode the period does not gate the integration,
             # so an operator asking for a short one gets it.
-            allow_short=(self.trigmode != 0),
+            allow_short=(self.trigmode != 0 or self.single_shot),
             warn=console_ui.warn)
         self._write_cmd(CMD_SET_PERIOD, period)
         self.period_us = period
@@ -514,6 +548,11 @@ class SpttCamera:
             return self._start(retries)
 
     def _start(self, retries):
+        if self.single_shot:
+            self._abort_shot()
+            self._running = True
+            self._params_dirty = False
+            return
         for attempt in range(retries):
             try:
                 try:
@@ -544,6 +583,14 @@ class SpttCamera:
                 else:
                     raise RuntimeError(f"Failed to start camera after {retries} attempts: {e}")
 
+    def _abort_shot(self):
+        try:
+            _usb_write_retry(self.ep_wr, make_command(CMD_CAM_STOP), retries=1)
+        except usb.core.USBError:
+            pass
+        time.sleep(0.05)
+        self._flush_endpoints()
+
     def stop(self):
         with self._lock:
             if self._running:
@@ -568,7 +615,17 @@ class SpttCamera:
         """
         period_us = (self.period_us
                      or exposure_to_us(self.exposure) + PERIOD_READOUT_MARGIN_US)
+        if self.single_shot:
+            return self.exposure + 1.0
         return 2 * period_us / 1_000_000.0 + 1.0
+
+    def _trigger(self):
+        self._read_done_at = None
+        self._params_dirty = False
+        _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
+        _usb_write_retry(self.ep_wr, make_command(CMD_CAM_START))
+        self.last_frame_started = dt.now(timezone.utc)
+        self._armed_at = time.monotonic()
 
     def _rearm(self):
         self._read_done_at = None
@@ -605,6 +662,12 @@ class SpttCamera:
         _usb_write_retry(self.ep_wr, make_command(CMD_READ_PREPARE, frame_size))
         raw_chunks = read_raw_frame(frame_size, self.ep_tr)
         self.last_read_s = time.monotonic() - t0
+        if self.single_shot:
+            self._read_done_at = time.monotonic()
+            if self._armed_at is not None:
+                self.last_frame_lag = self._read_done_at - self._armed_at
+            return (raw_chunks, w, h, self.encoding, self.binning,
+                    self.model.interlaced)
         self._check_read_time()
         # Reset the FIFO only if it is empty. Otherwise it holds the next frame from its
         # first byte, and with three bytes to two pixels a cut head turns every later
@@ -667,6 +730,8 @@ class SpttCamera:
         discarded here so no caller has to know. A change from another thread during the
         wait starts the wait over the same way.
         """
+        if self.single_shot:
+            return self._grab_single()
         while True:
             with self._lock:
                 # The live loop's own work, which the camera does not wait for either.
@@ -694,12 +759,39 @@ class SpttCamera:
             if not discard:                 # else it was the old-settings frame
                 return decode_frame(*raw)
 
+    def _grab_single(self):
+        """One software-started frame: its integration begins here and nothing can
+        run ahead of the read, so a slow host costs time and not data.
+        """
+        retried = False
+        while True:
+            with self._lock:
+                self._trigger()
+                gen = self._settings_gen
+            self._wait_for_fifo(self._frame_wait_budget())
+            with self._lock:
+                if self._settings_gen != gen:
+                    self._abort_shot()
+                    continue
+                try:
+                    raw = self._read_one_frame()
+                except FrameReadError as exc:
+                    self._abort_shot()
+                    if retried:
+                        raise
+                    retried = True
+                    console_ui.warn(f"{exc}; taking the frame again")
+                    continue
+            return decode_frame(*raw)
+
     def grab_fresh_frame(self):
         """A frame whose integration was allowed to start at this call.
 
         The camera free-runs, so between shots the FIFO fills with frames up to half a
         minute old, which would be archived under a DATE-OBS they were not taken at.
         """
+        if self.single_shot:
+            return self._grab_single()
         with self._lock:
             self._rearm()
         return self.grab_frame()
@@ -724,6 +816,7 @@ class SpttCamera:
     def get_status_info(self):
         try:
             sb, sl = self.get_status()
+            frame_w, frame_h = self._frame_size(sl)
             return {
                 "running": bool(sb & 1),
                 "exposing": bool(sb & 2),
@@ -741,8 +834,8 @@ class SpttCamera:
                 "roi_org_v": sl[9],
                 "roi_size_h": sl[10],
                 "roi_size_v": sl[11],
-                "frame_w": sl[17],
-                "frame_h": sl[18],
+                "frame_w": frame_w,
+                "frame_h": frame_h,
                 "fifo_cnt": sl[13],
                 "read_s": self.last_read_s,
                 "transfer_floor_us": self.transfer_floor_us,
@@ -856,7 +949,7 @@ def frame_metadata(cam, when, status=None, debayered=False):
         "EXPREQ": cam.exposure,
         "PERIOD": int(status.get("period_us", cam.period_us or 0)),
         "MINPERD": int(status.get("min_period_us", cam.min_period_us or 0)),
-        "TRIGMODE": int(cam.trigmode),
+        "TRIGMODE": int(cam.hardware_trigmode),
         "GAIN": cam.gain,
         "BINNING": cam.binning,
         "ENCODING": "12bit" if cam.encoding == ENCODING_12BPP else "8bit",
@@ -1224,7 +1317,7 @@ class SpttWorkerConsole(threading.Thread):
             "exposure_s": self.cam.exposure,
             "period_us": self.cam.period_us,
             "min_period_us": self.cam.min_period_us,
-            "trigmode": self.cam.trigmode,
+            "trigmode": self.cam.hardware_trigmode,
             "gain": self.cam.gain,
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",

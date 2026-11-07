@@ -14,6 +14,7 @@ from datetime import datetime as dt
 import alerts
 
 import console_ui
+from telemetry import TelemetryLog
 
 from utils import (
     STATUS_MIN_INTERVAL, write_status_file, cleanup_stale_status_files,
@@ -112,6 +113,7 @@ class WorkerBus:
             status_dir, f"{os.getpid()}{status_suffix}.json")
         self._last_status_name = None
         self._last_status_at = 0.0
+        self._telemetry = TelemetryLog(instance_name)
 
     def prepare_status_dir(self):
         os.makedirs(self.status_dir, exist_ok=True)
@@ -143,6 +145,7 @@ class WorkerBus:
             write_status_file(self.status_path, payload)
         except Exception as exc:
             console_ui.warn(f"Could not write status file: {exc}")
+        self._telemetry.write(payload)
         return True
 
     def publish_error(self, kind, error, ts_iso=None):

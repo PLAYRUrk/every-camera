@@ -310,6 +310,13 @@ DEFAULT_CONFIG = {
             "baudrate": 9600,
             "move_timeout": 8.0,
         },
+        # Filter wheel temperature controller, read only. "auto" finds it among the
+        # USB-serial ports, "sim" is the simulator, "" turns polling off.
+        "omega": {
+            "port": "auto",
+            "baudrate": 9600,
+            "poll_seconds": 10.0,
+        },
         "location": {
             "lat": 0.0,
             "lon": 0.0,

@@ -66,6 +66,12 @@ class SpttModel:
     # Full-sensor frame size per binning code. Only for a log line when the
     # firmware reports something else; the firmware's figure is what is used.
     nominal_sizes: dict
+    # Frames are taken one at a time by software start, as the vendor's demo does,
+    # rather than free-running.
+    single_shot: bool = False
+    # The firmware obeys the binning command. Where it does not, the status block's
+    # size fields hold the sensor's size and the frame is the ROI.
+    has_binning: bool = True
 
 
 # CSDU-423 is the same camera to this driver: the vendor installs it with the
@@ -82,7 +88,7 @@ CSDU429 = SpttModel(
 CSDU285C = SpttModel(
     name="CSDU-285C", pid_raw=0xD285, pid_configured=0xC285,
     spt_name="csdu285.spt", interlaced=False, color=True,
-    nominal_sizes={0: (1392, 1032), 1: (696, 516), 3: (348, 258)})
+    nominal_sizes={0: (1392, 1032)}, single_shot=True, has_binning=False)
 
 MODELS = (CSDU429, CSDU285C)
 

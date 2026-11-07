@@ -94,6 +94,7 @@ class AsiCamera:
         self.cfg = cfg
         self.cam = None
         self.wheel = None
+        self.omega = None
         self._info = {}
         self._opened = False
 
@@ -116,11 +117,14 @@ class AsiCamera:
         except Exception as exc:
             console_ui.warn(f"Could not close the shutter at startup: {exc}")
         self._info = self.cam.info()
+        self.omega = devices.make_omega(self.cfg).start()
         return self
 
     def close(self):
         if not self._opened:
             return
+        if self.omega is not None:
+            self.omega.stop()
         try:
             self.set_shutter(False)
         except Exception:
@@ -354,6 +358,11 @@ class AsiWorkerConsole(threading.Thread):
         self._dash.set_section("camera", self._camera_rows(cooling))
         return cooling
 
+    def _wheel_temperature(self, station):
+        monitor = getattr(self.cam, "omega", None)
+        reading = monitor.temperature if monitor else None
+        return station.fw_temp if reading is None else reading
+
     def _save_status(self, status, force=False, cooling=None):
         cooling = cooling or {}
         # The schedule moves the filter, the exposure and the shutter on its
@@ -387,6 +396,11 @@ class AsiWorkerConsole(threading.Thread):
                           if self._last_mean is not None else None),
             "last_update": dt.now().isoformat(),
         }
+        monitor = getattr(self.cam, "omega", None)
+        omega = monitor.snapshot() if monitor else None
+        if omega:
+            payload["omega"] = omega
+            payload["fw_temp"] = omega["value"]
         if cooling.get("ccd_temp") is not None:
             payload["ccd_temp"] = round(float(cooling["ccd_temp"]), 2)
         if cooling.get("setpoint") is not None:
@@ -747,7 +761,7 @@ class AsiWorkerConsole(threading.Thread):
             device_id=station.device_id,
             filter_wavelength=filt.wavelength,
             filter_description=filt.description,
-            fw_temp=station.fw_temp,
+            fw_temp=self._wheel_temperature(station),
             legacy_version=station.legacy_version,
             sky_mean=sky_mean,
             split_count=split_count,
