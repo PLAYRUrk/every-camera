@@ -547,6 +547,18 @@ def _drop_retired_keys(cfg):
     return cfg
 
 
+def _restore_tracked_config(path):
+    """Bring a missing config.json back from git. Exclusive open: never overwrites."""
+    import subprocess
+    try:
+        data = subprocess.run(["git", "-C", APP_DIR, "show", "HEAD:config.json"],
+                              capture_output=True, timeout=10, check=True).stdout
+        with open(path, "xb") as fh:
+            fh.write(data)
+    except Exception:
+        pass
+
+
 def load_config(path=None):
     """Load config from JSON file. Returns merged config with defaults.
 
@@ -557,6 +569,8 @@ def load_config(path=None):
     """
     path = path or LOCAL_CONFIG_FILE
     cfg = _deep_copy(DEFAULT_CONFIG)
+    if path == LOCAL_CONFIG_FILE and not os.path.exists(path):
+        _restore_tracked_config(path)
     try:
         with open(path) as fh:
             data = json.load(fh)

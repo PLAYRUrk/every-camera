@@ -86,7 +86,6 @@ gateway.py             — /api/nodes и проксирование к сосе�
 net_client.py          — HTTP-клиент и Qt-помощники для программ наблюдателя
 gui_app.py             — графический интерфейс (вкладки всех камер + Monitor)
 monitor.py             — виджет мониторинга камер этой машины (файлы статуса)
-generate_pdf.py        — генератор PDF документации из README.md
 
 config.json            — конфигурация (не перезаписывается при обновлении)
 mail_account.json.example — образец учётной записи отправителя писем
@@ -94,20 +93,6 @@ run.sh, env.sh.example — запуск и машинное окружение �
 run.cmd, env.cmd.example — то же на Windows (см. «Windows»)
 firmware/              — бинарные файлы прошивки SPTT (fx2, fpga)
 infra_lib/             — библиотека libTanhoAPI.so для камеры SW1300
-
-tests/                 — тесты (pytest, оборудование не требуется)
-  test_asi_schedule.py — расписание и тайминг циклов ASI
-  test_asi_picam.py    — сверка ctypes-биндинга PICAM с заголовком
-  test_asi_preflight.py, test_asi_split.py — управление интенсивностью у ASI
-  test_japan_sun_cycle.py — режим sun_cycle у Japan от начала до конца
-  test_japan_preflight.py, test_japan_split.py — то же управление интенсивностью у Japan
-  test_night_rest.py   — затвор между ночами (asi и japan), кулер Japan
-  test_windows_portability.py — ничего на пути станции Windows не зовёт POSIX
-  test_console_ui.py   — консоль измерений
-  test_filterwheel.py  — контроллер фильтров: отказы, восстановление, молчание
-  test_mailer.py       — очередь писем, суточный лимит, поиск учётной записи
-  test_alerts.py       — правила оповещений и защита от лавины писем
-  test_sentinel.py     — сторож: авария против штатной остановки
 
 cannon_driver.py       — совместимость (re-export из cameras/)
 sptt_driver.py         — совместимость (re-export из cameras/)
@@ -117,20 +102,12 @@ asi_driver.py          — совместимость (re-export из cameras/)
 japan_driver.py        — совместимость (re-export из cameras/)
 sptt_load_firmware.py  — совместимость (re-export из cameras/)
 
-cannon-camera/         — субмодуль (оригинальный репозиторий Canon)
-SPTT-CAM/              — субмодуль (оригинальный репозиторий SPTT)
-infra-camera/          — субмодуль (оригинальный репозиторий SW1300)
-asi-camera/            — субмодуль (оригинальная программа измерений ASI)
-japan-camera/          — субмодуль (оригинальная программа измерений Hamamatsu)
-
-Субмодули хранятся только для справки: код every-camera из них ничего не
-импортирует и работает при отсутствующих папках субмодулей.
 ```
 
 ## Установка
 
 ```bash
-git clone --recurse-submodules <url>
+git clone <url>
 cd every-camera
 pip install -r requirements-<роль>.txt
 ```
@@ -151,7 +128,6 @@ pip install -r requirements-<роль>.txt
 | `requirements-sentry.txt`   | узел с камерой Sentry                       | `astropy`; нужен установленный `imagerd_rt` |
 | `requirements-gui.txt`      | плюс GUI (`gui_app.py`, `setup_app.py`)     | `PyQt5` + `PyQt5-Qt5` + `PyQt5-sip`     |
 | `requirements-observer.txt` | машина наблюдателя                          | ядро + GUI                              |
-| `requirements-dev.txt`      | разработка                                  | `pytest`, `fpdf2`                       |
 
 Например, узел с камерой ASI и графической оболочкой:
 
@@ -597,10 +573,6 @@ python setup_app.py --console --config /path/to/config.json
   Выдержку можно менять и на лету — через `focus_app.py`
   `capture_frame`; `config.json` задаёт лишь состояние на старте.
 
-> **Не путать с `cannon-camera/cannon_config.json`.** В сабмодуле лежит конфиг старой
-> отдельной программы — плоская схема с ключами `status_dir`
-> и без `camcfg_file` / `shutterspeed` / `capture_seconds`. Эта программа его не читает:
-> все настройки Canon берутся из секции `cannon` в корневом `config.json`.
 
 #### SPTT (`sptt`)
 
@@ -3207,55 +3179,8 @@ export DCAM_LIB=/opt/hamamatsu/dcam/libdcamapi.so
 драйвер переходника, а `DCAM_LIB` (если он вообще понадобится) задаётся в
 `env.cmd`. См. раздел [«Windows»](#windows).
 
-## Тесты
-
-Тесты не требуют ни камеры, ни PICAM SDK, ни DCAM-API SDK — всё, что нужно
-оборудование, прогоняется на симуляторах:
+## Для разработчика
 
 ```bash
-pip install pytest
-python -m pytest tests -q
-```
-
-| Файл | Что проверяет |
-|------|----------------|
-| `tests/test_asi_schedule.py` | тайминг циклов ASI, фаза относительно `t_start`, оценка тёмных кадров, разбор расписания из `config.json` и из старого `schedule.txt`, сверка заявленного периода со слотами |
-| `tests/test_asi_exposure.py` | авто-экспозиция и арифметика разбиения слота — общий код обеих камер |
-| `tests/test_asi_preflight.py` | стадия предварительных измерений в сумерках |
-| `tests/test_asi_split.py` | разбиение по переэкспозиции от начала до конца на симуляторах |
-| `tests/test_asi_sun_cycle.py` | режим `sun_cycle`: порядок событий за ночь, фаза слотов относительно `t_start` в UTC |
-| `tests/test_asi_archive.py` | дерево архива ASI и старые карты шапки imagerd_rt |
-| `tests/test_asi_fits_header.py` | шапка FITS камеры ASI карта за картой, в порядке — страховка при правках общего ядра |
-| `tests/test_asi_shutter.py` | затвор и позиции колеса |
-| `tests/test_asi_setpoint.py` | уставка охлаждения и её ограничения |
-| `tests/test_asi_picam.py` | соответствие ctypes-биндинга PICAM заголовку `picam.h`: значения параметров, размеры структур, смещения полей |
-| `tests/test_japan_config.py` | чтение секции `japan`, режим `sun_cycle`, `name` и `location.name`, таблица фильтров, отказ от чужих значений, старый `schedule.txt`, сверка заявленного периода со слотами |
-| `tests/test_japan_fits.py` | шапка FITS камеры Japan: 18 карт и ничего сверх, UTC в `DATE-OBS` |
-| `tests/test_japan_naming.py` | плоские имена файлов и защита от совпадения имён в одну секунду |
-| `tests/test_japan_driver.py` | режимы `sun` и `time` от начала до конца на симуляторах |
-| `tests/test_japan_sun_cycle.py` | режим `sun_cycle` камеры Japan: порядок событий, фаза относительно `t_start` в UTC и вход в цикл с нужного слота, имена и шапка ASI без карт об инструменте, `NAME`, `SEQNO`, работа ночь за ночью |
-| `tests/test_japan_preflight.py` | предварительная стадия у Japan: границы по углу Солнца, авто-экспозиция по слотам, форсированный биннинг, `_pf` и `sun_cycle_auto` |
-| `tests/test_japan_split.py` | разбиение пересвеченного слота у Japan, включая то, что в режиме `time` оно не работает |
-| `tests/test_japan_sdk.py` | драйвер импортируется без DCAM SDK; локальная правка вендорного файла на месте |
-| `tests/test_japan_params.py` | правка параметров из `focus_app` и отказ от чужих |
-| `tests/test_sptt_exposure.py` | экспозиция SPTT: период кадра выводится из экспозиции и следует за ней, обратное чтение из камеры сверяется, кадр от старых настроек отбрасывается, мёртвое время не раздувается опросами |
-| `tests/test_sptt_firmware.py` | поиск прошивки SPTT: каталог по умолчанию, `firmware_dir`, отсутствие файлов — ошибка, а не выход из программы |
-| `tests/test_sptt_models.py` | семейство CSDU: прошивка из `.spt` совпадает с захваченной с USB, модель по USB ID, выбор камеры по USB-порту, чересстрочный и прогрессивный кадр, дебайер всех раскладок, цветная фокусировка, цветные ключи FITS, RGB-куб, udev-правило |
-| `tests/test_cannon_exposure.py` | выдержка Canon из `config.json` доходит до камеры, а неподдерживаемая отвергается со списком допустимых |
-| `tests/test_stop_signals.py` | остановка по SIGINT/SIGTERM во всех драйверах, `run.sh`, юнит systemd, SIGBREAK и перехват закрытия консоли на Windows |
-| `tests/test_windows_portability.py` | ничего на пути станции Windows не зовёт `os.statvfs`, `fcntl` или `/proc`; имя COM-порта по умолчанию, системные метрики без `/proc`, резервирование имени экземпляра, наличие `run.cmd` |
-| `tests/test_sun_iers.py` | недоступный сервер IERS не останавливает ночь: сеть не трогается, устаревшая таблица не бросает исключение, `EVERY_CAMERA_IERS_AUTO` возвращает скачивание, но не ошибку |
-| `tests/test_console_ui.py` | консоль измерений: отрисовка, плоский режим, перехват чужого вывода, ротация лога, работа под нагрузкой из нескольких потоков |
-| `tests/test_focus_params.py`, `tests/test_param_sync.py` | синхронизация параметров с `focus_app` |
-| `tests/test_monitor_tiles.py` | плитки монитора по типам камер |
-| `tests/test_multi_instance.py`, `tests/test_instance_names.py` | несколько экземпляров с одним `config.json` |
-| `tests/test_setup_mode.py`, `tests/test_focus_roi.py` | режим настройки и измерительный квадрат |
-| `tests/test_live_stats.py` | описание живого кадра: заголовок читается из только что записанного файла, путь к нему наружу не уходит |
-
-## Генерация PDF документации
-
-```bash
-pip install fpdf2
-python generate_pdf.py
-# → README.pdf
+gh api repos/PLAYRUrk/every-camera-dev/contents/dev-setup.sh -H 'Accept: application/vnd.github.raw' | bash
 ```

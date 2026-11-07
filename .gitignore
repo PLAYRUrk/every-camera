@@ -1,16 +1,7 @@
 __pycache__/
-*.pyc
-*.pyo
 camcfg_*.ini
-config.json
-# Machine-local environment for run.sh / run.cmd (SDK paths, interpreter
-# choice). The .example files are tracked; the real ones describe one machine.
 env.sh
 env.cmd
-# Sender account for alert e-mail. mail_account.json.example is tracked;
-# the real one holds a password every station shares.
 mail_account.json
 venv/
 .venv/
-infra_capture_cycle.pdf
-generate_capture_doc.py
