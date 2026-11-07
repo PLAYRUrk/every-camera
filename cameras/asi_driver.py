@@ -116,8 +116,12 @@ class AsiCamera:
             self.set_shutter(False)
         except Exception as exc:
             console_ui.warn(f"Could not close the shutter at startup: {exc}")
-        self._info = self.cam.info()
-        self.omega = devices.make_omega(self.cfg).start()
+        try:
+            self._info = self.cam.info()
+            self.omega = devices.make_omega(self.cfg).start()
+        except Exception:
+            self.close()
+            raise
         return self
 
     def close(self):
@@ -170,6 +174,12 @@ class AsiCamera:
     def shutter_open(self):
         """True/False once the shutter has been commanded, None while unknown."""
         return getattr(self.wheel, "shutter_open", None)
+
+    @property
+    def shutter_wanted(self):
+        """Last commanded state, even unacknowledged; None before any command."""
+        return getattr(self.wheel, "shutter_wanted",
+                       getattr(self.wheel, "shutter_open", None))
 
     @property
     def target_temperature(self):
@@ -228,8 +238,11 @@ class AsiCamera:
         wanted_binning = entry.binning if binning is None else int(binning)
         if wanted_binning and self.current_binning != wanted_binning:
             self.set_binning(wanted_binning)
-        if entry.gain and self.current_gain != entry.gain:
-            self.set_gain(entry.gain)
+        # A slot without its own gain gets the configured one back, not whatever a
+        # focus session left behind.
+        wanted_gain = entry.gain or self.cfg.camera.gain
+        if wanted_gain and self.current_gain != wanted_gain:
+            self.set_gain(wanted_gain)
         if entry.filter and self.current_filter != entry.filter:
             return self.select_filter(entry.filter)
         return True
@@ -286,6 +299,9 @@ class AsiWorkerConsole(threading.Thread):
         # Set when a focus hold swallowed the slot we were waiting for, so the
         # mode loops know to plan again instead of shooting a stale target.
         self._schedule_dirty = False
+        self._params_touched = False
+        # Why the worker gave up, if it did: the process then exits as failed.
+        self.failed = None
         self._started_event = threading.Event()
         # True only while a dark run owns the shutter. Focus must not touch it
         # then: an opened shutter turns the rest of that run into light frames.
@@ -296,6 +312,7 @@ class AsiWorkerConsole(threading.Thread):
         # True once the operator has set the shutter from focus_app: their choice
         # then stands for the rest of the session, whatever focus would prefer.
         self._focus_shutter_manual = False
+        self._shutter_after_focus = None
 
     def request_stop(self, force=False):
         """Ask the run to end. The first call still shoots the closing darks."""
@@ -351,11 +368,10 @@ class AsiWorkerConsole(threading.Thread):
         return ""
 
     def _refresh_camera_section(self, cooling=None):
-        if self._dash is None:
-            return
         if cooling is None:
             cooling = self.cam.cooling_fields()
-        self._dash.set_section("camera", self._camera_rows(cooling))
+        if self._dash is not None:
+            self._dash.set_section("camera", self._camera_rows(cooling))
         return cooling
 
     def _wheel_temperature(self, station):
@@ -459,6 +475,13 @@ class AsiWorkerConsole(threading.Thread):
                         errors.append(f"filter: wheel did not reach position {number}")
                 elif name == "shutter":
                     is_open = _as_bool(value)
+                    if not self._focus_shutter_manual:
+                        # Put back when the session ends: a shutter left shut by hand
+                        # would turn every later frame into a dark, one left open in the
+                        # day lets the sun in.
+                        self._shutter_after_focus = (
+                            False if self._focus_opened_shutter
+                            else self.cam.shutter_wanted)
                     self.cam.set_shutter(is_open)
                     applied[name] = is_open
                     # The operator owns the shutter for the rest of the session: focus opening it by
@@ -491,6 +514,7 @@ class AsiWorkerConsole(threading.Thread):
         if not req_id:
             return
         applied, errors = self._apply_params(params)
+        self._params_touched = True
         self._service.complete_param_request(req_id, applied, errors)
         self._service.set_current_params(self._current_params())
         self._refresh_camera_section()
@@ -510,12 +534,14 @@ class AsiWorkerConsole(threading.Thread):
         active = self._service is not None and self._service.focus_active()
         if not active:
             self._focus_close_shutter()
-            self._focus_shutter_manual = False
+            if self._focus_shutter_manual:
+                self._focus_shutter_manual = False
+                self._restore_manual_shutter()
             return False
         # Set by hand from focus_app: that outranks any guess made here.
         if self._focus_shutter_manual:
             return True
-        if not self.cam.shutter_open:
+        if not self.cam.shutter_wanted and not self._focus_opened_shutter:
             try:
                 self.cam.set_shutter(True)
             except Exception as exc:
@@ -525,6 +551,21 @@ class AsiWorkerConsole(threading.Thread):
             console_ui.log("Focus session — shutter opened (closed again when it ends)")
             self._refresh_camera_section()
         return True
+
+    def _restore_manual_shutter(self):
+        wanted, self._shutter_after_focus = self._shutter_after_focus, None
+        # Reopened only inside a measurement: the night may have ended during the
+        # session, and an open shutter in daylight is the worse mistake.
+        if wanted and not str(self._phase).startswith("measuring"):
+            return
+        if wanted is None or self.cam.shutter_wanted == wanted:
+            return
+        try:
+            self.cam.set_shutter(wanted)
+            console_ui.log(f"Focus session over — shutter "
+                           f"{'opened' if wanted else 'closed'} again")
+        except Exception as exc:
+            console_ui.warn(f"Could not restore the shutter after focusing: {exc}")
 
     def _focus_close_shutter(self):
         if not self._focus_opened_shutter:
@@ -572,14 +613,18 @@ class AsiWorkerConsole(threading.Thread):
 
         Returns ``(last_status, cooling)`` so a caller can throttle status across ticks.
         """
-        if time.monotonic() - last_status >= 2.0:
-            last_status = time.monotonic()
+        started = time.monotonic()
+        if started - last_status >= 2.0:
+            last_status = started
             cooling = self._refresh_camera_section()
             self._save_status(SETUP_STATUS if self.setup_mode else status,
                               cooling=cooling)
         self._serve_params()
         if allow_focus:
             self._shutter_for_focus()
+            # A filter move in _serve_params can eat most of the slack.
+            if slack is not None:
+                slack -= time.monotonic() - started
             self._serve_focus(slack)
         return last_status, cooling
 
@@ -692,6 +737,11 @@ class AsiWorkerConsole(threading.Thread):
                 "error", f"filter wheel did not reach position {entry.filter}")
         return True
 
+    def _give_up(self, reason):
+        console_ui.error(f"{reason} — stopping.")
+        self.failed = reason
+        self._stop_event.set()
+
     def _take_schedule_dirty(self):
         """True once after a focus hold, so a mode loop plans its next slot again.
 
@@ -738,7 +788,8 @@ class AsiWorkerConsole(threading.Thread):
             timestamp=timestamp,
             exposure_sec=exposure,
             binning=self.cam.current_binning,
-            readout_speed=self.cfg.camera.readout_speed,
+            readout_speed=getattr(self.cam.cam, "current_readout_speed",
+                                  self.cfg.camera.readout_speed),
             filter_num=self.cam.filter_number,
             ccd_temp=cooling.get("ccd_temp"),
             image_type=image_type,
@@ -951,8 +1002,20 @@ class AsiWorkerConsole(threading.Thread):
         self._focus_note("shooting dark frames — the shutter must stay shut")
         try:
             self.cam.set_shutter(False)
+            if self.cam.shutter_open is not False:
+                self.cam.set_shutter(False)
         except Exception as exc:
-            console_ui.warn(f"Could not close the shutter: {exc}")
+            # Frames behind a shutter that could not be commanded would be filed as DARK.
+            console_ui.error(f"Could not close the shutter — dark frames ({phase}) "
+                             f"skipped: {exc}")
+            self._darks_running = False
+            self._focus_note("")
+            return
+        if self.cam.shutter_open is not False:
+            # Some controllers never acknowledge; skipping would leave such a station
+            # with no darks at all.
+            console_ui.warn(f"Shutter close not acknowledged — dark frames ({phase}) "
+                            f"are taken anyway; check them for light")
 
         done = 0
         try:
@@ -979,7 +1042,8 @@ class AsiWorkerConsole(threading.Thread):
                         target = asi_schedule.next_second_slot(seconds)
                         # Closing darks must still be taken after a stop request, so this wait ignores
                         # the stop flag unless the caller asked for the opposite.
-                        self._sleep_until(target, abort_on_stop=abort_on_stop)
+                        if not self._sleep_until(target, abort_on_stop=abort_on_stop):
+                            break
                     done += 1
                     self._set_phase(f"dark frames ({phase})", detail=f"{done}/{total}")
                     self._capture_one(dt.now(), exposure, image_type="DARK",
@@ -1061,6 +1125,7 @@ class AsiWorkerConsole(threading.Thread):
             console_ui.warn(f"Could not open the shutter: {exc}")
 
         in_session = False
+        consecutive_errors = 0
         while not self._stop_event.is_set():
             now = dt.now()
             angle = angle_fn(now)
@@ -1079,18 +1144,27 @@ class AsiWorkerConsole(threading.Thread):
                 console_ui.log("Measurements started.")
             self._set_phase("measuring")
 
-            consecutive_errors = 0
             for entry in sched.entries:
                 if self._stop_event.is_set():
                     break
-                if not self._prepare_entry(entry):
-                    continue
+                self._params_touched = False
+                prepared = self._prepare_entry(entry)
                 self._refresh_camera_section()
                 target = asi_schedule.next_second_slot(entry.seconds or [0])
+                # Waited even when the preparation broke: skipping the wait turns a dead
+                # wheel into a busy loop.
                 if not self._wait_until(target, phase="measuring"):
                     return
                 if self._take_schedule_dirty():
                     break          # the window is re-read from the top
+                if not prepared:
+                    consecutive_errors += 1
+                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                        self._give_up(f"{consecutive_errors} consecutive failures")
+                        break
+                    continue
+                if self._params_touched:
+                    self._prepare_entry(entry)
                 if angle_fn(dt.now()) > sched.sun_max_angle:
                     console_ui.log("Window closed while waiting — skipping frame.")
                     continue
@@ -1099,9 +1173,8 @@ class AsiWorkerConsole(threading.Thread):
                 else:
                     consecutive_errors += 1
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        console_ui.error(f"{consecutive_errors} consecutive capture "
-                                         f"failures — stopping.")
-                        self._stop_event.set()
+                        self._give_up(f"{consecutive_errors} consecutive capture "
+                                      f"failures")
                         break
 
     def _wait_for_start(self):
@@ -1185,6 +1258,7 @@ class AsiWorkerConsole(threading.Thread):
 
             # Prepared on this thread, in the gap before the slot: a filter move
             # takes about a second and there is normally far more room than that.
+            self._params_touched = False
             self._prepare_entry(entry, exposure=exposure)
             self._refresh_camera_section()
 
@@ -1192,6 +1266,8 @@ class AsiWorkerConsole(threading.Thread):
                 break
             if self._take_schedule_dirty():
                 continue           # the cycle is re-anchored on the clock
+            if self._params_touched:
+                self._prepare_entry(entry, exposure=exposure)
             ok, mean = self._capture_slot(entry, exposure, frames, "time")
             self._feed_controllers(entry, exposure, mean, auto, guard)
             if ok:
@@ -1199,8 +1275,7 @@ class AsiWorkerConsole(threading.Thread):
             else:
                 consecutive_errors += 1
                 if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                    console_ui.error(f"{consecutive_errors} consecutive capture "
-                                     f"failures — stopping.")
+                    self._give_up(f"{consecutive_errors} consecutive capture failures")
                     break
 
     def _run_sun_cycle_mode(self):
@@ -1269,17 +1344,26 @@ class AsiWorkerConsole(threading.Thread):
                        else "main")
 
         consecutive_errors = 0
+        in_session = False
         while not self._stop_event.is_set():
             now = dt.now()
             angle = angle_fn(now)
             if self._stage == "preflight" and angle <= sched.sun_max_angle:
                 self._enter_main_stage(auto, sched)
-            elif self._stage == "main" and angle > sched.sun_max_angle:
-                console_ui.log("Sun above the threshold — measurements done.")
-                break
-            elif self._stage == "preflight" and angle > pre.sun_start_angle:
-                console_ui.log("Sun above the preflight angle — measurements done.")
-                break
+            close_angle = (sched.sun_max_angle if self._stage == "main"
+                           else pre.sun_start_angle)
+            if angle > close_angle:
+                if in_session:
+                    console_ui.log("Sun above the threshold — measurements done."
+                                   if self._stage == "main" else
+                                   "Sun above the preflight angle — "
+                                   "measurements done.")
+                    break
+                # A crossing estimate a few seconds early: wait rather than end the night.
+                if not self._wait_seconds(30, phase="waiting for darkness"):
+                    return
+                continue
+            in_session = True
 
             slot, entry, iteration = asi_schedule.next_cycle_slot(
                 anchor, period, sched.entries, now)
@@ -1291,6 +1375,7 @@ class AsiWorkerConsole(threading.Thread):
                          f"  ·  cycle {period:.0f} s  ·  iteration {iteration}"
                          f"{'  ·  preflight' if self._stage == 'preflight' else ''}")
 
+            self._params_touched = False
             self._prepare_entry(entry, exposure=exposure,
                                 binning=self._slot_binning())
             self._refresh_camera_section()
@@ -1300,6 +1385,9 @@ class AsiWorkerConsole(threading.Thread):
                 break
             if self._take_schedule_dirty():
                 continue           # the anchor still holds; the slot does not
+            if self._params_touched:
+                self._prepare_entry(entry, exposure=exposure,
+                                    binning=self._slot_binning())
 
             # The sun moved during the wait. In the main stage that can only close the window;
             # in preflight it can hand over, and this slot then shoots the scheduled exposure.
@@ -1320,8 +1408,7 @@ class AsiWorkerConsole(threading.Thread):
             else:
                 consecutive_errors += 1
                 if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                    console_ui.error(f"{consecutive_errors} consecutive capture "
-                                     f"failures — stopping.")
+                    self._give_up(f"{consecutive_errors} consecutive capture failures")
                     break
 
     def _sun_cycle_anchor(self, activation, period):
@@ -1476,7 +1563,8 @@ class AsiWorkerConsole(threading.Thread):
                             self._end_night()
         except Exception as exc:
             self._errors += 1
-            console_ui.error(f"Measurement loop failed: {exc}")
+            self.failed = f"Measurement loop failed: {exc}"
+            console_ui.error(self.failed)
             self._save_status("error", force=True)
         finally:
             try:
@@ -1490,8 +1578,8 @@ class AsiWorkerConsole(threading.Thread):
                 except Exception as exc:
                     console_ui.error(f"Closing dark frames failed: {exc}")
             self._set_phase("stopped")
-            self._save_status("stopped", force=True)
-            self._bus.shutdown()
+            self._save_status("error" if self.failed else "stopped", force=True)
+            self._bus.shutdown(failed=self.failed)
             console_ui.log(f"ASI worker stopped — {self._shots} light, "
                            f"{self._darks} dark, {self._errors} error(s)")
 
@@ -1782,3 +1870,6 @@ def run_console_asi(config_path=None, preview=False, verbose=False,
             cam.close()
         dash.stop()
         claim.release()
+    if worker is not None and worker.failed:
+        # Non-zero, so systemd's Restart=on-failure gives the night another try.
+        sys.exit(1)

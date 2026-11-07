@@ -17,6 +17,7 @@ FORBIDDEN_IN_TITLE = re.compile(r'[./\\:*?"<>|#%]')
 LINK = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)\s]+)\)")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 FENCE = re.compile(r"^\s*(```|~~~)")
+INLINE_CODE = re.compile(r"(`+[^`]*`+)")
 
 
 class WikiError(Exception):
@@ -94,9 +95,15 @@ def convert_links(stem, text, pages, names, anchors):
         suffix = f"#{anchor}" if anchor else ""
         return f"[{label}]({names[other]}{suffix})"
 
+    def rewrite(line):
+        # Text inside `inline code` is an example, not a link to check or rewrite.
+        parts = INLINE_CODE.split(line)
+        return "".join(part if i % 2 else LINK.sub(replace, part)
+                       for i, part in enumerate(parts))
+
     lines = []
     for line, in_code in split_fences(text):
-        lines.append(line if in_code else LINK.sub(replace, line))
+        lines.append(line if in_code else rewrite(line))
     return "\n".join(lines) + "\n"
 
 

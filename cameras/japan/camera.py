@@ -215,7 +215,17 @@ class HamamatsuCamera:
                         f"on this frame")
                     break
         finally:
-            self._dcam.buf_release()
+            if image is None:
+                # A snapshot still running keeps the buffer busy, and every later
+                # buf_alloc would then fail.
+                stop = getattr(self._dcam, "cap_stop", None)
+                if stop is not None:
+                    try:
+                        stop()
+                    except Exception:
+                        pass
+            if not self._dcam.buf_release():
+                console_ui.warn(f"buf_release failed: {self._dcam.lasterr()}")
         if image is None:
             return None
         # MONO16 passes through untouched; a MONO8 buffer is widened and shifted, so

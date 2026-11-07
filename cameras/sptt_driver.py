@@ -21,7 +21,7 @@ import intensity
 
 from utils import (
     claim_instance_name, get_instance_name, get_local_ip, get_system_info,
-    APP_DIR, STATUS_MIN_INTERVAL,
+    APP_DIR, STATUS_MIN_INTERVAL, unique_path,
 )
 from worker_common import (
     WorkerBus, publish_current_params,
@@ -508,13 +508,18 @@ class SpttCamera:
         _, sl = read_crb(self.ep_wr, self.ep_rd)
         self.min_period_us = sl[14]
         if verify:
-            self._verify_timing(exposure_us, sl)
+            self._verify_timing(exposure_us, sl,
+                                short_period_ok=(self.trigmode != 0 or self.single_shot))
         return sl
 
-    def _verify_timing(self, requested_exposure_us, sl):
+    def _verify_timing(self, requested_exposure_us, sl, short_period_ok=False):
+        """``short_period_ok``: outside continuous mode the period does not gate the
+        integration, so a short one was chosen on purpose and is not a fault."""
         console_ui.log(describe_timing(requested_exposure_us, sl))
-        problems = [p for p in (exposure_mismatch(requested_exposure_us, sl[5]),
-                                period_mismatch(sl[5], sl[6])) if p]
+        checks = [exposure_mismatch(requested_exposure_us, sl[5])]
+        if not short_period_ok:
+            checks.append(period_mismatch(sl[5], sl[6]))
+        problems = [p for p in checks if p]
         if problems:
             for problem in problems:
                 console_ui.warn(problem)
@@ -887,6 +892,9 @@ def ensure_firmware_loaded(backend, firmware_dir=None, usb_port=None):
     except usb.core.USBError as exc:
         console_ui.error(explain_usb_error(exc))
         return None
+    except RuntimeError as exc:
+        console_ui.error(f"SPTT firmware load failed: {exc}")
+        return None
 
 
 def _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
@@ -1196,7 +1204,7 @@ class SpttWorkerConsole(threading.Thread):
             console_ui.error(f"Failed to start camera: {exc}")
             self.failed = True
             self._save_status("error", force=True)
-            self._bus.shutdown()
+            self._bus.shutdown(failed=f"Failed to start camera: {exc}")
             return
 
         while not self._stop_event.is_set():
@@ -1245,12 +1253,12 @@ class SpttWorkerConsole(threading.Thread):
 
         self.cam.stop()
         self._save_status("error" if self.failed else "stopped", force=True)
-        self._bus.shutdown()
+        self._bus.shutdown(failed="consecutive capture errors" if self.failed else None)
         console_ui.log("SPTT measurement stopped")
 
     def _capture_one(self, now):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
-        filepath = os.path.join(self.output_dir, f"{timestamp}.fit")
+        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
         try:
             # Started at the tick, not one sitting in the FIFO since the last capture.
             frame = self.cam.grab_fresh_frame()

@@ -167,6 +167,7 @@ class PixisCamera:
         self.current_gain = self._set_checked(P.AdcAnalogGain, cfg.gain, "Analog gain")
         self._set_full_frame_roi(cfg.binning)
         self._commit()
+        self.current_binning = cfg.binning
 
         # The legacy ``BitDepth`` header records it on every frame.
         self._bit_depth = bit_depth = picam.get_int(self._handle, P.PixelBitDepth)
@@ -191,7 +192,6 @@ class PixisCamera:
             picam.set_rois(self._handle, rois)
         finally:
             picam.destroy_rois(rois)
-        self.current_binning = binning
 
     def _frame_shape(self) -> tuple[int, int]:
         """Read back, not derived from sensor/binning: PICAM may clamp a requested ROI or
@@ -214,6 +214,7 @@ class PixisCamera:
     def set_binning(self, b: int) -> None:
         self._set_full_frame_roi(b)
         self._commit()
+        self.current_binning = b
 
     def set_gain(self, gain: int) -> None:
         self.current_gain = self._set_checked(P.AdcAnalogGain, gain, "Analog gain")

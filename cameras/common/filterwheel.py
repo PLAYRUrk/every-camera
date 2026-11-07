@@ -89,6 +89,9 @@ class FilterWheel:
         # None until commanded: the controller never reports its state on its own, and
         # focus_app must not be shown a guess as a reading.
         self.shutter_open: bool | None = None
+        # What was last commanded, acknowledged or not: decisions about the shutter
+        # rest on this, the confirmed state only on what was reported.
+        self.shutter_wanted: bool | None = None
         self._silent_moves = 0
         self._lost = False
         self._probe_at = 0.0
@@ -97,8 +100,10 @@ class FilterWheel:
         # Imported here so the simulator backend runs without pyserial installed.
         import serial
 
-        self._ser = serial.Serial(
-            self._port, baudrate=self._baudrate,
+        from cameras.common.omega import open_serial
+
+        self._ser = open_serial(
+            serial, self._port, baudrate=self._baudrate,
             bytesize=8, parity="N", stopbits=1, timeout=_CHUNK_TIMEOUT,
         )
         del self._rx[:]
@@ -182,7 +187,7 @@ class FilterWheel:
         """
         console_ui.error(f"Filter wheel would not reach position {n} — reopening "
                          f"the port and homing the wheel")
-        shutter = self.shutter_open
+        shutter = self.shutter_wanted
         try:
             if self._ser and self._ser.is_open:
                 self._ser.close()
@@ -307,10 +312,15 @@ class FilterWheel:
             # full.
         position = None
         for attempt in range(1, attempts + 1):
-            arrived, elapsed = self._goto(n)
-            if not arrived:
-                position = self.read_position()
-                arrived = position == n
+            try:
+                arrived, elapsed = self._goto(n)
+                if not arrived:
+                    position = self.read_position()
+                    arrived = position == n
+            except OSError as exc:
+                # A USB-serial adapter that dropped off the bus: only reopening helps.
+                console_ui.error(f"Filter wheel port {self._port} failed: {exc}")
+                break
             if arrived:
                 self.current_filter = n
                 console_ui.log(f"Filter {n} reached in {elapsed:.1f} s")
@@ -321,13 +331,17 @@ class FilterWheel:
                 f"{'nothing' if position is None else position})"
                 + (" — retrying" if attempt < attempts else ""))
         if self._reinitialise(n):
-            arrived, elapsed = self._goto(n)
-            if arrived:
-                self.current_filter = n
-                console_ui.log(f"Filter {n} reached in {elapsed:.1f} s after "
-                               f"reinitialising the wheel")
-                return True
-            position = self.read_position()
+            try:
+                arrived, elapsed = self._goto(n)
+                if arrived:
+                    self.current_filter = n
+                    console_ui.log(f"Filter {n} reached in {elapsed:.1f} s after "
+                                   f"reinitialising the wheel")
+                    return True
+                position = self.read_position()
+            except OSError as exc:
+                console_ui.error(f"Filter wheel port {self._port} failed: {exc}")
+                position = None
             if position == n:
                 self.current_filter = n
                 console_ui.log(f"Filter {n} confirmed after reinitialising the wheel")
@@ -351,6 +365,28 @@ class FilterWheel:
         self._home()
 
     def set_shutter(self, open: bool) -> None:
+        self.shutter_wanted = bool(open)
+        try:
+            acked = self._command_shutter(open)
+        except OSError:
+            # The adapter may have re-enumerated: reopen once and try again.
+            self._reopen_port()
+            acked = self._command_shutter(open)
+        # Without an acknowledgement the state is only what was asked for.
+        self.shutter_open = bool(open) if acked else None
+        if not acked:
+            console_ui.warn(f"Shutter on {self._port}: no acknowledgement — "
+                            f"its state is unknown")
+
+    def _reopen_port(self) -> None:
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+        except Exception:
+            pass
+        self._open_port()
+
+    def _command_shutter(self, open: bool) -> bool:
         val = 1 if open else 0
         self._flush()
         started = monotonic()
@@ -359,14 +395,17 @@ class FilterWheel:
         self._ser.write(("GOSUB6" + chr(13)).encode())
         # Read the acknowledgement: a stray SHTR: answer picked up during a move is
         # one more way to miss an arrival.
+        acked = False
         deadline = monotonic() + _ACK_TIMEOUT
         while monotonic() < deadline:
             line = self._read_line(deadline)
             if line is None:
                 break
             if line.strip().upper().startswith("SHTR:"):
+                self._heard_from()
+                acked = True
                 break
         remaining = _SHUTTER_SETTLE - (monotonic() - started)
         if remaining > 0:
             sleep(remaining)
-        self.shutter_open = bool(open)
+        return acked

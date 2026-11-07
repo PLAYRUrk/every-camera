@@ -86,7 +86,7 @@ def _boot_id():
         return None
 
 
-def find_config(explicit=None):
+def find_config(explicit=None, config_dir=None):
     """The first config naming somebody to notify wins: the explicit path, the
     checkout's config.json, then each service config.
 
@@ -98,8 +98,9 @@ def find_config(explicit=None):
         candidates.append(explicit)
     candidates.append(None)          # load_config's own default
     try:
-        candidates += [os.path.join(SERVICE_CONFIG_DIR, name)
-                       for name in sorted(os.listdir(SERVICE_CONFIG_DIR))
+        directory = config_dir or SERVICE_CONFIG_DIR
+        candidates += [os.path.join(directory, name)
+                       for name in sorted(os.listdir(directory))
                        if name.endswith(".json")]
     except OSError:
         pass
@@ -144,7 +145,9 @@ def _age_of(record):
     if not stamp:
         return None
     try:
-        return (dt.now() - dt.fromisoformat(stamp)).total_seconds()
+        # Epoch seconds: a naive local stamp compared with dt.now() jumps an hour
+        # at a daylight-saving change.
+        return time.time() - dt.fromisoformat(stamp).timestamp()
     except (ValueError, TypeError):
         return None
 
@@ -382,6 +385,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Watch the camera workers on this machine and send alert mail")
     parser.add_argument("--config", default=None, help="Path to config.json")
+    parser.add_argument("--config-dir", default=None,
+                        help="Directory of the cameras' service configs "
+                             f"(default {SERVICE_CONFIG_DIR})")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                         help="Seconds between passes (default 15)")
     parser.add_argument("--once", action="store_true",
@@ -391,7 +397,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        cfg = find_config(args.config)
+        cfg = find_config(args.config, config_dir=args.config_dir)
     except Exception:
         cfg = {}
 

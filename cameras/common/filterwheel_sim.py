@@ -51,3 +51,4 @@ class SimFilterWheel:
 
     def set_shutter(self, open: bool) -> None:
         self.shutter_open = open
+        self.shutter_wanted = open

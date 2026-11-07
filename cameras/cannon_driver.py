@@ -17,7 +17,8 @@ import console_ui
 
 from utils import (
     load_schedule_safe, claim_instance_name, get_instance_name,
-    get_local_ip, get_system_info, APP_DIR,
+    get_local_ip, get_system_info, APP_DIR, schedule_now, schedule_to_local,
+    unique_path,
 )
 from worker_common import (
     WorkerBus, publish_current_params,
@@ -299,6 +300,11 @@ def get_camera_settings_info(config):
     return info
 
 
+def _gp_check(rc, what):
+    if rc < 0:
+        raise RuntimeError(f"gphoto2 {what} failed (code {rc})")
+
+
 def capture_image(cam):
     """The fallback serves cameras without capturetarget."""
     from gphoto2cffi.backend import lib as _gp_lib, ffi as _gp_ffi
@@ -306,22 +312,40 @@ def capture_image(cam):
         return cam.capture()
     except Exception:
         cam_file_path = _gp_ffi.new("CameraFilePath*")
-        _gp_lib.gp_camera_capture(cam._cam, _gp_lib.GP_CAPTURE_IMAGE,
-                                  cam_file_path, cam._ctx)
+        _gp_check(_gp_lib.gp_camera_capture(cam._cam, _gp_lib.GP_CAPTURE_IMAGE,
+                                            cam_file_path, cam._ctx), "capture")
         folder = _gp_ffi.string(cam_file_path.folder).decode(errors='replace')
         name = _gp_ffi.string(cam_file_path.name).decode(errors='replace')
         cam_file = _gp_ffi.new("CameraFile**")
-        _gp_lib.gp_file_new(cam_file)
-        _gp_lib.gp_camera_file_get(cam._cam, folder.encode(), name.encode(),
-                                   _gp_lib.GP_FILE_TYPE_NORMAL,
-                                   cam_file[0], cam._ctx)
-        data_p = _gp_ffi.new("const char**")
-        size_p = _gp_ffi.new("unsigned long*")
-        _gp_lib.gp_file_get_data_and_size(cam_file[0], data_p, size_p)
-        img_data = _gp_ffi.buffer(data_p[0], size_p[0])[:]
-        _gp_lib.gp_camera_file_delete(cam._cam, folder.encode(), name.encode(), cam._ctx)
-        _gp_lib.gp_file_free(cam_file[0])
-        return img_data
+        _gp_check(_gp_lib.gp_file_new(cam_file), "file_new")
+        try:
+            _gp_check(_gp_lib.gp_camera_file_get(cam._cam, folder.encode(), name.encode(),
+                                                 _gp_lib.GP_FILE_TYPE_NORMAL,
+                                                 cam_file[0], cam._ctx), "file_get")
+            data_p = _gp_ffi.new("const char**")
+            size_p = _gp_ffi.new("unsigned long*")
+            _gp_check(_gp_lib.gp_file_get_data_and_size(cam_file[0], data_p, size_p),
+                      "get_data")
+            if not size_p[0]:
+                raise RuntimeError("gphoto2 returned an empty image")
+            img_data = _gp_ffi.buffer(data_p[0], size_p[0])[:]
+            _gp_lib.gp_camera_file_delete(cam._cam, folder.encode(), name.encode(),
+                                          cam._ctx)
+            return img_data
+        finally:
+            _gp_lib.gp_file_free(cam_file[0])
+
+
+def shutter_seconds(value, unknown=30.0):
+    """``"1/250"`` → 0.004, ``"30"`` → 30; bulb or anything unreadable → ``unknown``."""
+    text = str(value or "").strip().lower().rstrip("s").strip()
+    try:
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return float(num) / float(den)
+        return float(text)
+    except (ValueError, ZeroDivisionError):
+        return unknown
 
 
 class CannonWorkerConsole(threading.Thread):
@@ -343,6 +367,7 @@ class CannonWorkerConsole(threading.Thread):
         self._bus = WorkerBus("cannon", instance_name, status_dir,
                               service=service, node_name=node_name)
         self._stop_event = threading.Event()
+        self.failed = None
         self._shots = 0
         self._errors = 0
         self._last_shot = None
@@ -379,7 +404,24 @@ class CannonWorkerConsole(threading.Thread):
         try:
             return self.cam.get_preview()
         except Exception:
+            if not self._full_focus_frame_fits():
+                raise RuntimeError("no live view, and a full exposure would run "
+                                   "into the next scheduled shot")
             return capture_image(self.cam)
+
+    def _full_focus_frame_fits(self):
+        """A full exposure is the fallback, and it must not swallow a capture second."""
+        if self.setup_mode or self._focus_holding() or not self.capture_seconds:
+            return True
+        try:
+            exposure = shutter_seconds(
+                get_camera_settings_info(self.config).get("shutterspeed"))
+        except Exception:
+            exposure = 30.0
+        now = dt.now()
+        sec = now.second + now.microsecond / 1e6
+        ahead = min((s - sec) % 60 or 60 for s in self.capture_seconds)
+        return ahead > exposure + 5.0
 
     def _focus_holding(self):
         return self._service is not None and self._service.focus_hold()
@@ -425,11 +467,12 @@ class CannonWorkerConsole(threading.Thread):
 
         while not self._stop_event.is_set():
             now = dt.now()
+            now_utc = schedule_now()
 
             active_end = None
             for entry in self.schedule:
-                if entry.start <= now <= entry.end:
-                    active_end = entry.end
+                if entry.start <= now_utc <= entry.end:
+                    active_end = schedule_to_local(entry.end)
                     break
 
             holding = self._focus_holding()
@@ -468,7 +511,8 @@ class CannonWorkerConsole(threading.Thread):
                     self._errors += 1
                     self._save_status("error", force=True)
                     if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
+                        self.failed = f"{consecutive_errors} consecutive errors"
+                        console_ui.error(f"{self.failed}, stopping")
                         break
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
@@ -476,13 +520,13 @@ class CannonWorkerConsole(threading.Thread):
 
             self._stop_event.wait(0.1)
 
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
+        self._save_status("error" if self.failed else "stopped", force=True)
+        self._bus.shutdown(failed=self.failed)
         console_ui.log("Cannon measurement stopped")
 
     def _capture_one(self, now):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
-        filepath = os.path.join(self.output_dir, f"{timestamp}.jpeg")
+        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.jpeg"))
         try:
             img_data = capture_image(self.cam)
             with open(filepath, "wb") as fh:
@@ -724,3 +768,5 @@ def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
     finally:
         if server:
             server.stop()
+    if worker.failed:
+        sys.exit(1)

@@ -3,7 +3,7 @@ import re
 import json
 import shutil
 import socket
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -211,6 +211,11 @@ DEFAULT_CONFIG = {
         # Which camera, by physical USB port ("1-2.3"), when the machine has
         # several; empty = the only one. --type sptt --probe lists them.
         "usb_port": "",
+        # Colour models only.
+        "debayer": False,               # save RGB instead of the raw mosaic
+        "bayer_pattern": "RGGB",
+        "r_offset": None,               # None: the camera keeps its own
+        "g_offset": None,
     },
     "infra": {
         "instance_name": "",
@@ -324,7 +329,7 @@ DEFAULT_CONFIG = {
         },
     },
     # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor filter
-    # wheel the ASI camera uses. No cooling control, no analog gain. Its sun_cycle mode
+    # wheel the ASI camera uses. No analog gain. Its sun_cycle mode
     # runs the ASI imager's night, intensity-control loops and all.
     "japan": {
         "instance_name": "",
@@ -380,6 +385,14 @@ DEFAULT_CONFIG = {
             "binning": 1,
             "frame_timeout_ms": 1000,   # one DCAM frame-ready wait, not the exposure
         },
+        "cooling": {
+            "enabled": False,
+            "lead_minutes": 30.0,       # switched on this long before the window
+            "target_temp": None,        # °C; None keeps the camera's own target
+            "tolerance": 3.0,           # °C off target that still counts as cold
+            "off_between_nights": True,
+            "off_on_exit": True,
+        },
         "filter_wheel": {
             "port": "/dev/ttyUSB0",     # "sim" selects the simulator
             "baudrate": 9600,
@@ -420,7 +433,6 @@ DEFAULT_CONFIG = {
         # How long before the same fault is reported again: a wheel failing every forty
         # seconds all night must stay one letter, not a thousand.
         "cooldown_minutes": 60,
-        "daily_summary": "",           # "09:00" to get a morning report
         "disk_free_min_mb": 5000,      # 0 disables the check
         "status_mail_minutes": 0,      # >0 mails a status summary that often
         # Per station per day. One mailbox serves every camera, so one station stuck in
@@ -441,7 +453,7 @@ DEFAULT_CONFIG = {
         "port_search": 20,      # 0 = use "port" or nothing
         "discovery": True,
         "discovery_port": 45455,
-        "max_list": 2000,
+        "max_list": 5000,
         "focus_ttl": 60,
     },
     # Friendly name of this machine, shown by viewer_app/focus_app/monitor
@@ -477,6 +489,10 @@ def _drop_retired_keys(cfg):
     the next save.
     """
     cfg.pop("mqtt", None)
+    # Never implemented; status_mail_minutes is the periodic report.
+    alerts = cfg.get("alerts")
+    if isinstance(alerts, dict):
+        alerts.pop("daily_summary", None)
     return cfg
 
 
@@ -492,26 +508,53 @@ def _restore_tracked_config(path):
         pass
 
 
+class LoadedConfig(dict):
+    """A config as loaded. ``load_error`` says why the file could not be used: the
+    result is then defaults, and must not be saved over the file."""
+    load_error = None
+    source_path = None
+
+
+def _read_config_text(path):
+    # Files written here are ASCII; one edited by hand on a Windows station may be
+    # in the ANSI code page.
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        import locale
+        return raw.decode(locale.getpreferredencoding(False))
+
+
+def _backup_path(path):
+    backup = path + ".bak"
+    if os.path.exists(backup):
+        backup = f"{path}.bak-{dt.now().strftime('%Y%m%d-%H%M%S')}"
+    return backup
+
+
 def load_config(path=None):
     """Returns the file merged over the defaults.
 
-    A malformed file is reported and kept as ``.bak``: every setting reverts to
-    defaults, and the GUI would write those back over it.
+    A malformed file is reported and kept as a backup: every setting reverts to
+    defaults, and ``load_error`` tells the GUI not to write those back over it.
     """
     path = path or LOCAL_CONFIG_FILE
     cfg = _deep_copy(DEFAULT_CONFIG)
+    error = None
     if path == LOCAL_CONFIG_FILE and not os.path.exists(path):
         _restore_tracked_config(path)
     try:
-        with open(path) as fh:
-            data = json.load(fh)
+        data = json.loads(_read_config_text(path))
         if not isinstance(data, dict):
             raise ValueError("top-level JSON value is not an object")
         _deep_merge(cfg, data)
     except FileNotFoundError:
         save_config(cfg, path)
     except (json.JSONDecodeError, ValueError) as exc:
-        backup = path + ".bak"
+        error = f"not valid JSON: {exc}"
+        backup = _backup_path(path)
         try:
             import shutil
             shutil.copy2(path, backup)
@@ -521,21 +564,49 @@ def load_config(path=None):
         console_ui.error(f"Config {path} is not valid JSON: {exc}\n"
                          f"        Falling back to defaults. {hint}")
     except Exception as exc:
+        error = f"could not be read: {exc}"
         console_ui.error(f"Could not read config {path}: {exc}. Using defaults.")
-    return _drop_retired_keys(cfg)
+    result = LoadedConfig(_drop_retired_keys(cfg))
+    result.load_error = error
+    result.source_path = path
+    return result
 
 
 def save_config(cfg, path=None):
+    """Atomic: a unique temp file, flushed to disk, then renamed over the config.
+    Returns False, having said why, if nothing was written."""
+    import tempfile
     path = path or LOCAL_CONFIG_FILE
     out = _deep_copy(cfg)
+    tmp = None
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                                   suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(out, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # mkstemp makes the file 0600; the config keeps the mode it had.
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            mode = 0o644
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
         os.replace(tmp, path)
+        return True
     except Exception as exc:
         console_ui.warn(f"Could not save config: {exc}")
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
 
 
 def _deep_copy(d):
@@ -579,8 +650,32 @@ def parse_schedule_text(text):
 
 
 def load_schedule_file(filepath):
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         return parse_schedule_text(f.read())
+
+
+def unique_path(path):
+    """``path``, or ``name_2.ext`` and on: names come from local time, which repeats an
+    hour when daylight saving ends, and an archived frame must never be overwritten."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{stem}_{n}{ext}"):
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
+def schedule_now():
+    """Interval schedule files hold naive UTC times."""
+    return dt.now(timezone.utc).replace(tzinfo=None)
+
+
+def schedule_to_local(moment):
+    """A schedule time as naive local time, for status files and the dashboard."""
+    if moment is None:
+        return None
+    return moment.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
 
 
 def load_schedule_safe(filepath):
@@ -775,9 +870,15 @@ def _ask_float(prompt, default=0.0):
         return default
 
 
+def _ask_clearable(prompt, default=""):
+    """Enter keeps the current value; "-" clears it."""
+    val = _ask(f"{prompt}, '-' = none", default or "").strip()
+    return "" if val == "-" else val
+
+
 def _ask_optional_int(prompt, default=None):
-    """An empty answer means "let the program work it out", not "keep the default"."""
-    val = _ask(prompt, "" if default is None else str(default)).strip()
+    """Enter keeps the current value; "-" means "let the program work it out"."""
+    val = _ask_clearable(prompt, "" if default is None else str(default))
     if not val:
         return None
     try:
@@ -834,11 +935,11 @@ def configure_console_sptt(cfg, config_path=None):
 
     print("\n  The frame period is a separate register, and one shorter than")
     print("  the exposure truncates the integration instead of slowing the")
-    print("  camera down. Leave it empty and it follows the exposure.")
+    print("  camera down. Answer '-' and it follows the exposure.")
     sptt["period_us"] = _ask_optional_int(
-        "Frame period, us (empty = auto)", sptt.get("period_us"))
+        "Frame period, us (none = auto)", sptt.get("period_us"))
     sptt["trigmode"] = _ask_optional_int(
-        "Trigger mode (empty = 0, continuous)", sptt.get("trigmode"))
+        "Trigger mode (none = 0, continuous)", sptt.get("trigmode"))
 
     sptt["gain"] = _ask_int("Gain (0-1023)", sptt.get("gain", 100))
     sptt["binning"] = _ask_int("Binning (0=1x1, 1=2x2, 3=4x4)", sptt.get("binning", 0))
@@ -1009,9 +1110,9 @@ def configure_console_asi(cfg, config_path=None):
                               asi.get("t_start", "20:00"))
     elif asi["mode"] == "sun_cycle":
         # UTC, so stations in different places and time zones share one phase.
-        asi["t_start"] = _ask("Cycle phase reference T_start, UTC (HH:MM; "
-                              "empty = first whole minute of the window)",
-                              asi.get("t_start", "") or "")
+        asi["t_start"] = _ask_clearable("Cycle phase reference T_start, UTC (HH:MM; "
+                                        "none = first whole minute of the window)",
+                                        asi.get("t_start", "") or "")
     if asi["mode"] in ("time", "sun_cycle"):
         asi["schedule_len"] = _ask_float(
             "Cycle length (s, 0 = derive from the slots)",
@@ -1148,9 +1249,9 @@ def configure_console_japan(cfg, config_path=None):
             japan.get("sun_max_angle", -10.0))
     if japan["mode"] == "sun_cycle":
         # UTC, so stations in different places and time zones share one phase.
-        japan["t_start"] = _ask("Cycle phase reference T_start, UTC (HH:MM; "
-                                "empty = first whole minute of the window)",
-                                japan.get("t_start", "") or "")
+        japan["t_start"] = _ask_clearable("Cycle phase reference T_start, UTC (HH:MM; "
+                                          "none = first whole minute of the window)",
+                                          japan.get("t_start", "") or "")
         period = _ask_float("Cycle period in seconds "
                             "(0 = derive it from the last slot)",
                             float(japan.get("schedule_len") or 0.0))

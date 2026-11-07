@@ -21,6 +21,8 @@ python schedule_generator.py --site GPHO_TK --angle -10 --start 2026-01-01 --day
 python schedule_generator.py --gui
 ```
 
+Время в создаваемом файле — UTC; камеры Canon и Infra читают его как UTC.
+
 ## Параметры
 
 | Параметр | Описание |

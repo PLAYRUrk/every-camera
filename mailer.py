@@ -318,7 +318,9 @@ class Spool:
                 except OSError:
                     pass
                 failed += 1
-                continue
+                # The next letter would most likely wait out the same timeout; this
+                # one backs off, so it does not block the others next pass.
+                break
             _discard(path)
             if quota is not None:
                 quota.count_one()

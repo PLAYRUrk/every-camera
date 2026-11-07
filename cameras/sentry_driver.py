@@ -267,6 +267,7 @@ class SentryWorkerConsole(threading.Thread):
         self._last_shot = None
         self._last_frame = None
         self._last_seqno = -1
+        self._focus_seqno = 0
 
     def request_stop(self):
         self._stop_event.set()
@@ -334,10 +335,11 @@ class SentryWorkerConsole(threading.Thread):
         """imagerd_rt owns schedule and exposure: focus just sees each new daemon frame."""
         if self._service is None or not self._service.focus_active():
             return
+        # Its own counter: the archive's must still see this frame as new.
         seqno = self.cam.get_seqno()
-        if seqno <= 0 or seqno == self._last_seqno:
+        if seqno <= 0 or seqno == self._focus_seqno:
             return
-        self._last_seqno = seqno
+        self._focus_seqno = seqno
         frame = self.cam.get_latest_image()
         if frame is not None:
             self._service.publish_frame(frame, now, self.cam.get_metadata())

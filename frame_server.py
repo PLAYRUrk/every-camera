@@ -11,6 +11,7 @@ Unauthenticated by design: run it on a trusted network, not a public interface.
 import errno
 import json
 import os
+import select
 import socket
 import threading
 import time
@@ -18,6 +19,7 @@ import time
 from datetime import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from urllib.error import HTTPError
 
 import console_ui
 import gateway
@@ -34,7 +36,7 @@ DEFAULT_PORT = 8765
 # config.json, so a busy port is normal.
 DEFAULT_PORT_SEARCH = 20
 DEFAULT_LIST_LIMIT = 200
-MAX_LIST_LIMIT = 2000
+MAX_LIST_LIMIT = 5000
 MAX_MJPEG_CLIENTS = 4
 MJPEG_BOUNDARY = "everycamframe"
 THUMB_MAX_SIDE = 256
@@ -46,7 +48,15 @@ class _FrameHTTPServer(ThreadingHTTPServer):
     kernel would split requests between two unrelated cameras at random.
     """
     allow_reuse_port = False
+    # On Windows SO_REUSEADDR lets a second socket bind a port that is already
+    # listening — the same split; SO_EXCLUSIVEADDRUSE is what keeps it out.
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class _ThumbCache:
@@ -72,11 +82,12 @@ class _ThumbCache:
 
 
 class FrameServer:
-    def __init__(self, httpd, thread, responder, port):
+    def __init__(self, httpd, thread, responder, port, fleet=None):
         self._httpd = httpd
         self._thread = thread
         self._responder = responder
         self.port = port
+        self._fleet = fleet
 
     @property
     def url(self):
@@ -86,6 +97,11 @@ class FrameServer:
         if self._responder is not None:
             try:
                 self._responder.stop()
+            except Exception:
+                pass
+        if self._fleet is not None:
+            try:
+                self._fleet.stop()
             except Exception:
                 pass
         try:
@@ -112,6 +128,9 @@ def _local_ip():
 class _Handler(BaseHTTPRequestHandler):
     server_version = SERVER_VERSION
     protocol_version = "HTTP/1.1"
+    # A client that vanished without closing must not pin a thread, or a stream
+    # slot, forever.
+    timeout = 120
 
     # Injected by start_frame_server
     service = None
@@ -174,13 +193,30 @@ class _Handler(BaseHTTPRequestHandler):
             value = min(maximum, value)
         return value
 
+    def _client_gone(self):
+        """Nothing is written while there is no frame, so a closed socket is only
+        noticed by asking: it reads as end of stream."""
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+            if not ready:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
     def _read_json_body(self):
+        """None for a body that cannot be taken: the connection is then closed, since
+        its unread bytes would be parsed as the next request."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self.close_connection = True
+            return None
+        if length <= 0:
             return {}
-        if length <= 0 or length > 1_000_000:
-            return {}
+        if length > 1_000_000:
+            self.close_connection = True
+            return None
         try:
             raw = self.rfile.read(length)
             data = json.loads(raw.decode("utf-8"))
@@ -282,7 +318,11 @@ class _Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
-            if 0 < length <= 1_000_000:
+            if length > 1_000_000:
+                self.close_connection = True
+                self._error(413, "request body too large")
+                return
+            if length > 0:
                 body = self.rfile.read(length)
 
         try:
@@ -301,6 +341,9 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._error(400, str(exc))
             return
+        except HTTPError as exc:
+            # The node answered: its status and message go through unchanged.
+            upstream = exc
         except Exception as exc:
             self._error(502, f"{target}: {type(exc).__name__}: {exc}")
             return
@@ -309,10 +352,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream_upstream(self, upstream):
         try:
-            self.send_response(upstream.status)
+            self.send_response(getattr(upstream, "status", None) or upstream.code)
             content_type = upstream.headers.get("Content-Type",
                                                 "application/octet-stream")
             self.send_header("Content-Type", content_type)
+            for name, value in upstream.headers.items():
+                lower = name.lower()
+                if (lower.startswith("x-composite-") or lower.startswith("x-frame-")
+                        or lower == "content-disposition"):
+                    self.send_header(name, value)
             length = upstream.headers.get("Content-Length")
             if length:
                 self.send_header("Content-Length", length)
@@ -326,8 +374,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command == "HEAD":
                 return
+            # read1: whatever has arrived, so a live stream is not held back until
+            # 64 KB have piled up.
+            read = getattr(upstream, "read1", None) or upstream.read
             while True:
-                chunk = upstream.read(64 * 1024)
+                chunk = read(64 * 1024)
                 if not chunk:
                     return
                 self.wfile.write(chunk)
@@ -609,7 +660,9 @@ class _Handler(BaseHTTPRequestHandler):
 
             last_counter = -1
             while True:
-                self.service.request_focus(self.focus_ttl)
+                if self._client_gone():
+                    return
+                self.service.request_focus(self.focus_ttl, renew=True)
                 frame, ts, _meta, counter = self.service.wait_for_frame(
                     last_counter, timeout=5.0)
                 if frame is None:
@@ -642,6 +695,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _post_params(self):
         params = self._read_json_body()
+        if params is None:
+            self._error(413, "request body too large or malformed")
+            return
         if not params:
             self._error(400, "expected a JSON object with parameters")
             return
@@ -656,6 +712,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _post_focus(self):
         body = self._read_json_body()
+        if body is None:
+            self._error(413, "request body too large or malformed")
+            return
         if body.get("enabled") is False or body.get("stop"):
             self._send_json(self.service.stop_focus())
             return
@@ -667,6 +726,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(self.service.request_focus(ttl, hold=hold))
 
 
+# WSAEACCES (10013) is what Windows says for a port reserved by the system.
+_PORT_TAKEN_ERRNOS = {errno.EADDRINUSE, errno.EACCES,
+                      getattr(errno, "WSAEACCES", 10013),
+                      getattr(errno, "WSAEADDRINUSE", 10048)}
+
+
 def start_frame_server(server_cfg, service, verbose=False):
     """Returns a handle, or None with a warning on any failure: callers need no
     try/except, since losing the viewer must never stop a measurement run.
@@ -676,18 +741,25 @@ def start_frame_server(server_cfg, service, verbose=False):
         console_ui.log("LAN frame server disabled in config.")
         return None
 
-    wanted_port = int(cfg.get("port", DEFAULT_PORT))
+    try:
+        wanted_port = int(cfg.get("port", DEFAULT_PORT))
+        # 0 means strict: the configured port or nothing.
+        port_search = max(0, int(cfg.get("port_search", DEFAULT_PORT_SEARCH)))
+        max_list = int(cfg.get("max_list", MAX_LIST_LIMIT))
+        focus_ttl = float(cfg.get("focus_ttl", 60))
+    except (TypeError, ValueError) as exc:
+        console_ui.warn(f"LAN frame server not started: bad value in the server "
+                        f"section of the config ({exc}). Measurements continue.")
+        return None
     bind = cfg.get("bind", "0.0.0.0")
-    # 0 means strict: the configured port or nothing.
-    port_search = max(0, int(cfg.get("port_search", DEFAULT_PORT_SEARCH)))
 
     # Makes a single reachable camera a way in to every camera beside it.
     fleet = gateway.Gateway(service)
     handler = type("_BoundHandler", (_Handler,), {
         "service": service,
         "gateway": fleet,
-        "max_list": int(cfg.get("max_list", MAX_LIST_LIMIT)),
-        "focus_ttl": float(cfg.get("focus_ttl", 60)),
+        "max_list": max_list,
+        "focus_ttl": focus_ttl,
         "stream_slots": threading.BoundedSemaphore(MAX_MJPEG_CLIENTS),
         "thumb_cache": _ThumbCache(),
         "verbose": bool(verbose or cfg.get("verbose")),
@@ -703,7 +775,7 @@ def start_frame_server(server_cfg, service, verbose=False):
             break
         except OSError as exc:
             last_exc = exc
-            if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
+            if exc.errno not in _PORT_TAKEN_ERRNOS:
                 break           # a wrong bind address will not fix itself
     if httpd is None:
         console_ui.warn(f"LAN frame server not started on {bind}:{wanted_port}"
@@ -748,7 +820,7 @@ def start_frame_server(server_cfg, service, verbose=False):
 
     console_ui.log(f"LAN frame server: http://{_local_ip()}:{port}/  "
                    f"(archive: {service.output_dir or 'none'})")
-    return FrameServer(httpd, thread, responder, port)
+    return FrameServer(httpd, thread, responder, port, fleet)
 
 
 _INDEX_HTML = """<!doctype html>

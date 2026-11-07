@@ -27,17 +27,28 @@ UPDATEABLE_EXTENSIONS = {
 
 UPDATEABLE_FILES = {
     "requirements.txt",
+    "run.sh",
+    "run.cmd",
+    "env.sh.example",
+    "env.cmd.example",
+    "mail_account.json.example",
 }
 
 UPDATEABLE_DIRS = {
+    "cameras",
     "docs",
     "firmware",
+    "infra_lib",
+    "systemd",
 }
 
 
 def is_config_file(filename):
     if filename in CONFIG_FILES:
         return True
+    # Program code is never station data, whatever its name (schedule_generator.py).
+    if filename.lower().endswith(".py"):
+        return False
     name_lower = filename.lower()
     for pattern in CONFIG_PATTERNS:
         if pattern in name_lower:
@@ -54,7 +65,8 @@ def is_updateable(filepath):
     if len(parts) > 1 and parts[0] in UPDATEABLE_DIRS:
         return True
 
-    if filename in UPDATEABLE_FILES:
+    if len(parts) == 1 and (filename in UPDATEABLE_FILES or (
+            filename.startswith("requirements") and filename.endswith(".txt"))):
         return True
 
     if len(parts) == 1:
@@ -66,10 +78,13 @@ def is_updateable(filepath):
 
 def run_git(*args, capture=True):
     cmd = ["git", "-C", APP_DIR] + list(args)
-    result = subprocess.run(
-        cmd, capture_output=capture, text=True,
-        timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=capture, text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args)} timed out after 60 s")
     if result.returncode != 0:
         error = result.stderr.strip() if capture else ""
         raise RuntimeError(f"git {' '.join(args)} failed: {error}")
@@ -99,11 +114,17 @@ def get_changed_files(remote, branch):
 
     changes = []
     for line in diff_output.splitlines():
-        parts = line.split("\t", 1)
+        parts = line.split("\t")
         if len(parts) < 2:
             continue
-        status, filepath = parts[0], parts[1]
-        changes.append((status, filepath))
+        status = parts[0]
+        if status[:1] in ("R", "C") and len(parts) >= 3:
+            # A rename is the old path removed and the new one added.
+            if status[:1] == "R":
+                changes.append(("D", parts[1]))
+            changes.append(("A", parts[2]))
+            continue
+        changes.append((status, parts[1]))
     return changes
 
 
@@ -169,12 +190,13 @@ def update(dry_run=False, force=False):
     skipped_config = []
     skipped_modified = []
 
+    skipped_other = []
     for status, filepath in changes:
         if not is_updateable(filepath):
-            if not is_config_file(os.path.basename(filepath)):
-                pass
-            else:
+            if is_config_file(os.path.basename(filepath)):
                 skipped_config.append(filepath)
+            else:
+                skipped_other.append(filepath)
             continue
 
         if status.startswith("D"):
@@ -218,6 +240,11 @@ def update(dry_run=False, force=False):
         print(f"\n  Preserved config ({len(skipped_config)}):")
         for f in skipped_config:
             print(f"    * {f}")
+
+    if skipped_other:
+        print(f"\n  Not used on stations, left as they are ({len(skipped_other)}):")
+        for f in skipped_other:
+            print(f"    . {f}")
 
     if skipped_modified:
         print(f"\n  Skipped (local changes, use --force) ({len(skipped_modified)}):")

@@ -2,6 +2,7 @@
 console or GUI, and nothing else. The network is ``monitor_app.py``'s business.
 """
 import os
+import time
 import json
 import glob
 
@@ -68,7 +69,7 @@ def status_display(rec):
     if status in ("running", "waiting") and last_update_str:
         try:
             last_update = dt.fromisoformat(last_update_str)
-            age = (dt.now() - last_update).total_seconds()
+            age = time.time() - last_update.timestamp()
             if age > STALE_THRESHOLD_SECONDS:
                 return "STALE", STATUS_COLORS["stale"]
         except (ValueError, TypeError):

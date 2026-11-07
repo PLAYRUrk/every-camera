@@ -463,23 +463,33 @@ _active = None
 _active_lock = threading.Lock()
 # Extra destinations for log lines. The GUI registers one, so a driver's messages
 # reach its log pane without the driver knowing a GUI exists.
-_sinks = []
+# ``owner`` returns the thread a sink belongs to: with two cameras in one GUI, a
+# line from one camera's worker goes to its own pane only.
+_sinks = {}
 
 
-def add_sink(callback):
-    if callback not in _sinks:
-        _sinks.append(callback)
+def add_sink(callback, owner=None):
+    _sinks[callback] = owner
 
 
 def remove_sink(callback):
-    try:
-        _sinks.remove(callback)
-    except ValueError:
-        pass
+    _sinks.pop(callback, None)
 
 
 def _emit_to_sinks(message, level):
-    for callback in list(_sinks):
+    entries = list(_sinks.items())
+    current = threading.current_thread()
+    owned = {}
+    for callback, owner in entries:
+        try:
+            owned[callback] = owner() if owner is not None else None
+        except Exception:
+            owned[callback] = None
+    claimed_elsewhere = {thread for thread in owned.values() if thread is not None}
+    for callback, _owner in entries:
+        mine = owned.get(callback)
+        if current in claimed_elsewhere and current is not mine:
+            continue
         try:
             callback(message, level)
         except Exception:
@@ -541,7 +551,16 @@ def log(message, level="INFO"):
         return
     _emit_to_sinks(message, level)
     prefix = f"[{level.upper()}] " if level else ""
-    print(f"{prefix}{message}", flush=True)
+    try:
+        print(f"{prefix}{message}", flush=True)
+    except (UnicodeEncodeError, OSError, ValueError):
+        # A redirected stdout in a legacy code page, or none at all (pythonw): the
+        # line must not raise into the measurement that logged it.
+        try:
+            print(f"{prefix}{message}".encode("ascii", "replace").decode("ascii"),
+                  flush=True)
+        except Exception:
+            pass
 
 
 def info(message):

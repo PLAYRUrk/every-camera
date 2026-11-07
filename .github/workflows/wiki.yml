@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write
 
+# Two quick pushes would race for the wiki repository; the later one must win.
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest

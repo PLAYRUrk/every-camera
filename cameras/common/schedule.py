@@ -286,7 +286,7 @@ def load_schedule_file(path, mode, default_binning=1):
     """Returns ``(entries, errors, overrides)``. JSON is told by extension or first
     character.
     """
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         text = fh.read()
     if str(path).lower().endswith(".json") or text.lstrip()[:1] in ("{", "["):
         return parse_schedule_json(text, mode, default_binning)

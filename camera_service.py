@@ -377,7 +377,8 @@ class CameraService:
                 # Also in /api/info so the focus tool can decide before opening a
                 # stream, without a second round trip.
                 "schedule_active": self._schedule_active,
-                "focus_hold": self._focus_hold,
+                "focus_hold": (self._focus_hold
+                               and time.monotonic() < self._focus_deadline),
                 "hold_supported": self.supports_hold,
                 "supports_focus": self.supports_focus,
                 "supports_params": self.supports_params and bool(self._param_schema),
@@ -411,12 +412,13 @@ class CameraService:
             return {"id": req_id, "done": False}
         return None
 
-    def request_focus(self, ttl=DEFAULT_FOCUS_TTL, hold=None):
+    def request_focus(self, ttl=DEFAULT_FOCUS_TTL, hold=None, renew=False):
         """``hold``: True stops measuring, False releases, None only extends the
         deadline.
 
-        The MJPEG endpoint renews the session on every frame and must not turn an
-        operator's hold into an ordinary session.
+        The MJPEG endpoint renews the session on every frame (``renew``) and must not
+        turn an operator's hold into an ordinary session, nor revive a session that
+        was switched off after repeated errors.
         """
         if not self.supports_focus:
             return {"focus_active": False, "supported": False,
@@ -428,9 +430,15 @@ class CameraService:
         ttl = max(1.0, min(ttl, MAX_FOCUS_TTL))
         with self._lock:
             was_measuring = bool(self._schedule_active)
+            if renew and self._focus_disabled_reason:
+                return {"focus_active": False, "supported": True,
+                        "hold": False, "hold_supported": self.supports_hold,
+                        "was_measuring": was_measuring,
+                        "schedule_active": self._schedule_active}
             self._focus_deadline = time.monotonic() + ttl
-            self._focus_errors = 0
-            self._focus_disabled_reason = ""
+            if not renew:
+                self._focus_errors = 0
+                self._focus_disabled_reason = ""
             if hold is not None:
                 self._focus_hold = bool(hold) and self.supports_hold
                 if not hold:

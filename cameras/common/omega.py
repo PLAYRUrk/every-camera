@@ -9,6 +9,7 @@ measurement loop nothing.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 from time import monotonic
@@ -121,8 +122,8 @@ class OmegaLink:
         # Imported here so the observer tools and the simulator need no pyserial.
         import serial
 
-        self._ser = serial.Serial(
-            self.port, baudrate=self._baudrate, bytesize=7, parity="O",
+        self._ser = open_serial(
+            serial, self.port, baudrate=self._baudrate, bytesize=7, parity="O",
             stopbits=1, timeout=0.05)
 
     def close(self) -> None:
@@ -163,12 +164,31 @@ def usb_serial_ports():
     return [p.device for p in list_ports.comports() if p.vid is not None]
 
 
+def same_port(name: str) -> str:
+    """One spelling per device: /dev/serial/by-id links resolved, COM3 == com3."""
+    if os.name == "nt":
+        return str(name).upper()
+    return os.path.realpath(str(name))
+
+
+def open_serial(serial, port, **kwargs):
+    """Exclusive on POSIX, as COM ports always are on Windows: a probe for the Omega
+    must not reconfigure a port a filter wheel, here or in another process, holds."""
+    if os.name != "nt":
+        try:
+            return serial.Serial(port, exclusive=True, **kwargs)
+        except TypeError:
+            pass        # pyserial older than 3.3
+    return serial.Serial(port, **kwargs)
+
+
 def find_port(exclude=(), baudrate: int = 9600) -> str | None:
     """The USB-serial port with an Omega on it. The wheel's port is never touched: it
     runs 8N1 and a stray command there could move it.
     """
+    excluded = {same_port(p) for p in exclude if p}
     for port in usb_serial_ports():
-        if port in exclude:
+        if same_port(port) in excluded:
             continue
         try:
             with OmegaLink(port, baudrate) as link:

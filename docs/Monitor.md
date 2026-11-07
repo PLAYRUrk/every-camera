@@ -7,7 +7,6 @@ python monitor_app.py                         # найти камеры в ло�
 python monitor_app.py --host 192.168.1.5      # добавить камеру, которой нет в обнаружении
 python monitor_app.py --interval 5            # период опроса статусов, секунд
 python monitor_app.py --via 192.168.1.5:8765  # и всё, что знает эта камера
-python monitor_app.py --config /path/to.json  # другой файл конфигурации
 ```
 
 `--host` можно указывать несколько раз.

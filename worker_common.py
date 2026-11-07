@@ -7,6 +7,7 @@ monitor on the same machine.
 import json
 import os
 import signal
+import threading
 import time
 
 from datetime import datetime as dt
@@ -117,6 +118,14 @@ class WorkerBus:
 
     def prepare_status_dir(self):
         os.makedirs(self.status_dir, exist_ok=True)
+        # Markers are keyed by PID; one left by an earlier process with this PID would
+        # make the sentinel misread this worker's end.
+        key = alerts.marker_key(self.status_path)
+        for directory in (alerts.EXIT_DIR, alerts.CRASH_DIR):
+            try:
+                os.remove(os.path.join(directory, f"{key}.json"))
+            except OSError:
+                pass
         removed = cleanup_stale_status_files(self.status_dir)
         if removed:
             console_ui.log(f"Removed {removed} stale status file(s) from "
@@ -156,14 +165,18 @@ class WorkerBus:
         except Exception:
             pass
 
-    def shutdown(self, reason="stopped normally"):
+    def shutdown(self, reason="stopped normally", failed=None):
         """The clean-exit marker goes down *before* the status file goes away.
 
         The sentinel reads a status file with a dead process behind it as a crash, and
         without the marker every orderly stop would wake somebody up for nothing.
+        ``failed`` (a reason) means the worker gave up: that is reported as a crash.
         """
         try:
-            alerts.note_clean_exit(self.status_path, reason)
+            if failed:
+                alerts.note_crash(self.status_path, str(failed))
+            else:
+                alerts.note_clean_exit(self.status_path, reason)
         except Exception:
             pass
         try:
@@ -172,6 +185,7 @@ class WorkerBus:
             pass
         except OSError:
             pass
+        _shutdown_done.set()
 
 
 # Kept alive for the life of the process: ``SetConsoleCtrlHandler`` stores the
@@ -181,6 +195,10 @@ _console_ctrl_handler = None
 # Windows console events meaning "this process is going away". CTRL_C and CTRL_BREAK
 # arrive as signals; these three do not.
 _WINDOWS_CLOSE_EVENTS = (2, 5, 6)      # CTRL_CLOSE, CTRL_LOGOFF, CTRL_SHUTDOWN
+# Windows ends the process as soon as the console callback returns, so the callback
+# waits for the worker's shutdown, within the roughly five seconds it is given.
+_shutdown_done = threading.Event()
+_CONSOLE_CLOSE_GRACE = 4.5
 
 
 def _install_windows_console_handler(handler):
@@ -201,6 +219,7 @@ def _install_windows_console_handler(handler):
     def on_console_event(event):
         if event in _WINDOWS_CLOSE_EVENTS:
             handler(signal.SIGTERM, None)
+            _shutdown_done.wait(_CONSOLE_CLOSE_GRACE)
             return 1
         return 0
 

@@ -16,7 +16,7 @@ import console_ui
 
 import numpy as np
 
-from datetime import datetime as dt, timezone
+from datetime import datetime as dt, timedelta, timezone
 from pathlib import Path
 
 import frame_archive
@@ -24,7 +24,8 @@ import intensity
 
 from utils import (
     load_schedule_safe, claim_instance_name, get_instance_name,
-    get_local_ip, get_system_info, APP_DIR,
+    get_local_ip, get_system_info, APP_DIR, schedule_now, schedule_to_local,
+    unique_path,
 )
 from worker_common import (
     WorkerBus, publish_current_params,
@@ -496,6 +497,10 @@ class TanhoCamera:
         self._roi_width = width
         self._roi_height = height
         self._allocate_buffer()
+        # The ROI command resets the exposure and gain registers; what exposure_us and
+        # gain report must stay what the camera holds.
+        self.set_exposure(self._exposure_us)
+        self.set_gain(self._gain)
 
     def _execute_raw_cmd(self, data):
         buf = (ctypes.c_ubyte * CMD_PACKET_SIZE)(*data[:CMD_PACKET_SIZE])
@@ -600,14 +605,16 @@ class _CameraStreamThread(threading.Thread):
 
 
 def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
-              stack_n=1, sub_exposure_us=None):
-    """Supports uint16 and stacked uint32 frames."""
+              stack_n=1, sub_exposure_us=None, date_obs=None):
+    """Supports uint16 and stacked uint32 frames. ``date_obs``: aware start of exposure."""
     from astropy.io import fits
     hdu = fits.PrimaryHDU(data=frame)
     hdr = hdu.header
     hdr['INSTRUME'] = ('THCAMSW1300', 'Camera model')
     hdr['SENSOR'] = ('IMX990-AABA-C', 'Sensor model')
-    hdr['DATE-OBS'] = (dt.now(timezone.utc).isoformat(), 'Observation date (UTC)')
+    start = date_obs or dt.now(timezone.utc)
+    hdr['DATE-OBS'] = (start.astimezone(timezone.utc).isoformat(),
+                       'Exposure start (UTC)')
     hdr['ADCFULL'] = (intensity.FULL_SCALE, '[ADU] intensity full scale')
     if exposure_us is not None:
         hdr['EXPTIME'] = (exposure_us / 1e6, 'Total integration time (seconds)')
@@ -682,6 +689,9 @@ class InfraWorkerConsole(threading.Thread):
         self._bus = WorkerBus("infra", instance_name, status_dir,
                               service=service, node_name=node_name)
         self._stop_event = threading.Event()
+        self._focus_published_ts = None
+        self._params_changed_at = None
+        self.failed = None
         self._shots = 0
         self._errors = 0
         self._last_shot = None
@@ -740,32 +750,6 @@ class InfraWorkerConsole(threading.Thread):
             stream.resume()
         return applied, errors
 
-    def _resync_camera(self, skip_frames: int = None):
-        """Discard frames after a config change, so the next has the new exposure/gain/ROI."""
-        t0 = time.perf_counter()
-        exp_s = self.cam.exposure_us / 1e6
-        # Capped so a 60 s exposure does not block the worker for a minute. One flushed
-        # frame is enough to clear the pipe.
-        settle_s = max(0.15, min(exp_s + 0.1, 1.0))
-        if skip_frames is None:
-            skip_frames = 3 if exp_s < 1.0 else 1
-        time.sleep(settle_s)
-        try:
-            self.cam._flush_usb()
-        except Exception as e:
-            console_ui.log(f"resync flush error: {e}")
-        discarded = 0
-        for i in range(skip_frames):
-            try:
-                self.cam.grab_frame(verbose_timing=False)
-                discarded += 1
-            except Exception as e:
-                console_ui.log(f"resync skip-frame {i} error: {e}")
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        console_ui.log(f"resync done: settle={settle_s*1000:.0f}ms, "
-                       f"discarded={discarded}/{skip_frames}, total={dt_ms:.0f}ms "
-                       f"(exposure={self.cam.exposure_us/1000:.1f}ms)")
-
     def _current_params(self):
         return {
             "exposure_us": self.cam.exposure_us,
@@ -788,10 +772,14 @@ class InfraWorkerConsole(threading.Thread):
         req_id, params = self._service.take_param_request()
         if params:
             applied, errors = self._apply_params(params, stream)
+            self._params_changed_at = dt.now()
             self._service.complete_param_request(req_id, applied, errors)
             self._service.set_current_params(self._current_params())
         frame, frame_ts = stream.get_latest_frame()
-        if frame is not None:
+        # This runs ten times a second; republishing the same frame would throw away
+        # every client's JPEG and make it encode again.
+        if frame is not None and frame_ts != self._focus_published_ts:
+            self._focus_published_ts = frame_ts
             self._service.publish_frame(frame, frame_ts or now)
 
     def run(self):
@@ -801,8 +789,9 @@ class InfraWorkerConsole(threading.Thread):
         if self._service is not None:
             self._service.set_current_params(self._current_params())
 
-        exp_s = self.cam.exposure_us / 1e6
-        frame_timeout = max(exp_s * 2 + 10.0, 30.0)
+        def frame_timeout():
+            # Read each time: focus_app can change the exposure mid-run.
+            return max(self.cam.exposure_us / 1e6 * 2 + 10.0, 30.0)
 
         # Continuous capture keeps the FX3 FIFO clean, as in preview mode.
         stream = _CameraStreamThread(self.cam)
@@ -822,11 +811,12 @@ class InfraWorkerConsole(threading.Thread):
             try:
 
                 now = dt.now()
+                now_utc = schedule_now()
 
                 active_end = None
                 for entry in self.schedule:
-                    if entry.start <= now <= entry.end:
-                        active_end = entry.end
+                    if entry.start <= now_utc <= entry.end:
+                        active_end = schedule_to_local(entry.end)
                         break
 
                 holding = self._focus_holding()
@@ -854,7 +844,7 @@ class InfraWorkerConsole(threading.Thread):
                 fire_key = (now.minute, now.second)
                 if now.second in self.capture_seconds and fire_key != last_fired:
                     last_fired = fire_key
-                    ok = self._capture_one_stream(now, stream, frame_timeout)
+                    ok = self._capture_one_stream(now, stream, frame_timeout())
                     if ok:
                         consecutive_errors = 0
                         self._shots += 1
@@ -865,7 +855,8 @@ class InfraWorkerConsole(threading.Thread):
                         self._errors += 1
                         self._save_status("error", force=True)
                         if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                            console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
+                            self.failed = f"{consecutive_errors} consecutive errors"
+                            console_ui.error(f"{self.failed}, stopping")
                             break
                 elif now.second not in self.capture_seconds:
                     last_fired = (-1, -1)
@@ -877,9 +868,9 @@ class InfraWorkerConsole(threading.Thread):
                 self._stop_event.wait(0.5)
 
         stream.stop()
-        stream.join(timeout=frame_timeout)
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
+        stream.join(timeout=frame_timeout())
+        self._save_status("error" if self.failed else "stopped", force=True)
+        self._bus.shutdown(failed=self.failed)
         console_ui.log("Infra camera measurement stopped")
 
     def _capture_one_stream(self, now, stream: "_CameraStreamThread",
@@ -891,13 +882,20 @@ class InfraWorkerConsole(threading.Thread):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
         ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
         ext = ext_map.get(self.save_format, "tiff")
-        filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
+        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.{ext}"))
 
         console_ui.log(f"=== scheduled capture {timestamp} — "
                        f"waiting for frame (timeout={timeout:.0f}s) ===")
         t0 = time.perf_counter()
         frame, frame_ts = stream.wait_for_frame(timeout=timeout,
                                                 stop_event=self._stop_event)
+        changed = self._params_changed_at
+        if (frame is not None and frame_ts is not None and changed is not None
+                and frame_ts - timedelta(microseconds=self.cam.exposure_us) < changed):
+            # Integrated partly under the settings before the change: its header
+            # would describe a different exposure.
+            frame, frame_ts = stream.wait_for_frame(timeout=timeout,
+                                                    stop_event=self._stop_event)
         wait_ms = (time.perf_counter() - t0) * 1000.0
 
         if frame is None:
@@ -909,10 +907,15 @@ class InfraWorkerConsole(threading.Thread):
                        f"frame_ts={frame_ts.isoformat()}")
         try:
             if self.save_format == "fits":
+                # frame_ts marks the end of the readout, local and naive.
+                started = (frame_ts.astimezone(timezone.utc)
+                           - timedelta(microseconds=self.cam.exposure_us)
+                           if frame_ts else None)
                 save_fits(filepath, frame,
                           exposure_us=self.cam.exposure_us,
                           gain=self.cam.gain,
-                          roi=f"{self.cam.roi_width}x{self.cam.roi_height}")
+                          roi=f"{self.cam.roi_width}x{self.cam.roi_height}",
+                          date_obs=started)
             elif self.save_format == "tiff":
                 save_tiff(filepath, frame)
             else:
@@ -1185,3 +1188,5 @@ def _run_console_infra(cfg, infra_cfg, config_path, preview, dash,
         cam.disconnect()
         if server:
             server.stop()
+    if worker.failed:
+        sys.exit(1)

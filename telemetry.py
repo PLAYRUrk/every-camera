@@ -63,16 +63,21 @@ class TelemetryLog:
             self._day = day
             self._part = 1
             self._columns = None
+        carried = set()
         while True:
             if self._columns is None:
                 path = self._path()
                 self._columns = (self._existing_columns(path)
                                  if path.exists() else None)
             if self._columns is None:
-                self._columns = ["time_utc"] + sorted(row)
+                # The union, so two field sets that alternate settle in one part
+                # instead of opening a new one at every switch.
+                self._columns = ["time_utc"] + sorted((carried | set(row))
+                                                      - {"time_utc"})
                 return True
             if set(row) <= set(self._columns):
                 return False
+            carried |= set(self._columns)
             self._part += 1
             self._columns = None
 

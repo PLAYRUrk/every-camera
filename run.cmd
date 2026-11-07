@@ -24,17 +24,18 @@ if not exist "%PYTHON%" goto :nopython
 
 set "TARGET=%APP_DIR%\main.py"
 set "ARGS=%*"
-if /I "%~1"=="--sentinel" (
-    set "TARGET=%APP_DIR%\sentinel.py"
-    shift
-    set "ARGS="
-    :shift_loop
-    if not "%~1"=="" (
-        set "ARGS=!ARGS! %1"
-        shift
-        goto :shift_loop
-    )
-)
+rem Outside any ( ) block: cmd expands %1 there once, before shift runs.
+if /I not "%~1"=="--sentinel" goto :run
+set "TARGET=%APP_DIR%\sentinel.py"
+set "ARGS="
+shift
+:shift_loop
+if "%~1"=="" goto :run
+set "ARGS=!ARGS! %1"
+shift
+goto :shift_loop
+
+:run
 
 rem cmd.exe has no exec, so this wrapper stays as the parent. Ctrl+C and
 rem Ctrl+Break reach both processes, but closing the window gives the tree only

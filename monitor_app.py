@@ -175,7 +175,8 @@ def main():
     parser.add_argument("--via", default="",
                         metavar="HOST[:PORT]",
                         help="Ask this camera for every camera it knows")
-    parser.add_argument("--config", default=None, help="Path to config.json")
+    # Accepted so old shortcuts keep starting; the monitor reads no config.
+    parser.add_argument("--config", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     from utils import can_use_gui
@@ -198,6 +199,8 @@ def main():
     from PyQt5.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
+    import qt_support
+    qt_support.install_excepthook()
     app.setStyle("Fusion")
     window = MonitorWindow(interval_ms=max(1000, int(args.interval * 1000)))
     for entry in args.host:

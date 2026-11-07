@@ -24,7 +24,8 @@ Usage: sudo $0 <camera-type> [--user NAME] [--python PATH] [--config-dir DIR]
                  with a label for a second camera of a type: sptt-north
   --user NAME    whose home receives the logs and status files
                  (default: the user invoking sudo)
-  --python PATH  interpreter to run (default: the first python3 on PATH)
+  --python PATH  interpreter to run (default: run.sh chooses — env.sh, then
+                 venv/ or .venv/, then python3 on PATH)
   --config-dir   where the service's config lives (default: $CONFIG_DIR)
   --dry-run      print the unit that would be written and change nothing
   --uninstall    stop and disable the service and remove the unit file
@@ -84,24 +85,33 @@ OWNER="${OWNER:-${SUDO_USER:-}}"
 USER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 [[ -n "$USER_HOME" ]] || die "no such user: $OWNER"
 
-PYTHON="${PYTHON:-$(command -v python3 || true)}"
-[[ -x "$PYTHON" ]] || die "python3 not found — pass --python /path/to/python3"
+# Recorded only when given: a value here overrides run.sh's own choice, and sudo's
+# python3 is the system one (3.6 on CentOS 7), not the venv's.
+if [[ -n "$PYTHON" ]]; then
+    [[ -x "$PYTHON" ]] || die "not executable: $PYTHON"
+elif [[ ! -x "$APP_DIR/venv/bin/python" && ! -x "$APP_DIR/.venv/bin/python" \
+        && ! -f "$APP_DIR/env.sh" ]]; then
+    command -v python3 >/dev/null || die "python3 not found — pass --python /path/to/python3"
+fi
+
+render() {
+    local drop_python=()
+    [[ -n "$PYTHON" ]] || drop_python=(-e "/^Environment=PYTHON=@PYTHON@\$/d")
+    sed "${drop_python[@]}" \
+        -e "s|@APP_DIR@|$APP_DIR|g" \
+        -e "s|@PYTHON@|$PYTHON|g" \
+        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
+        -e "s|@USER_HOME@|$USER_HOME|g" \
+        "$1"
+}
 
 TARGET_CONFIG="$CONFIG_DIR/$CAMERA.json"
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "--- would write $UNIT_DIR/every-camera@.service ---"
-    sed -e "s|@APP_DIR@|$APP_DIR|g" \
-        -e "s|@PYTHON@|$PYTHON|g" \
-        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-        -e "s|@USER_HOME@|$USER_HOME|g" \
-        "$TEMPLATE"
+    render "$TEMPLATE"
     echo "--- would use config $TARGET_CONFIG (copied from $APP_DIR/config.json if absent) ---"
     echo "--- would write $UNIT_DIR/every-camera-sentinel.service ---"
-    sed -e "s|@APP_DIR@|$APP_DIR|g" \
-        -e "s|@PYTHON@|$PYTHON|g" \
-        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-        -e "s|@USER_HOME@|$USER_HOME|g" \
-        "$SENTINEL_TEMPLATE"
+    render "$SENTINEL_TEMPLATE"
     if [[ "${CAMERA%%-*}" == sptt ]]; then
         echo "--- would copy $APP_DIR/systemd/99-every-camera-sptt.rules to /etc/udev/rules.d/ and reload udev ---"
     fi
@@ -123,11 +133,7 @@ python3 main.py --type $CAMERA --setup"
 fi
 
 UNIT="$UNIT_DIR/every-camera@.service"
-sed -e "s|@APP_DIR@|$APP_DIR|g" \
-    -e "s|@PYTHON@|$PYTHON|g" \
-    -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-    -e "s|@USER_HOME@|$USER_HOME|g" \
-    "$TEMPLATE" > "$UNIT"
+render "$TEMPLATE" > "$UNIT"
 chmod 644 "$UNIT"
 chmod +x "$APP_DIR/run.sh"
 echo "installed $UNIT"
@@ -135,11 +141,7 @@ echo "installed $UNIT"
 # Rewritten every time, so an upgrade cannot leave the wrong interpreter.
 if [[ -f "$SENTINEL_TEMPLATE" ]]; then
     SENTINEL_UNIT="$UNIT_DIR/every-camera-sentinel.service"
-    sed -e "s|@APP_DIR@|$APP_DIR|g" \
-        -e "s|@PYTHON@|$PYTHON|g" \
-        -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-        -e "s|@USER_HOME@|$USER_HOME|g" \
-        "$SENTINEL_TEMPLATE" > "$SENTINEL_UNIT"
+    render "$SENTINEL_TEMPLATE" > "$SENTINEL_UNIT"
     chmod 644 "$SENTINEL_UNIT"
     echo "installed $SENTINEL_UNIT"
 fi
@@ -180,7 +182,7 @@ To make it send anything, two things are needed on this machine:
      $APP_DIR/mail_account.json.example to
      $USER_HOME/.every_camera/mail_account.json
 
-Check it with:  $PYTHON $APP_DIR/sentinel.py --once
+Check it with:  $APP_DIR/run.sh --sentinel --config-dir $CONFIG_DIR --once
 
 Config:  $TARGET_CONFIG
 Logs:    $USER_HOME/.every_camera/logs/

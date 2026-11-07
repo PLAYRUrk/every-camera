@@ -9,8 +9,12 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
 
 if [[ -f "$APP_DIR/env.sh" ]]; then
+    # Vendor scripts sourced from env.sh (Pleora, conda) read unset variables and
+    # run commands that fail; under -eu that would stop the launcher.
+    set +eu
     # shellcheck disable=SC1091
     source "$APP_DIR/env.sh"
+    set -eu
 fi
 
 if [[ -z "${PYTHON:-}" ]]; then

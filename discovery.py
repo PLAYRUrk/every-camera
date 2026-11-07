@@ -35,7 +35,10 @@ ANNOUNCE = b"EVERYCAM_HELLO "
 # Known within the minute, at one datagram per camera per minute.
 ANNOUNCE_EVERY = 60.0
 SERVICE_TAG = "every-camera"
-MAX_REPLY_BYTES = 8192
+# A description with its parameter list and schedule runs past a few KB; UDP carries
+# up to about 64 KB.
+MAX_REPLY_BYTES = 60000
+_RECV_BYTES = 65535
 
 
 class DiscoveryResponder(threading.Thread):
@@ -101,22 +104,37 @@ class DiscoveryResponder(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                data, addr = self._sock.recvfrom(1024)
+                data, addr = self._sock.recvfrom(_RECV_BYTES)
             except socket.timeout:
                 continue
             except OSError:
-                break
+                # Windows reports an ICMP "port unreachable" from an earlier reply
+                # here; only a stop ends the listener.
+                if self._stop.is_set():
+                    break
+                self._stop.wait(0.2)
+                continue
             if data.startswith(ANNOUNCE):
                 self._note_announcement(data[len(ANNOUNCE):], addr)
                 continue
             if not data.startswith(PROBE):
                 continue
             payload = self._describe()
+            if payload and len(payload) > MAX_REPLY_BYTES:
+                self._warn_too_large(len(payload))
+                continue
             try:
-                if payload and len(payload) <= MAX_REPLY_BYTES:
+                if payload:
                     self._sock.sendto(payload, addr)
             except Exception:
                 continue
+
+    def _warn_too_large(self, size):
+        if getattr(self, "_warned_size", False):
+            return
+        self._warned_size = True
+        console_ui.warn(f"Discovery: this camera's description is {size} bytes, over "
+                        f"the {MAX_REPLY_BYTES}-byte limit — it is not announced")
 
     def _describe(self):
         try:
@@ -159,7 +177,9 @@ class DiscoveryResponder(threading.Thread):
             return
         while True:
             payload = self._describe()
-            if payload and len(payload) <= MAX_REPLY_BYTES:
+            if payload and len(payload) > MAX_REPLY_BYTES:
+                self._warn_too_large(len(payload))
+            elif payload:
                 for target in [self._group] + _broadcast_addresses():
                     try:
                         self._sock.sendto(ANNOUNCE + payload,
@@ -255,11 +275,12 @@ def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None,
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                data, addr = sock.recvfrom(MAX_REPLY_BYTES)
+                data, addr = sock.recvfrom(_RECV_BYTES)
             except socket.timeout:
                 continue
             except OSError:
-                break
+                # Windows: an unreachable probe target surfaces here (WSAECONNRESET).
+                continue
             try:
                 info = json.loads(data.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):

@@ -13,7 +13,7 @@ WorkingDirectory=@APP_DIR@
 
 # run.sh picks the cameras' interpreter: `python3` on CentOS 7 is 3.6.
 # No --config: it reads the cameras' configs, so the addresses cannot disagree.
-ExecStart=@APP_DIR@/run.sh --sentinel
+ExecStart=@APP_DIR@/run.sh --sentinel --config-dir @CONFIG_DIR@
 Environment=PYTHON=@PYTHON@
 Environment=PYTHONUNBUFFERED=1
 

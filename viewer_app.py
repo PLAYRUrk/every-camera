@@ -762,7 +762,20 @@ class LanPanel(QWidget):
         # The previous frame stays on screen for a moment; its header must not, or the
         # two read as one frame.
         self._clear_stats()
-        self._tasks.run(self._client.info, self._on_info, self._on_error)
+        client = self._client
+        self._tasks.run(client.info, self._for(client, self._on_info), self._on_error)
+
+    def _for(self, client, callback, name=False):
+        """Each request runs on its own thread, so answers can arrive out of order: one
+        meant for an earlier camera, or frame, is dropped. ``name``: the frame it is
+        for (None is the latest frame)."""
+        def deliver(*args):
+            if client is not self._client:
+                return
+            if name is not False and name != self._current_name:
+                return
+            callback(*args)
+        return deliver
 
     def _remember(self, host, port):
         recent = [tuple(x) for x in self._settings.get("recent_hosts", [])]
@@ -788,7 +801,8 @@ class LanPanel(QWidget):
             # The current mode does not decide the grouping (a directory can hold nights of
             # both), but a disagreement is worth saying.
             client = self._client
-            self._tasks.run(client.status, self._on_status, lambda msg: None)
+            self._tasks.run(client.status, self._for(client, self._on_status),
+                            lambda msg: None)
         self._reload_all()
         if info.get("archive_available"):
             self._list_timer.start()
@@ -803,7 +817,7 @@ class LanPanel(QWidget):
         if not self._client:
             return
         client = self._client
-        self._tasks.run(client.dates, self._on_dates, self._on_error)
+        self._tasks.run(client.dates, self._for(client, self._on_dates), self._on_error)
 
     def _on_dates(self, dates):
         current = self.cmb_date.currentData()
@@ -823,7 +837,7 @@ class LanPanel(QWidget):
         client = self._client
         date = self.cmb_date.currentData()
         self._tasks.run(lambda: client.frames(date=date, limit=ARCHIVE_LIMIT),
-                        self._on_frames, self._on_error)
+                        self._for(client, self._on_frames), self._on_error)
 
     def _on_frames(self, listing):
         self._frames = listing.get("frames", [])
@@ -1180,10 +1194,12 @@ class LanPanel(QWidget):
         stretch = self.cmb_stretch.currentData()
         self.view.show_message(f"Loading {name}…")
         self._tasks.run(lambda: client.frame_jpeg(name, stretch=stretch),
-                        lambda data: self._show_frame(data, name),
+                        self._for(client, lambda data: self._show_frame(data, name),
+                                  name=name),
                         self._on_error)
         self._tasks.run(lambda: client.frame_stats(name),
-                        lambda payload: self._show_stats(payload, name),
+                        self._for(client, lambda payload: self._show_stats(payload, name),
+                                  name=name),
                         lambda msg: None)
 
     def _show_frame(self, data, name):
@@ -1205,9 +1221,10 @@ class LanPanel(QWidget):
         self._current_name = None
         self.btn_save.setEnabled(False)
         self._tasks.run(lambda: client.latest_jpeg(stretch=stretch),
-                        self._on_latest, self._on_error)
+                        self._for(client, self._on_latest, name=None), self._on_error)
         # Without this the panel keeps describing the last archived frame, which looks current.
-        self._tasks.run(client.frame_stats, self._show_stats,
+        self._tasks.run(client.frame_stats,
+                        self._for(client, self._show_stats, name=None),
                         lambda msg: None)
 
     def _on_latest(self, result):
@@ -1302,6 +1319,8 @@ def main():
     settings = load_settings()
 
     app = QApplication(sys.argv)
+    import qt_support
+    qt_support.install_excepthook()
     app.setStyle("Fusion")
     window = ViewerWindow(settings)
     window.show()

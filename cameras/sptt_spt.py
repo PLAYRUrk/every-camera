@@ -39,8 +39,10 @@ def parse_spt(data):
         if data[pos:pos + 4] != MAGIC:
             raise ValueError(f"Not an SPT record at offset {pos}")
         length, header = struct.unpack_from("<IH", data, pos + 4)
-        if length < header or pos + length > len(data):
-            raise ValueError(f"Truncated SPT record at offset {pos}")
+        # The fields below are read from the first 22 bytes; a shorter header, or a
+        # zero length, would loop here forever.
+        if header < 22 or length < header or pos + length > len(data):
+            raise ValueError(f"Malformed SPT record at offset {pos}")
         kind, request = data[pos + 15], data[pos + 16]
         value, index = struct.unpack_from("<HH", data, pos + 18)
         records.append(Record(kind, request, value, index,

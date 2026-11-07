@@ -28,13 +28,57 @@ from utils import (
     load_config, save_config, can_use_gui, get_instance_name,
     claim_instance_name,
     parse_schedule_text, load_schedule_file, save_schedule_file,
+    load_schedule_safe,
     write_status_file, get_system_info,
-    SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR,
+    SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR, schedule_now, schedule_to_local,
+    unique_path,
 )
 from monitor import MonitorWidget
 from worker_common import (
     WorkerBus, publish_current_params, run_focus_iteration,
 )
+
+
+# Closing the window waits this long for an exposure in progress to end.
+WORKER_CLOSE_WAIT = 120
+
+
+def _make_dirs(parent, *dirs):
+    """False, having told the operator, if a directory cannot be created."""
+    for directory in dirs:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(parent, "Directory", f"Cannot create {directory}:\n{exc}")
+            return False
+    return True
+
+
+def _reload_section(cfg, name):
+    """setup_app may have changed the file since the GUI read it; Start uses that."""
+    path = getattr(cfg, "source_path", None)
+    if not path or getattr(cfg, "load_error", None):
+        return
+    fresh = load_config(path)
+    if not fresh.load_error and isinstance(fresh.get(name), dict):
+        cfg[name] = fresh[name]
+
+
+def _set_nested(target, updates):
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _set_nested(target[key], value)
+        else:
+            target[key] = value
+
+
+def _fill_schedule_table(table, entries):
+    table.setRowCount(0)
+    for e in entries:
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(e.start.strftime(SCHEDULE_DT_FMT)))
+        table.setItem(row, 1, QTableWidgetItem(e.end.strftime(SCHEDULE_DT_FMT)))
 
 
 def _release_claim(tab):
@@ -147,11 +191,12 @@ class CannonWorkerQt(QThread):
 
         while not self._stop:
             now = dt.now()
+            now_utc = schedule_now()
 
             active_end = None
             for entry in self.schedule:
-                if entry.start <= now <= entry.end:
-                    active_end = entry.end
+                if entry.start <= now_utc <= entry.end:
+                    active_end = schedule_to_local(entry.end)
                     break
 
             if active_end is None:
@@ -176,7 +221,7 @@ class CannonWorkerQt(QThread):
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
-                filepath = os.path.join(self.output_dir, f"{timestamp}.jpeg")
+                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.jpeg"))
                 try:
                     img_data = capture_image(self.cam)
                     with open(filepath, "wb") as f:
@@ -346,8 +391,8 @@ class CannonTab(QWidget):
         sched_box = QGroupBox("Measurement Schedule")
         sched_lay = QVBoxLayout(sched_box)
         self.sched_table = QTableWidget(0, 2)
-        self.sched_table.setHorizontalHeaderLabels(["Start (YYYY-MM-DD HH:MM:SS)",
-                                                     "End (YYYY-MM-DD HH:MM:SS)"])
+        self.sched_table.setHorizontalHeaderLabels(["Start UTC (YYYY-MM-DD HH:MM:SS)",
+                                                     "End UTC (YYYY-MM-DD HH:MM:SS)"])
         self.sched_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.sched_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         sched_lay.addWidget(self.sched_table, 1)
@@ -406,6 +451,22 @@ class CannonTab(QWidget):
         self.le_output.setText(c.get("output_dir", ""))
         secs = c.get("capture_seconds", [0, 30])
         self.le_cap_seconds.setText(", ".join(str(s) for s in secs))
+        self._load_configured_schedule(c)
+
+    def _load_configured_schedule(self, section):
+        if not str(section.get("schedule_file") or "").strip():
+            return
+        entries, errors, reason = load_schedule_safe(section["schedule_file"])
+        if reason:
+            self._log(f"Schedule: {reason}", "warn")
+        _fill_schedule_table(self.sched_table, entries)
+
+    def config_updates(self):
+        updates = {"output_dir": self.le_output.text().strip()}
+        secs = self._parse_capture_seconds()
+        if secs:
+            updates["capture_seconds"] = secs
+        return {"cannon": updates}
 
     def _browse_dir(self, line_edit):
         d = QFileDialog.getExistingDirectory(self, "Select directory")
@@ -416,9 +477,9 @@ class CannonTab(QWidget):
         text = self.le_cap_seconds.text()
         try:
             secs = [int(s.strip()) for s in text.split(",") if s.strip()]
-            return [s for s in secs if 0 <= s < 60]
+            return sorted({s for s in secs if 0 <= s < 60})
         except ValueError:
-            return [0, 30]
+            return []
 
     def _on_connect(self):
         self.btn_connect.setEnabled(False)
@@ -459,7 +520,7 @@ class CannonTab(QWidget):
     def _add_schedule_row(self):
         row = self.sched_table.rowCount()
         self.sched_table.insertRow(row)
-        now = dt.now().replace(second=0, microsecond=0)
+        now = schedule_now().replace(second=0, microsecond=0)
         end = now.replace(hour=23, minute=59)
         self.sched_table.setItem(row, 0, QTableWidgetItem(now.strftime(SCHEDULE_DT_FMT)))
         self.sched_table.setItem(row, 1, QTableWidgetItem(end.strftime(SCHEDULE_DT_FMT)))
@@ -519,8 +580,8 @@ class CannonTab(QWidget):
             QMessageBox.warning(self, "Schedule errors", "\n".join(errors))
             return
 
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(status_dir, exist_ok=True)
+        if not _make_dirs(self, output_dir, status_dir):
+            return
 
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("Cannon", self._cfg))
@@ -530,6 +591,11 @@ class CannonTab(QWidget):
             self._log("Schedule is empty — starting in setup mode: live frames "
                       "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
+        if not capture_seconds:
+            QMessageBox.warning(self, "Capture seconds",
+                                "Give at least one second of the minute, 0..59.")
+            _release_claim(self)
+            return
         self._service, self._server = _start_tab_server(
             self._cfg, "cannon", instance_name, output_dir, setup_mode)
 
@@ -762,7 +828,7 @@ class SpttScheduledWorkerQt(QThread):
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
-                filepath = os.path.join(self.output_dir, f"{timestamp}.fit")
+                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
                 try:
                     # A frame started at the tick, not one that has been
                     # sitting in the FIFO since the last capture.
@@ -1043,6 +1109,9 @@ class SpttTab(QWidget):
             self.spin_temp.setValue(int(round(float(c["target_temp"]))))
             self.chk_temp.setChecked(True)
 
+    def config_updates(self):
+        return {"sptt": {"output_dir": self.le_output.text().strip()}}
+
     def _browse_dir(self, le):
         d = QFileDialog.getExistingDirectory(self, "Select directory")
         if d:
@@ -1211,8 +1280,8 @@ class SpttTab(QWidget):
             self._on_preview_stop()
 
         status_dir = self._cfg.get("status_dir") or HOME_STATUS_DIR
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(status_dir, exist_ok=True)
+        if not _make_dirs(self, output_dir, status_dir):
+            return
 
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("SPTT", self._cfg))
@@ -1392,6 +1461,19 @@ class InfraWorkerQt(QThread):
         applied = {}
         errors = []
         try:
+            from cameras.infra_driver import ROI_MODES
+            # "roi" is what focus_app sends; ROI first, since it resets the exposure.
+            if "roi" in params:
+                if params["roi"] not in ROI_MODES:
+                    raise ValueError(f"roi must be one of {', '.join(ROI_MODES)}")
+                params = dict(params)
+                params["roi_width"], params["roi_height"] = ROI_MODES[params["roi"]]
+            if "roi_width" in params or "roi_height" in params:
+                w = int(params.get("roi_width", self.cam.roi_width))
+                h = int(params.get("roi_height", self.cam.roi_height))
+                self.cam.set_roi(width=w, height=h)
+                applied["roi_width"] = w
+                applied["roi_height"] = h
             if "exposure_us" in params:
                 self.cam.set_exposure(float(params["exposure_us"]))
                 applied["exposure_us"] = float(params["exposure_us"])
@@ -1402,12 +1484,6 @@ class InfraWorkerQt(QThread):
             if "gain" in params:
                 self.cam.set_gain(int(params["gain"]))
                 applied["gain"] = int(params["gain"])
-            if "roi_width" in params or "roi_height" in params:
-                w = int(params.get("roi_width", self.cam.roi_width))
-                h = int(params.get("roi_height", self.cam.roi_height))
-                self.cam.set_roi(width=w, height=h)
-                applied["roi_width"] = w
-                applied["roi_height"] = h
         except Exception as e:
             errors.append(str(e))
         return applied, errors
@@ -1425,11 +1501,12 @@ class InfraWorkerQt(QThread):
 
         while not self._stop:
             now = dt.now()
+            now_utc = schedule_now()
 
             active_end = None
             for entry in self.schedule:
-                if entry.start <= now <= entry.end:
-                    active_end = entry.end
+                if entry.start <= now_utc <= entry.end:
+                    active_end = schedule_to_local(entry.end)
                     break
 
             if active_end is None:
@@ -1456,7 +1533,7 @@ class InfraWorkerQt(QThread):
                 timestamp = now.strftime("%Y%m%dT%H%M%S")
                 ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
                 ext = ext_map.get(self.save_format, "tiff")
-                filepath = os.path.join(self.output_dir, f"{timestamp}.{ext}")
+                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.{ext}"))
                 try:
                     frame = self.cam.grab_frame()
                     if self.save_format == "fits":
@@ -1699,7 +1776,7 @@ class InfraTab(QWidget):
         meas_lay.addLayout(m_grid)
 
         self.sched_table = QTableWidget(0, 2)
-        self.sched_table.setHorizontalHeaderLabels(["Start", "End"])
+        self.sched_table.setHorizontalHeaderLabels(["Start (UTC)", "End (UTC)"])
         self.sched_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.sched_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.sched_table.setMinimumHeight(80)
@@ -1765,6 +1842,7 @@ class InfraTab(QWidget):
         self.le_output.setText(c.get("output_dir", ""))
         secs = c.get("capture_seconds", [0, 30])
         self.le_cap_seconds.setText(", ".join(str(s) for s in secs))
+        self._load_configured_schedule(c)
         self.exp_spinbox.setValue(c.get("exposure_us", 1000.0))
         self.gain_spinbox.setValue(c.get("gain", 0))
         roi = c.get("roi", "1280x1024")
@@ -1776,6 +1854,22 @@ class InfraTab(QWidget):
         if idx_fmt >= 0:
             self.combo_format.setCurrentIndex(idx_fmt)
 
+    def _load_configured_schedule(self, section):
+        if not str(section.get("schedule_file") or "").strip():
+            return
+        entries, errors, reason = load_schedule_safe(section["schedule_file"])
+        if reason:
+            self._log(f"Schedule: {reason}", "warn")
+        _fill_schedule_table(self.sched_table, entries)
+
+    def config_updates(self):
+        updates = {"output_dir": self.le_output.text().strip(),
+                   "save_format": self.combo_format.currentText()}
+        secs = self._parse_capture_seconds()
+        if secs:
+            updates["capture_seconds"] = secs
+        return {"infra": updates}
+
     def _browse_dir(self, le):
         d = QFileDialog.getExistingDirectory(self, "Select directory")
         if d:
@@ -1785,9 +1879,9 @@ class InfraTab(QWidget):
         text = self.le_cap_seconds.text()
         try:
             secs = [int(s.strip()) for s in text.split(",") if s.strip()]
-            return [s for s in secs if 0 <= s < 60]
+            return sorted({s for s in secs if 0 <= s < 60})
         except ValueError:
-            return [0, 30]
+            return []
 
     def _on_connect(self):
         self._log("Connecting to Infra camera...", "info")
@@ -1800,11 +1894,11 @@ class InfraTab(QWidget):
             from infra_driver import TanhoCamera
             self.cam = TanhoCamera()
             self.cam.connect()
-            self.cam.set_exposure(self.exp_spinbox.value())
-            self.cam.set_gain(self.gain_spinbox.value())
             roi_text = self.roi_combo.currentText()
             w, h = [int(x) for x in roi_text.split("x")]
             self.cam.set_roi(w, h)
+            self.cam.set_exposure(self.exp_spinbox.value())
+            self.cam.set_gain(self.gain_spinbox.value())
 
             self.lbl_cam_status.setText(f"Connected: {self.cam.roi_width}x{self.cam.roi_height}")
             self.lbl_cam_status.setStyleSheet("color:#007700; font-weight:bold;")
@@ -1858,7 +1952,18 @@ class InfraTab(QWidget):
     def _on_roi_changed(self, w, h):
         self.lbl_cam_status.setText(f"Connected: {w}x{h}")
 
+    def _measuring(self):
+        """The measurement thread owns the camera; a set from here would reach the USB
+        link in the middle of its grab."""
+        if self.worker and self.worker.isRunning():
+            self._log("Stop the measurement first, or change it from focus_app.py.",
+                      "warn")
+            return True
+        return False
+
     def _on_set_exposure(self):
+        if self._measuring():
+            return
         value = self.exp_spinbox.value()
         if self.capture_thread:
             self.capture_thread.request_exposure(value)
@@ -1867,6 +1972,8 @@ class InfraTab(QWidget):
         self._log(f"Exposure set: {value} us", "info")
 
     def _on_set_gain(self):
+        if self._measuring():
+            return
         value = self.gain_spinbox.value()
         if self.capture_thread:
             self.capture_thread.request_gain(value)
@@ -1875,6 +1982,8 @@ class InfraTab(QWidget):
         self._log(f"Gain set: {value}", "info")
 
     def _on_set_roi(self):
+        if self._measuring():
+            return
         roi_text = self.roi_combo.currentText()
         w, h = [int(x) for x in roi_text.split("x")]
         if self.capture_thread:
@@ -1886,7 +1995,7 @@ class InfraTab(QWidget):
     def _add_schedule_row(self):
         row = self.sched_table.rowCount()
         self.sched_table.insertRow(row)
-        now = dt.now().replace(second=0, microsecond=0)
+        now = schedule_now().replace(second=0, microsecond=0)
         end = now.replace(hour=23, minute=59)
         self.sched_table.setItem(row, 0, QTableWidgetItem(now.strftime(SCHEDULE_DT_FMT)))
         self.sched_table.setItem(row, 1, QTableWidgetItem(end.strftime(SCHEDULE_DT_FMT)))
@@ -1949,8 +2058,8 @@ class InfraTab(QWidget):
             self._on_preview_stop()
 
         status_dir = self._cfg.get("status_dir") or HOME_STATUS_DIR
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(status_dir, exist_ok=True)
+        if not _make_dirs(self, output_dir, status_dir):
+            return
 
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("Infra", self._cfg))
@@ -1960,6 +2069,11 @@ class InfraTab(QWidget):
             self._log("Schedule is empty — starting in setup mode: live frames "
                       "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
+        if not capture_seconds:
+            QMessageBox.warning(self, "Capture seconds",
+                                "Give at least one second of the minute, 0..59.")
+            _release_claim(self)
+            return
         save_format = self.combo_format.currentText()
         self._service, self._server = _start_tab_server(
             self._cfg, "infra", instance_name, output_dir, setup_mode)
@@ -2264,9 +2378,11 @@ class SentryTab(QWidget):
             self._log_local(
                 f"[ERROR] imagerd_rt not found at: {imagerd_rt_dir}", "error"
             )
+            _release_claim(self)
             return
 
-        status_dir = str(Path.home() / ".every_camera" / "status")
+        status_dir = self._cfg.get("status_dir") or str(
+            Path.home() / ".every_camera" / "status")
         sentry_cfg = self._cfg.get("sentry", {})
         capture_seconds = sentry_cfg.get("capture_seconds", [0, 30])
 
@@ -2342,6 +2458,7 @@ class AsiTab(QWidget):
     log lines arrive through a ``console_ui`` sink.
     """
 
+    CONFIG_SECTION = "asi"
     log_line = pyqtSignal(str, str)
 
     def __init__(self, cfg: dict, log_fn):
@@ -2504,6 +2621,7 @@ class AsiTab(QWidget):
         from utils import get_instance_name, claim_instance_name, get_node_name
         from pathlib import Path
 
+        _reload_section(self._cfg, "asi")
         asi_cfg = dict(self._cfg.get("asi", {}))
         asi_cfg["output_dir"] = self.le_output.text().strip()
         camera_cfg = dict(asi_cfg.get("camera", {}))
@@ -2512,6 +2630,8 @@ class AsiTab(QWidget):
         self._cfg["asi"] = asi_cfg
 
         conf = asi_config.from_dict(asi_cfg)
+        # Nobody can press Enter in a terminal the GUI may not even have.
+        conf.wait_for_enter = False
         for problem in conf.errors:
             self._log_local(problem, "warn")
         if not conf.output_dir:
@@ -2530,15 +2650,18 @@ class AsiTab(QWidget):
         node_name = get_node_name(self._cfg)
         status_dir = self._cfg.get("status_dir") or str(
             Path.home() / ".every_camera" / "status")
-        os.makedirs(conf.output_dir, exist_ok=True)
+        if not _make_dirs(self, conf.output_dir):
+            _release_claim(self)
+            return
 
-        console_ui.add_sink(self._on_console_log)
+        console_ui.add_sink(self._on_console_log, owner=lambda: self._worker)
         try:
             self.cam = AsiCamera(conf).open()
         except Exception as exc:
             console_ui.remove_sink(self._on_console_log)
             self._log_local(f"Could not open the camera: {exc}", "error")
             self.cam = None
+            _release_claim(self)
             return
 
 
@@ -2619,13 +2742,26 @@ class AsiTab(QWidget):
         if self._worker is not None and self._worker.is_alive():
             # Forced: closing the window should not block on a run of darks.
             self._worker.request_stop(force=True)
-            self._worker.join(timeout=10)
+            # An exposure under way still has to finish: the SDK must not be closed
+            # beneath it.
+            self._worker.join(timeout=WORKER_CLOSE_WAIT)
+            if self._worker.is_alive():
+                self._log_local("The worker is still exposing — the camera is left "
+                                "to the process exit.", "warn")
+                return
         if self._worker is not None:
             self._on_finished()
+
+    def config_updates(self):
+        return {self.CONFIG_SECTION: {
+            "output_dir": self.le_output.text().strip(),
+            "camera": {"backend": self.cmb_backend.currentText()}}}
 
 
 class JapanTab(QWidget):
     """Same arrangement as :class:`AsiTab`: runs the console worker, unchanged."""
+
+    CONFIG_SECTION = "japan"
 
     log_line = pyqtSignal(str, str)
 
@@ -2789,6 +2925,7 @@ class JapanTab(QWidget):
         from cameras.common import schedule as common_schedule
         from pathlib import Path
 
+        _reload_section(self._cfg, "japan")
         japan_cfg = dict(self._cfg.get("japan", {}))
         japan_cfg["output_dir"] = self.le_output.text().strip()
         camera_cfg = dict(japan_cfg.get("camera", {}))
@@ -2797,6 +2934,8 @@ class JapanTab(QWidget):
         self._cfg["japan"] = japan_cfg
 
         conf = japan_config.from_dict(japan_cfg)
+        # Nobody can press Enter in a terminal the GUI may not even have.
+        conf.wait_for_enter = False
         for problem in conf.errors:
             self._log_local(problem, "warn")
         if not conf.output_dir:
@@ -2815,15 +2954,18 @@ class JapanTab(QWidget):
         node_name = get_node_name(self._cfg)
         status_dir = self._cfg.get("status_dir") or str(
             Path.home() / ".every_camera" / "status")
-        os.makedirs(conf.output_dir, exist_ok=True)
+        if not _make_dirs(self, conf.output_dir):
+            _release_claim(self)
+            return
 
-        console_ui.add_sink(self._on_console_log)
+        console_ui.add_sink(self._on_console_log, owner=lambda: self._worker)
         try:
             self.cam = JapanCamera(conf).open()
         except Exception as exc:
             console_ui.remove_sink(self._on_console_log)
             self._log_local(f"Could not open the camera: {exc}", "error")
             self.cam = None
+            _release_claim(self)
             return
 
 
@@ -2902,9 +3044,20 @@ class JapanTab(QWidget):
         if self._worker is not None and self._worker.is_alive():
             # Forced: closing the window should not block on a run of darks.
             self._worker.request_stop(force=True)
-            self._worker.join(timeout=10)
+            # An exposure under way still has to finish: the SDK must not be closed
+            # beneath it.
+            self._worker.join(timeout=WORKER_CLOSE_WAIT)
+            if self._worker.is_alive():
+                self._log_local("The worker is still exposing — the camera is left "
+                                "to the process exit.", "warn")
+                return
         if self._worker is not None:
             self._on_finished()
+
+    def config_updates(self):
+        return {self.CONFIG_SECTION: {
+            "output_dir": self.le_output.text().strip(),
+            "camera": {"backend": self.cmb_backend.currentText()}}}
 
 
 class MainWindow(QMainWindow):
@@ -2983,10 +3136,31 @@ class MainWindow(QMainWindow):
         self.log_text.moveCursor(QTextCursor.End)
 
     def closeEvent(self, event):
-        save_config(self._cfg, self._config_path)
+        self._save_tab_settings()
         for tab in self._tabs.values():
             tab.cleanup()
         event.accept()
+
+    def _save_tab_settings(self):
+        """Only the fields the tabs own go back, merged into the file as it is now: it
+        may have been edited in setup_app meanwhile, and a config that failed to load
+        must not be replaced by defaults."""
+        if getattr(self._cfg, "load_error", None):
+            return
+        fresh = load_config(self._config_path)
+        if fresh.load_error:
+            return
+        before = json.dumps(fresh, sort_keys=True)
+        for tab in self._tabs.values():
+            updates = getattr(tab, "config_updates", None)
+            if updates is None:
+                continue
+            try:
+                _set_nested(fresh, updates())
+            except Exception as exc:
+                self._log(f"Could not collect settings: {exc}", "warn")
+        if json.dumps(fresh, sort_keys=True) != before:
+            save_config(fresh, self._config_path)
 
 
 def run_gui(args):
@@ -3004,6 +3178,8 @@ def run_gui(args):
     camera_type = getattr(args, 'type', None)
 
     app = QApplication(sys.argv)
+    import qt_support
+    qt_support.install_excepthook()
     app.setStyle("Fusion")
 
     win = MainWindow(cfg, camera_type, config_path)

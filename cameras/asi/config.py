@@ -215,7 +215,8 @@ def from_dict(asi_cfg):
         try:
             entries, slot_errors, overrides = schedule_mod.load_schedule_file(
                 schedule_file, mode, camera.binning)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # UnicodeDecodeError is a ValueError: a file in the wrong encoding.
             entries, slot_errors = [], [f"schedule_file {schedule_file}: {exc}"]
     else:
         entries, slot_errors = schedule_mod.entries_from_config(

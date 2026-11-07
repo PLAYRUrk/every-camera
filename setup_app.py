@@ -120,6 +120,14 @@ def _add_file_row(grid, row, label, le, caption="Select file", flt="All (*)", pa
     grid.addWidget(btn, row, 2)
 
 
+def _merge_into(base, override):
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge_into(base[key], value)
+        else:
+            base[key] = value
+
+
 def _add_label_row(grid, row, label, widget):
     from PyQt5.QtWidgets import QLabel
     grid.addWidget(QLabel(label), row, 0)
@@ -701,6 +709,9 @@ class AsiConfigTab:
     SLOT_KEYS = ["filter", "exposure", "delta", "binning", "gain", "readout",
                  "seconds"]
     SLOT_DEFAULTS = [1, 55.0, 0.0, 4, 3, 5.0, "0"]
+    # Left out of a slot, these follow the camera settings; an empty cell keeps
+    # them left out.
+    SLOT_OPTIONAL = {"binning", "gain", "readout"}
 
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
@@ -936,7 +947,9 @@ class AsiConfigTab:
         self.le_schedule_file.setToolTip(
             "Optional legacy asi-camera schedule.txt. When set, it replaces the "
             "slot table below.")
-        _add_dir_row(sgrid, row, "Legacy schedule file:", self.le_schedule_file)
+        _add_file_row(sgrid, row, "Legacy schedule file:", self.le_schedule_file,
+                      caption="Select schedule file",
+                      flt="Schedules (*.txt *.json);;All (*)")
         row += 1
 
         root.addWidget(sched_box)
@@ -1062,6 +1075,9 @@ class AsiConfigTab:
                 if isinstance(seconds, (int, float)):
                     seconds = [seconds]
                 value = ",".join(str(int(s)) for s in seconds) or str(default)
+            elif slot is not None and key in self.SLOT_OPTIONAL:
+                value = vals.get(key)
+                value = "" if value is None else value
             else:
                 value = vals.get(key, default)
             self._slot_table.setItem(row, col, QTableWidgetItem(str(value)))
@@ -1079,6 +1095,8 @@ class AsiConfigTab:
                                                      self.SLOT_DEFAULTS)):
                 item = self._slot_table.item(row, col)
                 raw = item.text().strip() if item else str(default)
+                if not raw and key in self.SLOT_OPTIONAL:
+                    continue
                 if key == "seconds":
                     try:
                         slot[key] = [int(s.strip()) for s in raw.split(",")
@@ -1175,6 +1193,7 @@ class JapanConfigTab:
     SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
     SLOT_KEYS = ["filter", "exposure", "delta", "binning", "seconds"]
     SLOT_DEFAULTS = [1, 30.0, 0.0, 1, "0"]
+    SLOT_OPTIONAL = {"binning"}
 
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
@@ -1370,7 +1389,9 @@ class JapanConfigTab:
         self.le_schedule_file.setToolTip(
             "Optional legacy japan-camera schedule.txt. When set, it replaces the "
             "slot table below.")
-        _add_dir_row(sgrid, row, "Legacy schedule file:", self.le_schedule_file)
+        _add_file_row(sgrid, row, "Legacy schedule file:", self.le_schedule_file,
+                      caption="Select schedule file",
+                      flt="Schedules (*.txt *.json);;All (*)")
         row += 1
 
         root.addWidget(sched_box)
@@ -1498,6 +1519,9 @@ class JapanConfigTab:
                 if isinstance(seconds, (int, float)):
                     seconds = [seconds]
                 value = ",".join(str(int(s)) for s in seconds) or str(default)
+            elif slot is not None and key in self.SLOT_OPTIONAL:
+                value = vals.get(key)
+                value = "" if value is None else value
             else:
                 value = vals.get(key, default)
             self._slot_table.setItem(row, col, QTableWidgetItem(str(value)))
@@ -1515,6 +1539,8 @@ class JapanConfigTab:
                                                      self.SLOT_DEFAULTS)):
                 item = self._slot_table.item(row, col)
                 raw = item.text().strip() if item else str(default)
+                if not raw and key in self.SLOT_OPTIONAL:
+                    continue
                 if key == "seconds":
                     try:
                         slot[key] = [int(s.strip()) for s in raw.split(",")
@@ -1871,7 +1897,7 @@ class AlertsConfigTab:
         }
         # Carried through untouched: this form does not offer them, and dropping
         # a key the operator set by hand would be a silent change of behaviour.
-        for key in ("daily_summary", "status_mail_minutes", "smtp"):
+        for key in ("status_mail_minutes", "smtp"):
             if key in (self._cfg.get("alerts") or {}):
                 alerts[key] = self._cfg["alerts"][key]
         return alerts
@@ -1973,7 +1999,6 @@ class ServerConfigTab:
             "discovery":      self.cb_discovery.isChecked(),
             "discovery_port": self.sb_disc_port.value(),
             "focus_ttl":      self.sb_focus_ttl.value(),
-            "max_list":       2000,
         }
 
 
@@ -2027,6 +2052,8 @@ class ConfigWizardWindow:
 
         self._cfg = cfg
         self._config_path = config_path
+        self._camera_type = camera_type
+        self._successor = None
 
         self.window = QMainWindow()
         self.window.setWindowTitle("Every Camera — Setup")
@@ -2111,7 +2138,11 @@ class ConfigWizardWindow:
         for tab_key, cfg_key in KEY_MAP.items():
             tab = self._camera_tabs.get(tab_key)
             if tab is not None:
-                cfg[cfg_key] = tab.get_config()
+                # Merged, not replaced: keys added by hand that no form shows survive.
+                section = copy.deepcopy(cfg.get(cfg_key)) if isinstance(
+                    cfg.get(cfg_key), dict) else {}
+                _merge_into(section, tab.get_config())
+                cfg[cfg_key] = section
 
         general_tab = self._camera_tabs.get("general")
         if general_tab is not None:
@@ -2122,11 +2153,12 @@ class ConfigWizardWindow:
     def _on_save(self):
         from PyQt5.QtWidgets import QMessageBox
         cfg = self._collect_config()
-        try:
-            save_config(cfg, self._config_path)
+        if save_config(cfg, self._config_path):
             self._status.showMessage(f"Saved: {self._config_path}")
-        except Exception as exc:
-            QMessageBox.critical(self.window, "Save failed", str(exc))
+        else:
+            QMessageBox.critical(self.window, "Save failed",
+                                 f"Could not write {self._config_path} — see the "
+                                 f"terminal for the reason.")
 
     def _on_load(self):
         from PyQt5.QtWidgets import QFileDialog, QMessageBox
@@ -2136,18 +2168,22 @@ class ConfigWizardWindow:
         )
         if not path:
             return
-        try:
-            new_cfg = load_config(path)
-        except Exception as exc:
-            QMessageBox.critical(self.window, "Load failed", str(exc))
+        new_cfg = load_config(path)
+        if new_cfg.load_error:
+            QMessageBox.critical(self.window, "Load failed",
+                                 f"{path} {new_cfg.load_error}")
             return
-        QMessageBox.information(
-            self.window, "Config loaded",
-            f"Loaded:\n{path}\n\nRestart the wizard to see the new values."
-        )
-        self._config_path = path
-        self._cfg = new_cfg
-        self._status.showMessage(f"Config: {path}  (restart to reload UI)")
+        # The forms hold the old file's values; a new window shows the new ones, so
+        # Save cannot write one file's settings into another.
+        self._replace_window(new_cfg, path)
+
+    def _replace_window(self, cfg, path):
+        geometry = self.window.geometry()
+        self._successor = ConfigWizardWindow(cfg, camera_type=self._camera_type,
+                                             config_path=path)
+        self._successor.window.setGeometry(geometry)
+        self._successor.show()
+        self.window.close()
 
     def _on_reset(self):
         from PyQt5.QtWidgets import QMessageBox
@@ -2158,12 +2194,7 @@ class ConfigWizardWindow:
         )
         if reply != QMessageBox.Yes:
             return
-        new_win = ConfigWizardWindow(
-            DEFAULT_CONFIG,
-            config_path=self._config_path,
-        )
-        new_win.show()
-        self.window.close()
+        self._replace_window(copy.deepcopy(DEFAULT_CONFIG), self._config_path)
 
     def show(self):
         self.window.show()
@@ -2174,6 +2205,8 @@ def run_gui_wizard(config_path=None, camera_type=None):
 
     cfg = load_config(config_path)
     app = QApplication(sys.argv)
+    import qt_support
+    qt_support.install_excepthook()
     app.setStyle("Fusion")
 
     win = ConfigWizardWindow(cfg, camera_type=camera_type,

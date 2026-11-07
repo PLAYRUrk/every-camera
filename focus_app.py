@@ -880,6 +880,11 @@ class FocusWindow(QMainWindow):
         self._on_start()
 
     def _on_start(self):
+        # Enter in the address box arrives here even while a view runs; switching the
+        # client then would send the running session's heartbeats to the new camera.
+        if self._stream is not None or not self.btn_start.isEnabled():
+            self._status("Stop the live view before connecting to another camera.")
+            return
         target = self.cmb_cameras.currentData()
         if not target:
             QMessageBox.information(self, "No camera",
@@ -1021,8 +1026,10 @@ class FocusWindow(QMainWindow):
         self._stop_stream()
         # Leave focus mode now rather than wait out the deadline. Repeated because the server
         # renews focus on every chunk, undoing a stop that arrives before it sees the disconnect.
-        self._request_focus_off()
-        QTimer.singleShot(2500, self._request_focus_off)
+        client = self._client
+        self._request_focus_off(client)
+        # Bound now: by then a new session may own self._client.
+        QTimer.singleShot(2500, lambda: self._request_focus_off(client))
         self.roi_preview.set_source(None, None)
         self.view.clear_frame("Stopped")
         self.lbl_stream.setText("stream: idle")
@@ -1031,10 +1038,10 @@ class FocusWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self._status("Live view stopped — the camera has resumed its schedule")
 
-    def _request_focus_off(self):
-        if not self._client:
+    def _request_focus_off(self, client=None):
+        client = client or self._client
+        if not client:
             return
-        client = self._client
         self._tasks.run(client.stop_focus, None, lambda msg: None)
 
     def _send_heartbeat(self, hold=True):
@@ -1268,6 +1275,8 @@ def main():
         os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
     app = QApplication(sys.argv)
+    import qt_support
+    qt_support.install_excepthook()
     app.setStyle("Fusion")
     window = FocusWindow(load_settings())
     window.set_via(args.via or None)

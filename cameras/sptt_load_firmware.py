@@ -182,15 +182,20 @@ def find_libusb_backend():
     if system == "Linux":
         import ctypes.util
         path = ctypes.util.find_library("usb-1.0")
-        if path:
-            return usb.backend.libusb1.get_backend(find_library=lambda x: path)
-        for p in ["/usr/lib/x86_64-linux-gnu/libusb-1.0.so",
-                  "/usr/lib/libusb-1.0.so",
-                  "/usr/lib/aarch64-linux-gnu/libusb-1.0.so"]:
+        candidates = ([path] if path else []) + [
+            "/usr/lib/x86_64-linux-gnu/libusb-1.0.so",
+            "/usr/lib64/libusb-1.0.so.0",
+            "/usr/lib/libusb-1.0.so",
+            "/usr/lib/aarch64-linux-gnu/libusb-1.0.so"]
+        for p in candidates:
+            # get_backend answers None, not an exception, for a library it cannot load.
             try:
-                return usb.backend.libusb1.get_backend(find_library=lambda x, path=p: path)
+                backend = usb.backend.libusb1.get_backend(
+                    find_library=lambda x, path=p: path)
             except Exception:
-                continue
+                backend = None
+            if backend is not None:
+                return backend
 
     return usb.backend.libusb1.get_backend()
 
@@ -319,8 +324,8 @@ def load_fx2_firmware(dev, fx2_blocks):
             print(f"  Verified {size} bytes at 0x{addr:04X} OK")
 
     if not verify_ok:
-        print("ERROR: Firmware verification failed! Aborting.")
-        sys.exit(1)
+        # Raised, not sys.exit: see _load_429_blobs.
+        raise RuntimeError("FX2 firmware verification failed")
 
     # Release reset: the 8051 starts executing.
     print("  CPUCS = 0x00 (release reset)")
