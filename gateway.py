@@ -1,33 +1,16 @@
-"""One address, the whole fleet: every camera is also a way in to the others.
-
-This is what replaces the broker. The problem a broker solved was never
-publish/subscribe — it was that an observer had to be able to reach a camera,
-and often could not. A relay in the middle answered that by making every camera
-dial *out* to it, at the price of an external service, six settings, a payload
-ceiling, and a channel that could carry a status and a single JPEG and nothing
-else: no archive, no live stream, no focusing.
-
-The cheaper answer is that the cameras can already reach each other. They are on
-one segment, they announce themselves (``discovery.py``) and they remember each
-other (``peers.py``), so any one of them knows where all of them are. Making
-each one willing to forward a request turns that knowledge into access: reach a
-single camera and you have reached the site.
+"""Every camera forwards requests to the others: reach one and you have reached the
+site.
 
     GET /api/nodes                     everything this node knows about
     GET /api/node/<host>:<port>/<path> that request, made on your behalf
 
-And because it forwards whole HTTP requests rather than a fixed set of messages,
-what comes back through it is the real thing: the archive, ``/api/live.mjpg``,
-``/api/params``, ``/api/focus``. The relay was never able to carry any of those.
+Cameras announce themselves (``discovery.py``) and remember each other (``peers.py``),
+so any one of them knows them all. Whole HTTP requests are forwarded, so the archive,
+live stream, parameters and focus all work through it.
 
-Two rules keep it from being a liability:
-
-* **Only known peers.** A forwarding target has to be a node this one has
-  actually seen. Otherwise every camera on the site would be an open proxy to
-  anything its network can route to.
-* **No forwarding a forward.** A hop counter, checked on the way in and set on
-  the way out. Two nodes that know each other would otherwise be able to pass a
-  request back and forth until something ran out.
+Only nodes this one has seen are targets, or every camera would be an open proxy to
+anything its network routes to. A hop counter stops two nodes passing a request back and
+forth.
 """
 import json
 import socket
@@ -38,30 +21,25 @@ from urllib.request import Request, urlopen
 
 import peers
 
-# How often the fleet view is refreshed. Not a poll of the network — the peer
-# registry fills itself from announcements — just a status read per known node.
+# Not a poll of the network: the peer registry fills itself from announcements. This
+# is a status read per known node.
 REFRESH_SECONDS = 20.0
 # One node must never be able to hold up the view of the others.
 POLL_TIMEOUT = 3.0
-# A node that has not answered for this long is still listed, and said to be
-# unreachable. Dropping it would be the one thing a monitor must not do: "was
-# there and stopped answering" is the whole reason anybody is watching.
+# A silent node stays listed as unreachable: "was there and stopped answering" is the
+# whole reason anybody is watching.
 STALE_SECONDS = 120.0
 
-# Header carrying how many nodes a request has already been through.
 HOP_HEADER = "X-Everycam-Hops"
 MAX_HOPS = 2
 PROXY_TIMEOUT = 30.0
-# Paths worth forwarding. A whitelist rather than a blacklist: this is the one
-# place where a request from outside chooses what a camera does next. "/" is
-# listed exactly, not as a prefix — as a prefix it matches every path there
-# is, which would have made the whole list decorative.
+# A whitelist: here a request from outside chooses what a camera does next. "/" is
+# listed exactly because as a prefix it would match every path.
 PROXY_PREFIXES = ("/api/",)
 PROXY_EXACT = ("/", "/index.html")
 
 
 def forwardable(path):
-    """True if ``path`` is one this node is willing to fetch for somebody."""
     bare = (path or "").split("?", 1)[0]
     return bare in PROXY_EXACT or any(bare.startswith(prefix)
                                       for prefix in PROXY_PREFIXES)
@@ -72,8 +50,6 @@ def _target_of(node):
 
 
 class Gateway:
-    """This node's view of every other node, and the door through to them."""
-
     def __init__(self, service=None, refresh=REFRESH_SECONDS,
                  poll_timeout=POLL_TIMEOUT):
         self.service = service
@@ -84,7 +60,6 @@ class Gateway:
         self._stop = threading.Event()
         self._thread = None
 
-    # -- lifecycle -----------------------------------------------------------
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="everycam-gateway")
@@ -107,9 +82,7 @@ class Gateway:
             if self._stop.wait(self.refresh):
                 return
 
-    # -- the fleet view ------------------------------------------------------
     def refresh_once(self):
-        """Read the status of every remembered peer. Returns how many answered."""
         answered = 0
         for peer in peers.load():
             target = _target_of(peer)
@@ -127,9 +100,8 @@ class Gateway:
                 record["error"] = ""
                 record["last_ok"] = time.time()
                 answered += 1
-            # The whole record is swapped in under the lock rather than
-            # edited in place: nodes() runs on an HTTP thread and would
-            # otherwise be able to read one half-updated.
+            # Swapped in whole under the lock: nodes() runs on an HTTP thread and must
+            # not read a half-updated record.
             with self._lock:
                 previous = self._seen.get(target) or {}
                 if status is None:
@@ -139,13 +111,11 @@ class Gateway:
         return answered
 
     def nodes(self, include_self=True):
-        """Everything this node knows, itself first.
+        """``target`` is the ``host:port`` for an ``/api/node/<target>/...`` request.
 
-        Each entry carries ``target`` — the ``host:port`` to put in a
-        ``/api/node/<target>/...`` request — and ``reachable``, which is this
-        node's opinion and not the observer's: a camera the gateway can see may
-        still be unreachable from wherever the question came from, which is
-        exactly the situation that makes forwarding worth having.
+        ``reachable`` is this node's opinion, not the observer's: a camera the gateway
+        sees may be unreachable from the caller, which is what makes forwarding worth
+        having.
         """
         listed = []
         mine = self._self_target()
@@ -156,10 +126,8 @@ class Gateway:
             records = [dict(record) for record in self._seen.values()]
         for record in records:
             if mine and _target_of(record) == mine:
-                # Cameras on one machine share peers.json, so this node's own
-                # entry is in it — written there by its neighbour, which had
-                # no way to know it was us. Listing it again would put the
-                # same camera on the monitor twice.
+                # Cameras on one machine share peers.json, so a neighbour wrote this
+                # node's own entry there. Listing it would show the same camera twice.
                 continue
             last_ok = float(record.get("last_ok") or 0)
             record["target"] = _target_of(record)
@@ -170,7 +138,6 @@ class Gateway:
         return listed
 
     def _self_target(self):
-        """This node's own ``host:port``, or "" if the port is not known yet."""
         port = getattr(self.service, "http_port", None)
         if not port:
             return ""
@@ -201,13 +168,9 @@ class Gateway:
             "seen_ago": 0.0,
         }
 
-    # -- forwarding ----------------------------------------------------------
     def known_target(self, target):
-        """The peer behind ``host:port``, or None if this node has not seen it.
-
-        The gate on forwarding. Without it every camera would forward anything
-        anywhere its network can route to, which is a proxy nobody asked for on
-        a port that has no authentication by design.
+        """The gate on forwarding: without it every camera would forward anything
+        anywhere, on a port that has no authentication by design.
         """
         wanted = str(target or "").strip()
         with self._lock:
@@ -220,12 +183,7 @@ class Gateway:
 
     def open_upstream(self, target, path, method="GET", body=None,
                       content_type=None, hops=0, timeout=PROXY_TIMEOUT):
-        """Make the request on the caller's behalf and hand back the live response.
-
-        Returns the open response object rather than its bytes, so that the
-        caller can stream it — ``/api/live.mjpg`` never ends, and buffering it
-        would mean holding a night of video in memory.
-        """
+        """Returns the open response, not its bytes: ``/api/live.mjpg`` never ends."""
         peer = self.known_target(target)
         if peer is None:
             raise LookupError(f"unknown node: {target}")
@@ -241,7 +199,6 @@ class Gateway:
             request.add_header("Content-Type", content_type)
         return urlopen(request, timeout=timeout)
 
-    # -- helpers -------------------------------------------------------------
     def _get_json(self, host, port, path):
         url = f"http://{host}:{port}{path}"
         request = Request(url, method="GET")
@@ -253,7 +210,6 @@ class Gateway:
 
 
 def _local_address():
-    """This machine's address as the network sees it."""
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         probe.settimeout(0.3)
@@ -266,10 +222,8 @@ def _local_address():
 
 
 def parse_node_path(path):
-    """Split ``/api/node/<target>/<rest>`` into ``(target, rest)``.
-
-    ``rest`` always starts with a slash, so ``/api/node/host:8765`` and
-    ``/api/node/host:8765/`` both mean the node's own index page.
+    """``rest`` always starts with a slash, so a bare ``/api/node/host:8765`` is the
+    index.
     """
     prefix = "/api/node/"
     if not path.startswith(prefix):

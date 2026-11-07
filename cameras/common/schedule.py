@@ -1,39 +1,18 @@
-"""
-Schedule entries and cycle timing for the ASI imager.
+"""Schedule entries and cycle timing for both imagers. Pure: no camera, and no clock
+beyond what is passed in.
 
-Three schedule shapes exist, and all are kept because they describe genuinely
-different observing programmes:
+* **sun** — entries fire on given seconds of every minute while the sun stays below
+  ``sun_max_angle``. Entry: ``filter, exposure, seconds``.
+* **time** — one general cycle repeats, phase-locked to ``t_start``. Entry: ``delta,
+  filter, exposure, binning, gain, readout``, ``delta`` being seconds from the start
+  of the cycle.
+* **sun_cycle** — the same cycle, started by the sun: the pre-darks are timed to
+  finish as the altitude reaches ``sun_max_angle``. ``t_start`` is read as UTC, so
+  stations at different sites run in step and a run joins at whichever slot is due.
+  Without it the anchor is the first whole minute of the window.
 
-* **sun** — entries fire on given seconds of every minute for as long as the sun
-  stays below ``sun_max_angle``. Each entry is ``filter, exposure, seconds``.
-* **time** — one "general cycle" of fixed period repeats, phase-locked to a
-  single ``t_start``. Each entry is ``delta, filter, exposure, binning, gain,
-  readout``, where ``delta`` is seconds from the start of the cycle. The period
-  is ``schedule_len`` when configured, otherwise derived: last delta + that
-  exposure + that entry's readout.
-* **sun_cycle** — the same cycle as *time*, but *started* by the sun: nothing
-  is exposed until the solar altitude drops to ``sun_max_angle``, and the
-  pre-darks are timed to finish just as that happens, which is what imagerd_rt
-  did (``imagerd_rt.c:531-738``). The cycle's *phase* is still locked to
-  ``t_start``, read as **UTC** in this mode (:func:`utc_cycle_anchor`): the run
-  joins the cycle at whichever slot is due when the window opens, so that at
-  ``t_start`` the cycle is at its slot zero. Stations at different sites — and
-  so with different moments of the same solar altitude — then run the same
-  cycle in step. Without a ``t_start`` the cycle falls back to imagerd_rt's own
-  anchor, the first whole minute of the window.
-
-Entries come from ``config.json`` (a list of objects, the normal case), from a
-converted imagerd_rt schedule in JSON, or from a legacy asi-camera
-``schedule.txt``; :func:`parse_schedule_text` reads the oldest format so an
-existing station file keeps working.
-
-Either file format may also carry the globals in :data:`FILE_OVERRIDE_KEYS` —
-notably ``schedule_len``, writable as ``period = 1440`` at the top of a text
-schedule. A schedule and the length of its cycle belong together: keeping the
-period in config.json meant that swapping schedules silently kept the old one.
-
-Everything here is pure: no camera, no clock beyond what is passed in. That is
-what makes the cycle arithmetic — the subtlest part of the driver — testable.
+A schedule file may carry the globals in :data:`FILE_OVERRIDE_KEYS`: a period kept
+only in config.json silently survives a swap of its schedule.
 """
 from __future__ import annotations
 
@@ -52,35 +31,27 @@ FILTER_MAX = 6
 
 MODES = ("sun", "time", "sun_cycle")
 
-# Modes built from a repeating general cycle, where entries carry ``delta``
-# rather than seconds-within-a-minute.
+# Modes whose entries carry ``delta`` rather than seconds-within-a-minute.
 CYCLE_MODES = ("time", "sun_cycle")
 
 GAIN_MIN = 1        # 1 Low, 2 Medium, 3 High — PICAM AdcAnalogGain
 GAIN_MAX = 3
 
-# The globals a converted imagerd_rt schedule may carry with it. Keeping this an
-# explicit list means a stray key in a schedule file cannot silently redefine,
-# say, the output directory.
+# An explicit list, so a stray key in a schedule file cannot redefine, say, the output
+# directory.
 FILE_OVERRIDE_KEYS = ("mode", "sun_max_angle", "schedule_len", "t_start",
                       "dark_frames", "dead_time", "site_id", "device_id")
 
-# What an operator may write instead of the canonical key. ``period`` is the
-# word the console, the setup wizard and the observers all use for
-# ``schedule_len``, and a schedule file is edited by hand far more often than
-# config.json is.
+# ``period`` is the word the console, the setup wizard and the observers use.
 FILE_OVERRIDE_ALIASES = {"period": "schedule_len", "cycle": "schedule_len"}
 
-# A ``key = value`` line in a text schedule. Slot lines are separated by ``;``
-# (cycle modes) or ``,`` (sun mode) and never contain ``=``, so the two shapes
-# cannot be confused for one another.
+# Slot lines use ``;`` or ``,`` and never contain ``=``, so the two shapes cannot be
+# confused.
 _DIRECTIVE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
 @dataclass
 class Entry:
-    """One line of the schedule."""
-
     filter: int
     exposure: float
     seconds: list = field(default_factory=list)   # sun mode: seconds within a minute
@@ -104,9 +75,6 @@ class Entry:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
 def _as_int(value, what, errors):
     try:
         return int(value)
@@ -124,10 +92,9 @@ def _as_float(value, what, errors):
 
 
 def entries_from_config(slots, mode, default_binning=1):
-    """Build entries from the ``asi.schedule`` list in config.json.
+    """Returns ``(entries, errors)``.
 
-    Returns ``(entries, errors)``. Unusable slots are reported and skipped rather
-    than raising, so one bad line cannot stop a night of measurements.
+    Unusable slots are reported and skipped, so one bad line cannot stop a night.
     """
     entries, errors = [], []
     for index, slot in enumerate(slots or [], 1):
@@ -167,10 +134,8 @@ def entries_from_config(slots, mode, default_binning=1):
                 readout = None
 
         if mode in CYCLE_MODES:
-            # A slot written for the wrong mode is the commonest way a schedule
-            # comes out empty, and the camera then starts in setup mode. Say so
-            # here: "expected a number, got None" left the operator to work out
-            # both which field was missing and why it was needed.
+            # A slot written for the wrong mode is the commonest way a schedule comes
+            # out empty, and the camera then starts in setup mode, so name the cause.
             if slot.get("delta") is None:
                 hint = (" This slot has 'seconds' instead, which belongs to "
                         "'sun' mode — either set mode to 'sun' or give the slot "
@@ -208,34 +173,18 @@ def entries_from_config(slots, mode, default_binning=1):
 
 
 def parse_schedule_text(text, mode, default_binning=1):
-    """Parse a legacy asi-camera ``schedule.txt``.
+    """Parse a legacy ``schedule.txt``. Returns ``(entries, errors, overrides)``.
 
-    Returns ``(entries, errors, overrides)``.
+    ``sun`` mode: ``filter,exposure,seconds``, e.g. ``1,55,0:30``
+    Cycle modes: ``delta;filter;exposure;binning;gain;readout``
 
-    ``sun``   mode: ``filter,exposure,seconds``       e.g. ``1,55,0:30``
-    cycle modes: ``delta;filter;exposure;binning;gain;readout``
+    In a cycle line only the first three fields are required. ``binning`` falls back
+    to the camera's; ``gain`` and ``readout`` stay unset, so the slot takes the
+    camera-wide gain and the schedule-wide dead time. A field may be left empty:
+    ``0;3;25;1;;5`` names a readout without a gain.
 
-    In a cycle line only the first three fields are required; ``binning`` falls
-    back to the camera's, and ``gain`` and ``readout`` are left unset — the slot
-    then takes the camera-wide gain and the schedule-wide dead time, as a
-    four-field station file always has. A field may also be left empty to skip
-    it, so ``0;3;25;1;;5`` names a readout without naming a gain::
-
-        100;3;25;1              # gain and readout from the camera
-        1428;3;7;4;3;5          # a converted imagerd_rt slot, in full
-
-    A line may instead be ``key = value``, which sets one of
-    :data:`FILE_OVERRIDE_KEYS` for the whole programme — the same globals the
-    JSON schedule format carries. This is what lets a station state the length
-    of its cycle where the cycle itself is written::
-
-        period = 1440
-        0;1;55;1
-        100;3;25;1
-
-    Without it the period could only be set in config.json, and every change of
-    schedule meant editing two files in step — which is exactly how a schedule
-    and its period drift apart.
+    A line may instead be ``key = value``, setting one of :data:`FILE_OVERRIDE_KEYS`
+    for the whole programme, e.g. ``period = 1440``.
     """
     slots, errors, overrides = [], [], {}
     # Two passes, because ``mode`` decides how a slot line is punctuated: a file
@@ -281,9 +230,7 @@ def parse_schedule_text(text, mode, default_binning=1):
                     "binning": int(parts[3]) if len(parts) > 3 and parts[3]
                     else default_binning,
                 }
-                # Only name the optional fields when the line does. A key left
-                # out here is what makes ``entries_from_config`` fall back to
-                # the camera-wide gain and the schedule-wide dead time.
+                # An absent key is what makes ``entries_from_config`` fall back.
                 if len(parts) > 4 and parts[4]:
                     slot["gain"] = int(parts[4])
                 if len(parts) > 5 and parts[5]:
@@ -312,11 +259,8 @@ def parse_schedule_text(text, mode, default_binning=1):
 def parse_schedule_json(text, mode, default_binning=1):
     """Parse a converted imagerd_rt schedule. Returns ``(entries, errors, overrides)``.
 
-    The file is either a bare list of slots or an object whose ``slots`` (or
-    ``schedule``) key holds them. In the object form its other keys are the
-    globals the imagerd_rt schedule.conf carried — ``mode``, ``sun_max_angle``,
-    ``schedule_len`` and friends — and they are handed back so the caller can
-    let the file speak for the whole programme, as it did in the old station.
+    The file is a bare list of slots, or an object holding them under ``slots`` or
+    ``schedule``, whose other keys are the globals of that schedule.conf.
     """
     try:
         payload = json.loads(text)
@@ -339,11 +283,8 @@ def parse_schedule_json(text, mode, default_binning=1):
 
 
 def load_schedule_file(path, mode, default_binning=1):
-    """Load a schedule file. Returns ``(entries, errors, overrides)``.
-
-    JSON is detected by extension or by the first non-blank character, so a
-    converted schedule can be dropped in beside a legacy ``schedule.txt``
-    without a second config key to say which is which.
+    """Returns ``(entries, errors, overrides)``. JSON is told by extension or first
+    character.
     """
     with open(path, "r") as fh:
         text = fh.read()
@@ -353,20 +294,15 @@ def load_schedule_file(path, mode, default_binning=1):
 
 
 def schedule_to_text(entries, mode, period=None):
-    """Render entries back into the legacy file format (used by the setup tools).
-
-    ``period`` is written as a ``period =`` header when given, so a file that
-    stated its own cycle length still states it after a round trip through an
-    editor. Passing ``None`` leaves the period to be derived from the slots, as
-    it always was.
+    """Render entries as a text schedule; ``period`` becomes a ``period =`` header when
+    given.
     """
     lines = []
     if period:
         lines.append(f"period = {float(period):g}")
     if mode in CYCLE_MODES:
-        # The long line only appears once something needs it, so a schedule that
-        # never named a gain still round-trips to the four fields a station file
-        # has always had.
+        # The long form only when needed, so a schedule that never named a gain
+        # round-trips to the four fields a station file has.
         detailed = any(e.gain is not None or e.readout is not None
                        for e in entries)
         lines.append("# delta(s);filter;exposure(s);binning" +
@@ -387,17 +323,11 @@ def schedule_to_text(entries, mode, period=None):
     return "\n".join(lines) + "\n"
 
 
-# ---------------------------------------------------------------------------
-# Timing
-# ---------------------------------------------------------------------------
 def unique_dark_settings(entries):
-    """One ``(exposure, binning, gain, readout)`` tuple per unique exposure.
+    """One ``(exposure, binning, gain, readout)`` per unique exposure, in schedule order.
 
-    Dark frames are keyed by exposure only, in schedule order; the remaining
-    settings come from the first cycle that uses that exposure. A dark must
-    match the light frames it will be subtracted from, so the gain travels with
-    the exposure rather than being left at whatever the last slot happened to
-    set.
+    A dark must match the lights it is subtracted from, so the settings come from the
+    first slot using that exposure.
     """
     combos, seen = [], set()
     for entry in entries:
@@ -409,18 +339,13 @@ def unique_dark_settings(entries):
 
 
 def unique_exposures(entries):
-    """``(exposure, binning)`` per unique exposure — the settings darks reuse."""
     return [(exposure, binning)
             for exposure, binning, _gain, _readout in unique_dark_settings(entries)]
 
 
 def cycle_period(entries, dead_time):
-    """General-cycle length = last cycle's delta + its exposure + its readout.
-
-    The readout is the entry's own when the schedule gives one (imagerd_rt's
-    per-slot ``prep_time``), otherwise the schedule-wide dead time. For the Tory
-    programme this reproduces the original ``schedule_len`` exactly:
-    1428 + 7 + 5 = 1440 s.
+    """Last slot's delta + exposure + readout (its own ``prep_time``, else the dead
+    time).
     """
     if not entries:
         return float(dead_time)
@@ -430,28 +355,14 @@ def cycle_period(entries, dead_time):
 
 
 def period_mismatch(mode, entries, schedule_len, dead_time, what="the schedule"):
-    """Say it when a stated cycle period disagrees with the slots it describes.
+    """The warning for a stated period that disagrees with its slots, or ``""``.
 
-    Returns the sentence to warn with, or ``""`` when there is nothing to say.
+    A cycle may close a little after its last slot. The mistake is a gap at the end of
+    the cycle wider than any gap inside it: the first slot of the following cycle then
+    becomes the next frame, and a start less than one period before ``t_start`` sits
+    idle until ``t_start``.
 
-    A period is stated in one place (``period = 1440`` in the schedule file, or
-    ``schedule_len`` in config.json) and described in another — the slots — and
-    nothing used to compare the two. It should: a station that set the period to
-    twice what its slots close at spent the second half of every cycle with no
-    slot in it, and the driver's answer to "when is the next frame" was then the
-    first slot of the *following* cycle. Started less than one such period before
-    ``t_start``, that answer is ``t_start`` itself, so the camera sits doing
-    nothing until the appointed hour. The arithmetic was right and the number was
-    wrong, and from the outside there was no way to tell which.
-
-    Not every difference is worth a word. A cycle may close a little after its
-    last slot, and a programme of one frame per cycle is nothing but tail. What
-    marks the mistake is a gap at the end of the cycle longer than any gap
-    *inside* it: room for another slot, and no slot in it. Below that the tail is
-    ordinary and this keeps quiet.
-
-    The period is never corrected here, only reported. Which of the two numbers
-    is the wrong one is the operator's to say.
+    The period is never corrected: which number is wrong is the operator's to say.
     """
     if mode not in CYCLE_MODES or not entries or not schedule_len:
         return ""
@@ -483,11 +394,10 @@ def period_mismatch(mode, entries, schedule_len, dead_time, what="the schedule")
 
 
 def slot_gap(entries, period, entry):
-    """Seconds from this slot to the next one in the cycle, wrapping at the end.
+    """Seconds from this slot to the next, wrapping at the end.
 
-    Entries are ordered by delta, the way :func:`next_cycle_slot` orders them.
-    The last slot's gap runs into the next iteration, so it is measured to the
-    first slot of that one rather than to the end of the cycle.
+    The last slot's gap runs to the first slot of the next iteration, not to the end
+    of the cycle.
     """
     if not entries:
         return float(period)
@@ -500,20 +410,17 @@ def slot_gap(entries, period, entry):
 
 
 def slot_budget(entries, period, entry, dead_time):
-    """How long an exposure at this slot may actually run.
+    """How long an exposure at this slot may run: the gap to the next slot, less the
+    readout.
 
-    The gap to the next slot, less the time the frame needs after the shutter
-    closes — the entry's own readout when it names one, otherwise the
-    schedule-wide dead time. Nothing in a well-formed schedule exceeds this; it
-    is the guard that stops an automatically chosen exposure from pushing the
-    following slot late.
+    The guard that stops an automatically chosen exposure from pushing the next slot
+    late.
     """
     readout = entry.readout if entry.readout is not None else dead_time
     return max(slot_gap(entries, period, entry) - float(readout), 0.0)
 
 
 def _as_utc_time(t_start):
-    """A local time of day as ``"HH:MM:SS"`` UTC, or None."""
     if t_start is None:
         return None
     local = datetime.combine(datetime.now().date(), t_start).astimezone()
@@ -521,15 +428,14 @@ def _as_utc_time(t_start):
 
 
 def schedule_snapshot(sched):
-    """Describe an observing programme for observers, as plain JSON types.
+    """An observing programme as plain JSON types, for observers.
 
-    Which cycle a frame belongs to is written nowhere — not in the file name,
-    not in the FITS header — so an archive can only be grouped into cycles by
-    replaying this phase reference and period against the frame times. Published
-    through ``CameraService.set_schedule`` and consumed by ``cycles.py``.
+    Which cycle a frame belongs to is written in neither file name nor header, so an
+    archive can only be grouped into cycles by replaying this phase reference and
+    period against the frame times.
 
-    Duck-typed on purpose: the japan and asi ``ScheduleCfg`` classes are
-    separate but agree on every field read here.
+    Duck-typed: the japan and asi ``ScheduleCfg`` are separate but agree on every
+    field read here.
     """
     if sched is None:
         return {}
@@ -537,8 +443,7 @@ def schedule_snapshot(sched):
     t_start = getattr(sched, "t_start", None)
     entries = list(getattr(sched, "entries", None) or [])
     if mode == "sun_cycle" and t_start is not None:
-        # In this mode ``t_start`` is already UTC; the local reading is the
-        # derived one.
+        # ``t_start`` is already UTC in this mode; the local reading is derived.
         anchor = utc_cycle_anchor(t_start, datetime.now())
         t_start_local = anchor.strftime("%H:%M:%S")
         t_start_utc = t_start.strftime("%H:%M:%S")
@@ -548,10 +453,8 @@ def schedule_snapshot(sched):
     return {
         "mode": mode,
         "t_start": t_start_local,
-        # The same instant in UTC. Frame names are UTC on every camera that
-        # writes them, and an observer never learns the station's offset — so
-        # the anchor has to travel in the clock the names are in, and only the
-        # camera can convert it.
+        # Frame names are UTC and an observer never learns the station's offset, so
+        # the anchor travels in UTC, and only the camera can convert it.
         "t_start_utc": t_start_utc,
         "period": float(getattr(sched, "period", 0.0) or 0.0),
         "dead_time": float(getattr(sched, "dead_time", 0.0) or 0.0),
@@ -562,11 +465,10 @@ def schedule_snapshot(sched):
 
 
 def next_cycle_slot(t_start, period, entries, now):
-    """``(slot_time, entry, iteration)`` of the next capture, phase-locked to ``t_start``.
+    """``(slot_time, entry, iteration)`` of the next capture.
 
-    Handles warm-up (``now`` before ``t_start`` → negative iteration) and a late
-    start identically: the phase is always measured from ``t_start``, never from
-    when the program happened to be launched.
+    The phase is always measured from ``t_start``, never from launch; before
+    ``t_start`` the iteration is negative.
     """
     ordered = sorted(entries, key=lambda e: e.delta or 0.0)
     elapsed = (now - t_start).total_seconds()
@@ -584,22 +486,11 @@ def next_cycle_slot(t_start, period, entries, now):
 
 
 def cycle_anchor(t_start, now):
-    """The occurrence of ``t_start`` that belongs to the night ``now`` is in.
+    """The occurrence of ``t_start`` nearest to ``now``, in either direction.
 
-    ``t_start`` is a time of day, so it happens once every 24 h and something has
-    to choose which one. Combining it with today's date — what both drivers used
-    to do — is right for the ordinary case of starting up in the evening before
-    the programme begins, and wrong for a restart after midnight: a station
-    coming back at 00:30 under ``t_start = 22:00`` would read the anchor as
-    22:00 *tonight*, twenty-one and a half hours away. It would then believe it
-    had started early, shoot the opening darks it should have skipped, and — on
-    any period that does not divide into a day — put every slot of the night on
-    the wrong phase.
-
-    So the anchor is simply the nearest occurrence, in either direction: within
-    twelve hours ahead it is tonight's, beyond that it was last night's. Both
-    readings describe the same repeating cycle; this one picks the night the
-    operator is actually standing in.
+    Today's date alone is wrong after midnight: at 00:30 under ``t_start = 22:00`` the
+    anchor would be 21.5 h away, so a station would shoot darks it should skip and, on
+    a period that does not divide a day, put every slot on the wrong phase.
     """
     anchor = datetime.combine(now.date(), t_start)
     if anchor - now > timedelta(hours=12):
@@ -612,15 +503,9 @@ def cycle_anchor(t_start, now):
 def utc_cycle_anchor(t_start_utc, now):
     """The occurrence of the UTC time of day ``t_start_utc`` nearest to ``now``.
 
-    The ``sun_cycle`` counterpart of :func:`cycle_anchor`. There ``t_start`` is
-    the station's own wall clock, which is right for one station on its own;
-    here it is UTC, because the point of the mode is that stations in different
-    places — possibly in different time zones — share one cycle phase.
-
-    ``now`` is a naive local datetime, as everywhere in the drivers, and so is
-    the answer: the anchor is the UTC instant converted back to local time, so it
-    can be handed straight to :func:`next_cycle_slot`. The nearest occurrence in
-    either direction is chosen, for the reason :func:`cycle_anchor` gives.
+    The ``sun_cycle`` counterpart of :func:`cycle_anchor`: UTC lets stations in
+    different time zones share one phase. ``now`` and the result are naive local
+    datetimes, so the result can go straight to :func:`next_cycle_slot`.
     """
     from .timeutil import to_utc
 
@@ -634,7 +519,6 @@ def utc_cycle_anchor(t_start_utc, now):
 
 
 def next_second_slot(seconds, now=None):
-    """Next datetime matching any of ``seconds`` within this or the next minute."""
     now = now or datetime.now()
     ordered = sorted(set(int(s) for s in seconds)) or [0]
     current = now.second + now.microsecond / 1e6
@@ -646,22 +530,17 @@ def next_second_slot(seconds, now=None):
 
 
 def next_minute_boundary(t):
-    """The first whole minute at or after ``t``.
-
-    imagerd_rt armed its cycle timer only on a whole UTC minute
-    (``imagerd_rt.c:725-736``); the cycle modes anchor themselves the same way so
-    that slot times stay readable and comparable between nights.
+    """The first whole minute at or after ``t``; keeps slot times comparable between
+    nights.
     """
     truncated = t.replace(second=0, microsecond=0)
     return truncated if truncated == t else truncated + timedelta(minutes=1)
 
 
 def estimate_cycle_dark_duration(entries, dark_frames, dead_time):
-    """Worst-case seconds to shoot the cycle-mode darks, +10 % and a 30 s buffer.
+    """Worst-case seconds for the cycle-mode darks, +10 % and a 30 s buffer.
 
-    Cycle-mode darks run back to back — there is no second-of-the-minute to wait
-    for — so this is simply the exposures plus their readouts, unlike
-    :func:`estimate_dark_duration`, which has to allow for that wait.
+    They run back to back, with no second-of-the-minute to wait for.
     """
     total = 0.0
     for exposure, _binning, _gain, readout in unique_dark_settings(entries):
@@ -671,10 +550,9 @@ def estimate_cycle_dark_duration(entries, dark_frames, dead_time):
 
 
 def estimate_dark_duration(entries, dark_frames):
-    """Worst-case seconds to shoot every dark frame, +10 % and a 30 s buffer.
+    """Worst-case seconds for every dark frame, +10 % and a 30 s buffer.
 
-    Used to start the pre-darks early enough that they finish exactly when the
-    measurement window opens.
+    Starts the pre-darks early enough to finish as the measurement window opens.
     """
     per_exposure = {}
     for entry in entries:
@@ -689,9 +567,8 @@ def estimate_dark_duration(entries, dark_frames):
 def sun_crossing_time(angle_fn, sun_max_angle, now=None):
     """Next moment the solar altitude drops to ``sun_max_angle``.
 
-    ``angle_fn(datetime) -> degrees``. Walks forward in 5-minute steps to bracket
-    the crossing, then binary-searches it to ~5 ms. Returns ``now`` when it is
-    already dark enough, and ``now + 24 h`` if no crossing is found.
+    Brackets in 5-minute steps, then bisects. ``now`` when already dark enough, ``now
+    + 24 h`` if no crossing is found.
     """
     now = now or datetime.now()
     if angle_fn(now) <= sun_max_angle:

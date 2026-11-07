@@ -1,26 +1,12 @@
 """The two intensity-control blocks of config.json, validated.
 
-:mod:`cameras.common.exposure` is deliberately pure — no camera, no clock, no
-config parsing — so the dataclasses those controllers are constructed from, and
-the validation that decides whether they may run at all, live here instead.
+``prefix`` (``asi`` or ``japan``) opens every message, so an operator knows which
+section to edit. :func:`parse_overexposure` takes the modes the split guard may run
+in: the ASI imager runs it in every mode with slots, the Hamamatsu only in
+``sun_cycle``.
 
-Both imagers read the same two blocks with the same defaults; what differs is
-one rule and one label:
-
-* the **label** is the config prefix used in every message (``asi.preflight``
-  vs ``japan.preflight``), because an operator reading the error has to know
-  which section of config.json to open;
-* the **rule** is where the overexposure guard is allowed to run.
-  ``preflight`` is a ``sun_cycle`` stage on both cameras, but the split guard is
-  a feature of the general cycle: on the ASI imager that means ``time`` as well,
-  while on the Hamamatsu only ``sun_cycle`` drives it — its ``time`` mode is the
-  plain programme it always was. :func:`parse_overexposure` takes the modes it
-  may run in rather than deciding for itself.
-
-The house rule of both camera parsers holds here too: a misconfigured loop is
-switched *off* and the reason appended to ``errors``, never corrected into
-something the operator did not ask for. Shooting the twilight at the wrong
-exposure is worse than not shooting it.
+A loop that cannot run as configured is switched off and reported: shooting the
+twilight at the wrong exposure is worse than not shooting it.
 """
 from __future__ import annotations
 
@@ -30,25 +16,19 @@ import intensity
 
 from . import cfgparse
 
-# Full scale of these 16-bit instruments, the range every intensity setting is
-# expressed in. ``intensity`` is safe to import here because it carries no numpy
-# import of its own, so reading a config still does not drag one in.
+# ``intensity`` has no module-level numpy import, so reading a config does not drag
+# one in.
 SATURATION_ADU = float(intensity.FULL_SCALE)
 
-# The archive file name resolves to one second (``archive_paths.frame_name``), so
-# two frames closer together than this cannot both be filed under the name the
-# station's processing program expects. The overexposure guard therefore never
-# plans sub-frames tighter than this, whatever the config asks for.
+# File names resolve to one second, so two frames closer than this cannot both be
+# filed under the name the processing program expects.
 ARCHIVE_NAME_RESOLUTION = 1.0
 
 
 @dataclass
 class PreflightCfg:
-    """The bright-twilight stage of ``sun_cycle``, with automatic exposure.
-
-    ``sun_start_angle`` is the first setpoint and must sit *above*
-    ``sun_max_angle``: the sun descends through them in that order, and the
-    stage lives in the gap between the two.
+    """``sun_start_angle`` must sit above ``sun_max_angle``: the stage lives between the
+    two.
     """
 
     enabled: bool = False
@@ -64,8 +44,6 @@ class PreflightCfg:
 
 @dataclass
 class OverexposureCfg:
-    """Dividing a slot's frame into shorter sub-frames when it over-exposes."""
-
     enabled: bool = False
     threshold: float = 55000.0        # mean ADU above which the slot divides
     release: float = 0.85             # hysteresis on the way back down
@@ -77,7 +55,6 @@ class OverexposureCfg:
 
 
 def parse_preflight(raw, mode, sun_max_angle, errors, *, prefix):
-    """The preflight block, validated against the schedule it has to fit inside."""
     cfg = PreflightCfg(
         enabled=cfgparse.as_bool(raw, "enabled", False),
         sun_start_angle=cfgparse.as_float(raw, "sun_start_angle", -6.0),
@@ -126,12 +103,8 @@ def parse_preflight(raw, mode, sun_max_angle, errors, *, prefix):
 
 
 def parse_overexposure(raw, errors, *, prefix, mode=None, modes=None):
-    """The overexposure block. Same rule: unusable settings switch it off.
-
-    ``modes`` names the schedule modes this camera drives the guard in; with it
-    given, a guard enabled in any other mode is switched off and said so. Left
-    out, the mode is not checked at all — which is the ASI imager, where every
-    mode that has slots also has the guard.
+    """``modes`` names the schedule modes this camera drives the guard in; a guard
+    enabled in any other is switched off. Left out, the mode is not checked.
     """
     cfg = OverexposureCfg(
         enabled=cfgparse.as_bool(raw, "enabled", False),
@@ -169,9 +142,8 @@ def parse_overexposure(raw, errors, *, prefix, mode=None, modes=None):
         errors.append(f"{prefix}.overexposure.margin must not be negative, got "
                       f"{cfg.margin:g}; using 0.0")
         cfg.margin = 0.0
-    # Not negotiable: sub-frames packed tighter than the archive's own name
-    # resolution would overwrite each other, and a frame taken is a frame that
-    # has to reach the disk. A config asking for less is raised, with a note.
+    # Sub-frames tighter than the archive's name resolution would overwrite each
+    # other.
     if cfg.min_frame_gap < ARCHIVE_NAME_RESOLUTION:
         errors.append(f"{prefix}.overexposure.min_frame_gap must be at least "
                       f"{ARCHIVE_NAME_RESOLUTION:g} s — the archive file name "

@@ -1,16 +1,7 @@
-"""
-The ``asi`` section of config.json, as typed configuration objects.
+"""The ``asi`` section of config.json, as typed configuration objects.
 
-The standalone asi-camera program read an ``config.ini`` through configparser.
-every-camera keeps one JSON file for every camera, so this module does the same
-job against a plain dict: validate, fill defaults, and hand the hardware classes
-the small typed objects they expect (``CameraCfg``, ``CoolingCfg``, …) instead of
-letting them dig around in raw config keys.
-
-Validation never raises for a bad *slot*: problems are collected into
-``AsiConfig.errors`` and reported on the console, because losing one schedule
-line must not cost a night. Missing hardware settings do raise — starting a run
-with an unknown serial port is worse than not starting.
+Problems do not raise: they are collected into ``AsiConfig.errors`` and reported on
+the console, because one bad schedule line must not cost a night.
 """
 from __future__ import annotations
 
@@ -21,27 +12,21 @@ from . import schedule as schedule_mod
 from ..common import cfgparse
 from ..common import exposure_config
 from ..common import filters as common_filters
-# Only for ``default_port``; the module pulls in pyserial when it opens a port,
-# never at import, so reading a config still costs nothing.
+# Only for ``default_port``; pyserial is imported when a port opens, never at import.
 from ..common import filterwheel as common_filterwheel
 
 DEFAULT_MODE = "sun"
 
-# imagerd_rt's own metadata version, written to the ``Version`` header. Spelled
-# here rather than imported from .fits so that reading a config never drags in
-# astropy.
+# imagerd_rt's metadata version for the ``Version`` header. Not imported from .fits,
+# so that reading a config never drags in astropy.
 DEFAULT_LEGACY_VERSION = "3.0"
 
-# The intensity-control blocks are shared with the japan imager and live in
-# cameras/common/exposure_config.py; re-exported under the old names, which the
-# driver and its tests use.
+# Re-exported under the names the driver and its tests use.
 SATURATION_ADU = exposure_config.SATURATION_ADU
 ARCHIVE_NAME_RESOLUTION = exposure_config.ARCHIVE_NAME_RESOLUTION
 PreflightCfg = exposure_config.PreflightCfg
 OverexposureCfg = exposure_config.OverexposureCfg
 
-# The Tory instrument's wheel lives in cameras/common/filters.py now, shared
-# with the japan imager's sun_cycle mode; re-exported under the old names.
 DEFAULT_FILTERS = common_filters.DEFAULT_FILTERS
 FilterInfo = common_filters.FilterInfo
 
@@ -75,8 +60,8 @@ class CoolingCfg:
 
 @dataclass
 class FilterWheelCfg:
-    # Filled in by ``from_dict`` from config.json; the dataclass default is this
-    # platform's usual name. "sim" selects the simulator.
+    # ``from_dict`` fills this in; the default is this platform's usual name. "sim"
+    # selects the simulator.
     port: str = field(default_factory=common_filterwheel.default_port)
     baudrate: int = 9600
     move_timeout: float = 8.0
@@ -115,7 +100,6 @@ class ScheduleCfg:
 
     @property
     def period(self):
-        """Length of one general cycle (cycle modes only)."""
         if self.schedule_len:
             return float(self.schedule_len)
         return schedule_mod.cycle_period(self.entries, self.dead_time)
@@ -141,21 +125,11 @@ class AsiConfig:
         return self.camera.backend == "sim"
 
     def filter_info(self, number):
-        """The wheel position's tag and description; blank when it is unknown.
-
-        A wheel that never confirmed its move reports position 0, and a frame
-        still has to be saved — an unknown filter must cost the header its
-        wavelength, not the night its data.
-        """
         return common_filters.lookup(self.filters, number)
 
 
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
-# Shared with cameras/japan/config.py, which reads the same kind of hand-edited
-# JSON. Kept under the local names so the rest of this module — and anything that
-# calls ``asi_config.parse_time`` — is unaffected by where they live.
+# Shared with cameras/japan/config.py; local names keep ``asi_config.parse_time``
+# working.
 parse_time = cfgparse.parse_time
 _sub = cfgparse.sub
 _float = cfgparse.as_float
@@ -163,20 +137,12 @@ _int = cfgparse.as_int
 _bool = cfgparse.as_bool
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def from_dict(asi_cfg):
     """Build an :class:`AsiConfig` from the ``asi`` sub-dict of config.json.
 
-    The schedule comes from ``asi.schedule`` (a list of slot objects). If
-    ``asi.schedule_file`` points at a readable file, that file wins instead —
-    either a legacy asi-camera ``schedule.txt`` or a converted imagerd_rt
-    schedule in JSON. A JSON schedule may also carry the globals its
-    ``schedule.conf`` carried (mode, sun angle, cycle length, station identity),
-    and those override the matching ``asi.*`` keys: the point of converting a
-    station's schedule is that the whole programme moves with it, not just the
-    slots.
+    A readable ``asi.schedule_file`` wins over ``asi.schedule``. Its globals (mode,
+    sun angle, cycle length, station identity) override the matching ``asi.*`` keys:
+    converting a station's schedule moves the whole programme, not just the slots.
     """
     asi_cfg = asi_cfg or {}
     errors = []
@@ -265,9 +231,8 @@ def from_dict(asi_cfg):
     if mode == "time" and t_start is None:
         errors.append("asi.t_start is required in 'time' mode (HH:MM); using 20:00")
         t_start = time(20, 0)
-    # ``sun_cycle`` without a ``t_start`` is legitimate — a converted imagerd_rt
-    # schedule has none — and keeps imagerd_rt's whole-minute anchor. With one,
-    # it is read as UTC and the cycle phase is locked to it.
+    # ``sun_cycle`` without a ``t_start`` is legitimate: a converted imagerd_rt
+    # schedule has none and keeps the whole-minute anchor. With one, it is UTC.
 
     schedule_len = None
     raw_len = settings.get("schedule_len")
@@ -299,8 +264,8 @@ def from_dict(asi_cfg):
         schedule_len=schedule_len,
     )
 
-    # The ASI imager drives the split guard in every mode that has slots, so no
-    # ``modes`` is passed: there is nothing to restrict it to.
+    # The ASI imager drives the split guard in every mode that has slots: no
+    # ``modes``.
     preflight = exposure_config.parse_preflight(
         _sub(asi_cfg, "preflight"), sched.mode, sched.sun_max_angle, errors,
         prefix="asi")
@@ -335,5 +300,4 @@ def from_dict(asi_cfg):
 
 
 def _filters(raw):
-    """Build the wheel table, falling back to the Tory instrument's."""
     return common_filters.parse_filters(raw, what="asi.filters")

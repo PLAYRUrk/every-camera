@@ -1,14 +1,7 @@
-"""Reading values out of a config dict without ever raising.
+"""Config readers that fall back instead of raising.
 
-every-camera keeps one JSON file for every camera, hand-edited as often as it is
-written by the setup wizard, so a value can be the wrong type, a number can be
-spelled as a string, and a whole sub-object can be missing. A camera refusing to
-start over a stray quote would be worse than a camera starting with the default,
-so these readers fall back instead of raising; the camera's ``from_dict`` collects
-what looked wrong into its ``errors`` list and the console reports it.
-
-Both ``cameras/asi/config.py`` and ``cameras/japan/config.py`` are built out of
-these five, which is why they live here.
+The JSON is hand-edited, and a camera refusing to start over a stray quote is worse
+than one starting with the default.
 """
 from __future__ import annotations
 
@@ -16,7 +9,6 @@ from datetime import datetime, time
 
 
 def parse_time(value, default=None):
-    """Parse ``HH:MM`` / ``HH:MM:SS`` into a ``time``; ``default`` when unusable."""
     if value in (None, ""):
         return default
     if isinstance(value, time):
@@ -31,7 +23,6 @@ def parse_time(value, default=None):
 
 
 def sub(cfg, key):
-    """The nested object at ``key``, or an empty dict if it is missing or not one."""
     value = cfg.get(key)
     return value if isinstance(value, dict) else {}
 

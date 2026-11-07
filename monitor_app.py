@@ -1,31 +1,10 @@
 #!/usr/bin/env python3
-"""
-Every Camera — monitor.
+"""Every camera as a tile: what it is, where it runs, what it is doing, what went wrong.
 
-Every camera as a tile: what it is, which machine it runs on, what it is doing
-right now, and what has gone wrong.
-
-Two ways of finding them, and the second is not a lesser one:
-
-* **The local network** — cameras are found by the same UDP discovery
-  ``viewer_app.py`` and ``focus_app.py`` use, and each tile is filled in from
-  that camera's ``GET /api/status``. Nothing has to be configured.
-* **Through a gateway** — every camera knows the others and will fetch from
-  them on your behalf (``gateway.py``). Name one camera you can reach, in the
-  strip at the bottom, and its neighbours appear as tiles too. This replaced a
-  broker, and unlike the broker it carries everything: the tiles it produces
-  have working Frames and Focus buttons, because the route is real.
-
-Watching only. Frames belong to ``viewer_app.py`` and focusing to
-``focus_app.py`` — this program used to fetch frames itself, which amounted to
-a second, weaker viewer inside the monitor. The tiles now hand the camera over
-to the right tool instead.
-
-Usage:
-    python monitor_app.py
-    python monitor_app.py --host 192.168.1.5      # one discovery cannot see
-    python monitor_app.py --via 192.168.1.5:8765  # and everything it knows
-    python monitor_app.py --interval 5            # status refresh, seconds
+Cameras come from UDP discovery on the LAN, or through a gateway (``gateway.py``):
+name one reachable camera and its neighbours appear too, with working Frames and
+Focus buttons. Watching only: frames and focus belong to ``viewer_app.py`` and
+``focus_app.py``.
 """
 import argparse
 import html
@@ -49,11 +28,7 @@ TILE_WIDTH = 330
 MISSES_BEFORE_GONE = 2
 
 
-# ---------------------------------------------------------------------------
-# Wording — everything below reads a status payload, nothing talks to hardware
-# ---------------------------------------------------------------------------
 def fmt_age(iso_str):
-    """How long ago, in words, or an em dash when there is nothing to say."""
     if not iso_str:
         return "—"
     try:
@@ -72,7 +47,6 @@ def fmt_age(iso_str):
 
 
 def fmt_countdown(iso_str):
-    """Time until a moment in the future, for the next scheduled capture."""
     if not iso_str:
         return "—"
     try:
@@ -89,7 +63,7 @@ def fmt_countdown(iso_str):
 
 
 def fmt_filter(value):
-    """The ASI wheel's position: home is a place, unknown is a failed move."""
+    """0 is the home position; None means the last wheel move failed."""
     if value is None:
         return "unknown"
     return "home" if value == 0 else str(value)
@@ -104,10 +78,7 @@ def fmt_sensor(rec):
 
 
 def short_reason(message):
-    """The readable part of a connection failure, for a 330-pixel tile.
-
-    ``urlopen`` wraps the real cause twice over; a card has room for the cause.
-    """
+    """``urlopen`` wraps the real cause twice over; a tile has room only for the cause."""
     text = str(message or "").strip()
     _, _, tail = text.partition("unreachable: ")
     text = (tail or text).strip()
@@ -119,12 +90,7 @@ def short_reason(message):
 
 
 def camera_rows(rec):
-    """The lines worth showing for one camera, as ``(label, value)`` pairs.
-
-    Everything comes from the status payload the worker publishes — the same
-    one whichever way it was fetched — so a camera type that grows a field only
-    has to publish it.
-    """
+    """``(label, value)`` rows from the status payload, the same whichever way it was fetched."""
     rows = []
     kind = (rec.get("camera_type") or "").lower()
 
@@ -135,9 +101,7 @@ def camera_rows(rec):
     if rec.get("mode") and not rec.get("setup_mode"):
         rows.append(("Schedule", str(rec["mode"])))
 
-    # Both imagers report the same fields; the Japan camera simply has no
-    # setpoint, and ``fmt_sensor`` already shows a bare reading when there is
-    # none, so one branch serves both.
+    # The Japan camera has no setpoint; ``fmt_sensor`` then shows a bare reading.
     if kind in ("asi", "japan"):
         exposure, binning = rec.get("exposure"), rec.get("binning")
         if exposure is not None:
@@ -260,15 +224,12 @@ from net_client import (                                            # noqa: E402
     load_settings, save_settings,
 )
 
-# A tile's key is (route, host, port). ``route`` is LAN for a camera this
-# machine talks to directly, or the ``host:port`` of the gateway that will
-# fetch for us — which is also exactly what CameraClient(via=...) wants.
+# A tile's key is (route, host, port). ``route`` is LAN or the gateway's
+# ``host:port``, which is what CameraClient(via=...) takes.
 LAN = "lan"
 
 
 class CameraTile(QFrame):
-    """One camera, as much of it as fits on a card."""
-
     details_requested = pyqtSignal(object)      # the whole status record
 
     def __init__(self, key, node, parent=None):
@@ -278,9 +239,7 @@ class CameraTile(QFrame):
         self.record = {}
         self.misses = 0
         self.unreachable = ""
-        # Whether the filter box excludes this tile. Kept here rather than read
-        # back from Qt: a widget that has not been shown yet is "hidden" too,
-        # and taking that for "filtered out" left every new tile invisible.
+        # Not read back from Qt: a widget not yet shown also reports hidden.
         self.filtered_out = False
         self.setFrameShape(QFrame.StyledPanel)
         self.setFixedWidth(TILE_WIDTH)
@@ -335,19 +294,16 @@ class CameraTile(QFrame):
 
         self.refresh()
 
-    # -- identity ---------------------------------------------------------
     @property
     def source(self):
         return self.key[0]
 
     @property
     def address(self):
-        """``(host, port)`` of the camera itself, whichever way we reach it."""
         return (self.key[1], self.key[2])
 
     @property
     def via(self):
-        """The gateway fetching for us, or None when we talk to it directly."""
         return None if self.source == LAN else self.source
 
     @property
@@ -356,23 +312,19 @@ class CameraTile(QFrame):
 
     @property
     def snapshot(self):
-        """Everything known about this camera: discovery reply plus status."""
         merged = dict(self.node)
         merged.update(self.record)
         return merged
 
     @property
     def label(self):
-        """The text the filter box matches against."""
         rec = self.snapshot
         return " ".join(str(x) for x in (
             rec.get("instance_name"), rec.get("camera_type"),
             node_name_of(rec), self.address[0], self.via or "",
             rec.get("status")))
 
-    # -- updates ----------------------------------------------------------
     def seen(self, node):
-        """A fresh discovery reply for this camera."""
         self.node.update(node or {})
         self.misses = 0
 
@@ -383,7 +335,6 @@ class CameraTile(QFrame):
         self.refresh()
 
     def set_unreachable(self, message):
-        """It answered once and is not answering now — say so, keep the tile."""
         self.unreachable = message or "not answering"
         self.refresh()
 
@@ -392,8 +343,7 @@ class CameraTile(QFrame):
         self.lbl_name.setText(str(rec.get("instance_name") or "?"))
         where = f"{self.address[0]}:{self.address[1]}"
         if self.via:
-            # Say which camera is fetching for us: "not answering" then points
-            # at the right one of the two.
+            # Names the fetching camera, so "not answering" points at the right one of the two.
             where += f"  (via {self.via})"
         self.lbl_where.setText(
             f"{str(rec.get('camera_type') or '?').upper()}  ·  "
@@ -415,8 +365,7 @@ class CameraTile(QFrame):
                                   f"{html.escape(short_reason(self.unreachable))}"
                                   "</span>")
         else:
-            # Escaped as it is put in: a status value is a camera's own text,
-            # and one with a "<" in it silently ate the rest of the tile.
+            # A status value is a camera's own text; a raw "<" would eat the rest of the tile.
             cells = [(key, html.escape(str(value)))
                      for key, value in camera_rows(rec)]
             errors = rec.get("errors") or 0
@@ -435,9 +384,7 @@ class CameraTile(QFrame):
         if rec.get("setup_mode"):
             notes.append("Setup mode — no schedule, nothing is being archived.")
         if rec.get("hold_effective"):
-            # Distinguished from an ordinary focus session on purpose: this
-            # camera has stopped measuring, and a monitor that only said
-            # "someone is focusing" would leave that looking like a fault.
+            # Told apart from a focus session: stopped measurements must not read as a fault.
             notes.append("Measurements paused while someone focuses this camera.")
         elif rec.get("focus_active"):
             notes.append("Someone is focusing this camera.")
@@ -448,7 +395,6 @@ class CameraTile(QFrame):
         self._update_buttons(rec)
 
     def _update_buttons(self, rec):
-        """Both work through a gateway too, which is why it replaced the broker."""
         self.btn_frames.setEnabled(not self.unreachable)
         self.btn_frames.setToolTip("Open viewer_app.py for this camera")
         focusable = bool(rec.get("supports_focus", True))
@@ -458,7 +404,6 @@ class CameraTile(QFrame):
             else "This camera has no free-running focus mode")
 
     def _launch(self, program):
-        """Hand this camera over to the program whose job that is."""
         host, port = self.address
         command = [sys.executable, os.path.join(APP_DIR, program),
                    "--host", str(host), "--port", str(port)]
@@ -472,8 +417,6 @@ class CameraTile(QFrame):
 
 
 class DetailsDialog(QDialog):
-    """The camera's whole status payload, for when a tile is not enough."""
-
     def __init__(self, record, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{record.get('instance_name', 'camera')} — status")
@@ -487,16 +430,8 @@ class DetailsDialog(QDialog):
 
 
 class GatewayPanel(QGroupBox):
-    """The second way in: one camera, asked about all the others.
-
-    Deliberately a strip at the bottom rather than a tab. Most of the time
-    discovery finds everything and this stays collapsed; it earns its place on
-    the network where broadcast does not cross a switch, or from a machine
-    outside the cameras' segment with a route to exactly one of them.
-
-    The address is remembered, so it has to be typed once. The tiles it
-    produces are not second-class: the gateway forwards the archive, the live
-    stream and the parameters, so Frames and Focus work on them.
+    """A strip, not a tab: needed only where broadcast does not cross a switch, or from
+    outside the cameras' segment with a route to just one of them.
     """
 
     nodes_received = pyqtSignal(str, object)     # gateway address, node list
@@ -507,7 +442,7 @@ class GatewayPanel(QGroupBox):
     def __init__(self, parent=None):
         super().__init__("Through a gateway — ask one camera about the rest", parent)
         self.setCheckable(True)
-        self.setChecked(False)          # collapsed until someone wants it
+        self.setChecked(False)
         self._tasks = TaskRunner(self)
         self._asking = False
 
@@ -560,7 +495,6 @@ class GatewayPanel(QGroupBox):
 
     @staticmethod
     def normalise(address):
-        """``host`` or ``host:port`` to the ``host:port`` a proxy URL needs."""
         text = str(address or "").strip()
         if not text:
             return ""
@@ -571,7 +505,6 @@ class GatewayPanel(QGroupBox):
         return f"{host}:{int(port) if port.strip().isdigit() else DEFAULT_HTTP_PORT}"
 
     def ask(self, address):
-        """Fetch ``/api/nodes`` from ``address`` and hand the result on."""
         via = self.normalise(address)
         if not via:
             self._set_state("type the address of a camera you can reach", error=True)
@@ -615,7 +548,7 @@ class MonitorWindow(QMainWindow):
 
         self._tasks = TaskRunner(self)
         self._tiles = {}             # key -> CameraTile
-        self._polling = set()        # LAN keys with a status request in flight
+        self._polling = set()        # keys with a status request in flight
         self._discovery = None
         self._columns = 0
         self._last_search = None
@@ -634,7 +567,6 @@ class MonitorWindow(QMainWindow):
 
         QTimer.singleShot(150, self.discover)
 
-    # -- UI ----------------------------------------------------------------
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -695,7 +627,6 @@ class MonitorWindow(QMainWindow):
         super().resizeEvent(event)
         self._relayout()
 
-    # -- finding cameras ----------------------------------------------------
     def discover(self):
         if self._discovery is not None and self._discovery.isRunning():
             return
@@ -719,13 +650,10 @@ class MonitorWindow(QMainWindow):
             else:
                 tile.seen(node)
                 tile.refresh()
-            # Reached first-hand now, so a forwarded tile for it is one hop of
-            # hearsay too many.
             self._drop_forwarded_twin(key)
         for key, tile in self._tiles.items():
-            # A camera added by hand never answers discovery, and one reached
-            # through a gateway is not on this network at all: both are
-            # judged by their own route, not by this probe.
+            # Manual cameras never answer discovery and gateway ones are not on this
+            # network: both are judged by their own route, not by this probe.
             if key in seen or tile.via or tile.node.get("manual"):
                 continue
             tile.misses += 1
@@ -735,7 +663,6 @@ class MonitorWindow(QMainWindow):
         self._update_summary()
 
     def add_manual(self, text):
-        """Watch a camera given as ``host`` or ``host:port``."""
         text = (text or "").strip()
         if not text:
             return
@@ -756,8 +683,7 @@ class MonitorWindow(QMainWindow):
         tile = CameraTile(key, node, self._canvas)
         tile.details_requested.connect(self._show_details)
         self._tiles[key] = tile
-        # Through the filter, so a camera appearing while one is typed in does
-        # not jump the queue.
+        # Through the filter, so a new camera does not bypass what is typed there.
         self._apply_filter(self.le_filter.text())
         return tile
 
@@ -770,19 +696,13 @@ class MonitorWindow(QMainWindow):
         self._relayout(force=True)
 
     def _drop_forwarded_twin(self, lan_key):
-        """A camera we can reach directly does not also need a forwarded tile.
-
-        Same camera, same address, two routes to it. The direct one is a
-        first-hand reading and one hop shorter, so the forwarded tile goes.
-        """
+        """The direct route is first-hand and one hop shorter, so the forwarded tile goes."""
         _, host, port = lan_key
         for key in [k for k in self._tiles
                     if k[0] != LAN and k[1] == host and k[2] == port]:
             self._remove_tile(key)
 
-    # -- through a gateway ---------------------------------------------------
     def use_gateway(self, address):
-        """Ask ``address`` for every camera it knows."""
         self.gateway.setChecked(True)
         self.gateway.ask(address)
 
@@ -807,7 +727,6 @@ class MonitorWindow(QMainWindow):
         self._poll_all()
         self._update_summary()
 
-    # -- reading status -----------------------------------------------------
     def _poll_all(self):
         for key, tile in list(self._tiles.items()):
             if key in self._polling:
@@ -837,9 +756,7 @@ class MonitorWindow(QMainWindow):
     def _show_details(self, record):
         DetailsDialog(record, self).exec_()
 
-    # -- layout -------------------------------------------------------------
     def _relayout(self, force=False):
-        """Reflow the tiles into as many columns as the window now fits."""
         width = max(self._canvas.width(), TILE_WIDTH)
         columns = max(1, (width + self._grid.spacing())
                       // (TILE_WIDTH + self._grid.spacing()))
@@ -862,7 +779,6 @@ class MonitorWindow(QMainWindow):
         self.lbl_empty.setVisible(not self._tiles)
 
     def _sorted_tiles(self):
-        """LAN first, then by camera type and name — a stable, readable order."""
         return sorted(self._tiles.values(),
                       key=lambda t: (bool(t.via),
                                      str(t.snapshot.get("camera_type") or ""),

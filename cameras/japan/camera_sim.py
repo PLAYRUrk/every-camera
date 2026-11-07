@@ -1,14 +1,8 @@
-"""Synthetic camera with the same interface as :class:`camera.HamamatsuCamera`.
+"""Synthetic camera with the interface of :class:`camera.HamamatsuCamera`, for machines
+with no SDK.
 
-Selected with ``japan.camera.backend = "sim"``. It exists so the scheduler, the
-filter sequencing, the dashboard and the FITS output can be exercised end to end
-on a machine with no camera and no DCAM-API SDK installed. Exposures really do
-take the requested time, so timing behaviour matches a real run.
-
-The cooler can be switched, as ``SENSORCOOLER`` switches it on the real camera:
-on, the sensor relaxes towards the target; off, towards the room. Either way it
-wanders a little, which is what the dashboard and the CCD-TEMP header should be
-shown.
+Exposures really take the requested time. The cooler switches as ``SENSORCOOLER``
+does: on, the sensor relaxes towards the target; off, towards the room.
 """
 from __future__ import annotations
 
@@ -27,9 +21,8 @@ if TYPE_CHECKING:
 SENSOR_WIDTH = 2048
 SENSOR_HEIGHT = 2048
 
-# Where the sensor settles with the cooler on (unless a target is set) and off,
-# and how fast it gets there. A camera starts with its cooler running, which is
-# how the real one powers up.
+# Where the sensor settles with the cooler on (unless a target is set) and off. A
+# camera starts with its cooler running, as the real one powers up.
 SENSOR_TEMP_C = -10.0
 AMBIENT_C = 20.0
 COOLING_TAU_S = 60.0         # time constant of the approach either way
@@ -54,7 +47,6 @@ class SimCamera:
         self._temp = SENSOR_TEMP_C
         self._temp_at = monotonic()
 
-    # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> SimCamera:
         console_ui.log("Camera backend: SIMULATOR (no hardware in use)")
         return self
@@ -62,7 +54,6 @@ class SimCamera:
     def __exit__(self, *args) -> None:
         pass
 
-    # --- configuration ------------------------------------------------------
     def set_exposure(self, sec: float) -> None:
         self.current_exposure = float(sec)
 
@@ -84,9 +75,7 @@ class SimCamera:
             value = 2
         self.current_readout_speed = value
 
-    # --- cooling ------------------------------------------------------------
     def _settle(self) -> float:
-        """Advance the sensor towards wherever the cooler is taking it."""
         now = monotonic()
         goal = self.target_temperature if self.cooler_on else AMBIENT_C
         self._temp = goal + (self._temp - goal) * float(
@@ -116,7 +105,6 @@ class SimCamera:
         near = abs(self._settle() - self.target_temperature) <= READY_WITHIN_C
         return "ready" if near else "busy"
 
-    # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
         phase = (monotonic() - self._started) / DRIFT_PERIOD_S
         drift = DRIFT_C * np.sin(2.0 * np.pi * phase)
@@ -135,7 +123,6 @@ class SimCamera:
         frame = signal + 600.0 + self._rng.normal(0.0, read_noise, (h, w))
         return np.clip(frame, 0, 65535).astype("<u2")
 
-    # --- identification -----------------------------------------------------
     def info(self) -> dict:
         """The same keys the real ``info()`` returns, so nothing branches on backend."""
         return {
@@ -150,7 +137,6 @@ class SimCamera:
         }
 
     def info_rows(self) -> list:
-        """``(label, value)`` rows describing the camera, for the console block."""
         info = self.info()
         width, height = self._sensor
         return [

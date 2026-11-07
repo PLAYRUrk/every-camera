@@ -1,38 +1,20 @@
-"""
-LAN discovery for every-camera nodes — a tiny UDP beacon, no dependencies.
+"""LAN discovery over UDP. A convenience: typing ``host:port`` by hand always works.
 
-A camera answers broadcast probes with a JSON description of itself, so
-``viewer_app.py`` and ``focus_app.py`` can list the cameras on the network
-instead of asking the observer to remember IP addresses. Typing ``host:port``
-by hand always works too, so discovery is a convenience, never a requirement.
+    probe  -> multicast + broadcast, payload  b"EVERYCAM_DISCOVER?"
+    reply  -> unicast,               payload  {"service": "every-camera", ...}
+    hello  -> multicast + broadcast, payload  b"EVERYCAM_HELLO {...}"
 
-Protocol (deliberately trivial):
-    probe  -> UDP multicast + broadcast, payload  b"EVERYCAM_DISCOVER?"
-    reply  -> UDP unicast,               payload  {"service": "every-camera", ...}
+Probes go out twice: a broadcast to a shared port reaches exactly *one* socket, while
+multicast is copied to every socket in the group, so only it finds several instances
+per host. Broadcast stays because switches without an IGMP querier drop multicast,
+and older nodes answer nothing else.
 
-The probe goes out twice on purpose. A broadcast datagram arriving at a shared
-port is delivered by the kernel to exactly *one* socket, so on a machine
-running two cameras only one of them was ever discoverable. A multicast
-datagram is copied to every socket that joined the group — the same trick mDNS
-uses — which is what makes several instances per host visible. Broadcast is
-kept alongside it because switches without an IGMP querier drop multicast, and
-because nodes running an older version answer nothing else.
+Hellos reach every camera's responder and land in its peer registry (``peers.py``):
+a camera started later turns up by itself, and one behind a switch that drops
+broadcast stays reachable by unicast once it has been seen.
 
-Nodes also announce themselves unasked, every ``ANNOUNCE_EVERY`` seconds:
-
-    hello  -> UDP multicast + broadcast, payload  b"EVERYCAM_HELLO {...}"
-
-Nobody has to be running a probe to hear one. Every camera already keeps a
-responder socket bound to this port for the life of the process, so an
-announcement from one camera reaches every other camera on the segment and is
-written into its peer registry (``peers.py``). Two things follow, and both are
-the point: a camera started later turns up by itself instead of waiting for
-somebody to search again, and — because the registry is also probed by unicast
-on the next run — a camera behind a switch that drops broadcast stays
-reachable once it has been seen once.
-
-The responder runs in a daemon thread with every error swallowed: a firewall
-that blocks UDP, or a port already in use, must never disturb measurements.
+The responder swallows every error: a firewall blocking UDP or a port in use must
+never disturb measurements.
 """
 import json
 import os
@@ -50,19 +32,13 @@ MCAST_GROUP = "239.255.42.99"
 PROBE = b"EVERYCAM_DISCOVER?"
 # Unsolicited "here I am", carrying the same JSON a reply would.
 ANNOUNCE = b"EVERYCAM_HELLO "
-# Often enough that a camera started mid-evening is known within the minute,
-# rarely enough to be invisible: one datagram per camera per minute.
+# Known within the minute, at one datagram per camera per minute.
 ANNOUNCE_EVERY = 60.0
 SERVICE_TAG = "every-camera"
 MAX_REPLY_BYTES = 8192
 
 
-# ---------------------------------------------------------------------------
-# Camera side — answer probes
-# ---------------------------------------------------------------------------
 class DiscoveryResponder(threading.Thread):
-    """Answers ``EVERYCAM_DISCOVER?`` broadcasts with this node's details."""
-
     def __init__(self, info_provider, port=DISCOVERY_PORT, group=MCAST_GROUP):
         super().__init__(daemon=True, name="everycam-discovery")
         self._info_provider = info_provider
@@ -74,13 +50,11 @@ class DiscoveryResponder(threading.Thread):
         self._announcer = None
 
     def start_safely(self):
-        """Bind and start. Returns True on success, False (with a warning) otherwise."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Both options are needed for several responders per machine:
-            # SO_REUSEPORT lets them all bind the port, and the multicast
-            # membership below is what actually gets each of them a copy.
+            # Several responders per machine need both: SO_REUSEPORT to bind the port,
+            # and the multicast membership below to give each of them a copy.
             if hasattr(socket, "SO_REUSEPORT"):
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -90,9 +64,7 @@ class DiscoveryResponder(threading.Thread):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             except OSError:
                 pass
-            # Announcements go out on this same socket, so it needs the
-            # sending options too. TTL 1: an announcement is about this
-            # segment and has no business being routed off it.
+            # Announcements go out on this socket too. TTL 1: they stay on this segment.
             for option, value in ((socket.IP_MULTICAST_TTL, 1),
                                   (socket.IP_MULTICAST_LOOP, 1)):
                 try:
@@ -112,8 +84,8 @@ class DiscoveryResponder(threading.Thread):
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
             self._joined = True
         except OSError as exc:
-            # Broadcast still works, so this is a degradation, not a failure —
-            # but on a host with several instances only one will be found.
+            # Broadcast still works, but on a host with several instances only one is
+            # found.
             console_ui.warn(f"Discovery multicast group {self._group} unavailable "
                             f"({exc}); falling back to broadcast only.")
 
@@ -147,7 +119,6 @@ class DiscoveryResponder(threading.Thread):
                 continue
 
     def _describe(self):
-        """This node as a JSON datagram, or None if it will not say."""
         try:
             info = dict(self._info_provider() or {})
         except Exception:
@@ -159,13 +130,11 @@ class DiscoveryResponder(threading.Thread):
             return None
 
     def _note_announcement(self, payload, addr):
-        """Write a neighbour into the peer registry.
+        """The address comes from the packet, not the sender: a node behind NAT does not
+        know how it is reached.
 
-        The address is taken from the packet rather than from what the sender
-        claimed: a node behind NAT does not know how it is reached, and the
-        one thing this must never record is an address that does not work.
-        Its own announcement comes back through multicast loopback and is
-        dropped by the pid check.
+        Its own announcement returns through multicast loopback and is dropped by the
+        pid check.
         """
         try:
             info = json.loads(payload.decode("utf-8"))
@@ -185,9 +154,7 @@ class DiscoveryResponder(threading.Thread):
             pass
 
     def _announce_loop(self):
-        """Say "here I am" on a timer, so nobody has to ask."""
-        # A short first wait, so a camera just started is known within seconds
-        # rather than at the end of the first full interval.
+        # Short first wait, so a camera just started is known within seconds.
         if self._stop.wait(2.0):
             return
         while True:
@@ -220,7 +187,6 @@ class DiscoveryResponder(threading.Thread):
 
 
 def start_responder(info_provider, port=DISCOVERY_PORT, group=MCAST_GROUP):
-    """Start a DiscoveryResponder. Returns the responder, or None on failure."""
     try:
         responder = DiscoveryResponder(info_provider, port, group)
         return responder if responder.start_safely() else None
@@ -229,11 +195,7 @@ def start_responder(info_provider, port=DISCOVERY_PORT, group=MCAST_GROUP):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Viewer side — send probes
-# ---------------------------------------------------------------------------
 def _broadcast_addresses():
-    """Best-effort list of broadcast targets for the probe."""
     targets = ["255.255.255.255"]
     try:
         # Derive the /24 broadcast of the interface holding the default route.
@@ -252,18 +214,12 @@ def _broadcast_addresses():
 
 def discover(timeout=1.5, port=DISCOVERY_PORT, extra_hosts=None,
              group=MCAST_GROUP, use_peers=True):
-    """Probe the LAN and collect replies for ``timeout`` seconds.
+    """Returns dicts with at least ``host``, ``http_port``, ``instance_name`` and
+    ``camera_type``, unique by ``host:http_port``, so two instances on a machine both
+    show.
 
-    Returns a list of dicts, each carrying at least ``host``, ``http_port``,
-    ``instance_name`` and ``camera_type``. Duplicates (a node answering both the
-    multicast and the broadcast probe) are collapsed by ``host:http_port``;
-    two instances on one machine differ by port and are both listed.
-
-    With ``use_peers``, every address seen on a previous run is probed by
-    unicast as well, and whatever answers is written back. This is what makes
-    a camera behind a switch that drops broadcast findable at all: it has to
-    be seen once — by broadcast, by an announcement, or by being typed in —
-    and after that it is remembered.
+    With ``use_peers`` addresses seen on earlier runs are probed by unicast too, which
+    is how a camera behind a switch that drops broadcast stays findable once seen.
     """
     found = {}
     try:

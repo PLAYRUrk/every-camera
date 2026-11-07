@@ -1,27 +1,10 @@
-"""Which log lines are worth waking somebody for, and what the letter says.
+"""Decides which log lines deserve a letter; hangs off ``console_ui.add_sink``.
 
-This hangs off ``console_ui.add_sink``, which every line of every process passes
-through whatever mode it is running in — dashboard, plain, or no dashboard at
-all. That is the only place in the program where "something went wrong" is
-already spelled out in words a person can act on, so it is where the rules
-live, rather than scattered across six drivers.
-
-Three things it is careful about.
-
-**It never blocks the measurement.** The sink is called on the thread that
-logged the line, which is usually the thread taking the frame. So the most this
-does synchronously is match a few regexes and, occasionally, write a small file
-into the spool. It never opens a socket; ``sentinel.py`` sends.
-
-**It never floods.** The night of 26 August 2026 produced the same filter-wheel
-error every forty seconds from dusk to breakfast. Sent as written that is a
-thousand letters, an exhausted daily allowance, and a mailbox nobody will read
-again. Each rule therefore sends once and then goes quiet for
-``cooldown_minutes``, counting repeats; the digest says how many there were.
-
-**It never recurses.** A rule that logged something would re-enter the sink it
-was called from, and a rule that logged on failure would do it for ever. The
-guard below is not decorative.
+The sink runs on the logging thread, usually the one taking the frame, so letters
+only go into the spool and ``sentinel.py`` sends them.
+Each rule sends once, then counts repeats for ``cooldown_minutes``: a fault repeating
+all night costs one letter, not a thousand and the daily allowance.
+A rule must not log: it would re-enter the sink.
 """
 import faulthandler
 import json
@@ -39,27 +22,17 @@ from pathlib import Path
 import console_ui
 import mailer
 
-# How often the background thread wakes to flush a digest or check the disk.
-# Nothing here is urgent to the second, and the thread must be invisible.
 _TICK_SECONDS = 30.0
 
-# Where a process leaves word of how it ended, for the sentinel to find
-# afterwards. Both are keyed by the stem of the worker's status file —
-# "{pid}" for a console worker, "{pid}_{camera}" for one tab of the GUI —
-# because that is what the sentinel is tracking.
+# Both keyed by the status file stem the sentinel tracks: "{pid}" for a console
+# worker, "{pid}_{camera}" for one GUI tab.
 _MARKER_HOME = Path.home() / ".every_camera"
 EXIT_DIR = str(_MARKER_HOME / "exits")
 CRASH_DIR = str(_MARKER_HOME / "crashes")
 
 
 class Rule:
-    """One thing worth reporting, and how loudly.
-
-    ``immediate`` rules get a letter of their own the moment they first fire.
-    Everything else accumulates into the digest, which goes out on a timer —
-    an error that repeats is a fact about the night, not a reason for a letter
-    each time.
-    """
+    """Immediate rules get a letter on first match; the rest wait for the digest."""
 
     def __init__(self, kind, pattern, headline, immediate=True, levels=("ERROR",)):
         self.kind = kind
@@ -72,15 +45,14 @@ class Rule:
         return level in self.levels and self.pattern.search(message) is not None
 
 
-# Ordered: the first rule that matches wins, so the specific ones come first.
+# First match wins, so the specific rules come first.
 RULES = (
     Rule("capture-stopped",
          r"consecutive capture failures",
          "камера остановила съёмку"),
     Rule("filter-controller-silent",
-         # Both spellings: the controller says "no answer" and "written
-         # off" about itself, while the failed rebuild is reported by the
-         # wheel. Same fault, and the same letter is wanted for it.
+         # The controller says "no answer" and "written off" about itself; the failed
+         # rebuild is reported by the wheel. Same fault, same letter.
          r"Filter (controller|wheel).*(no answer|written off|still says nothing)",
          "контроллер фильтров не отвечает"),
     Rule("filter-wheel-lost",
@@ -101,18 +73,13 @@ RULES = (
     Rule("measurement-loop-failed",
          r"Measurement loop failed",
          "измерительный цикл прерван ошибкой"),
-    # The catch-all. Everything else logged as an error is worth knowing about
-    # by morning, but not worth a letter of its own at three in the morning.
+    # Catch-all: worth knowing by morning, not worth a letter at three at night.
     Rule("error", r".", "ошибка", immediate=False),
 )
 
 
 def _log_tail(path, lines):
-    """The last ``lines`` lines of the log, or a note saying why there are none.
-
-    Read from the end: these files rotate at 2 MB, and a letter that had to
-    parse all of it would be paying for the whole night to quote its last page.
-    """
+    """Reads from the end: the file can reach 2 MB and only its last page is quoted."""
     if not path or not os.path.exists(path):
         return "(лог недоступен)"
     try:
@@ -128,7 +95,6 @@ def _log_tail(path, lines):
 
 
 def _host_address():
-    """This machine's address as the network sees it, for the letter's header."""
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         probe.settimeout(0.3)
@@ -141,8 +107,6 @@ def _host_address():
 
 
 class AlertEngine:
-    """Watches the log of one process and queues letters about it."""
-
     def __init__(self, cfg, node_name, instance_name, camera_type,
                  log_path=None, status_provider=None, spool=None):
         cfg = cfg or {}
@@ -164,14 +128,12 @@ class AlertEngine:
         self._digest = []           # (time, level, message) awaiting a letter
         self._digest_due = time.monotonic() + self.digest_every
         self._disk_warned = False
-        # Set while a rule is being handled, so that anything logged from in
-        # here cannot come back round as another line to react to.
+        # Set while handling a rule, so anything logged from here is not handled again.
         self._busy = threading.local()
         self._stop = threading.Event()
         self._thread = None
         self.started_at = time.time()
 
-    # -- lifecycle -----------------------------------------------------------
     def start(self):
         console_ui.add_sink(self._on_line)
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -189,17 +151,15 @@ class AlertEngine:
             try:
                 self.tick()
             except Exception:
-                # A broken rule must not take the process down, and must not
-                # log — see the recursion note at the top.
+                # Must not take the process down, and must not log: that re-enters the
+                # sink.
                 pass
 
     def tick(self):
-        """Periodic work: send the digest when it is due, watch the disk."""
         if time.monotonic() >= self._digest_due:
             self.flush_digest()
         self._check_disk()
 
-    # -- the sink ------------------------------------------------------------
     def _on_line(self, message, level):
         if getattr(self._busy, "flag", False):
             return
@@ -223,7 +183,6 @@ class AlertEngine:
             return
 
     def _raise(self, rule, message):
-        """Queue a letter for ``rule``, unless it is still inside its cooldown."""
         now = time.monotonic()
         with self._lock:
             last = self._sent_at.get(rule.kind)
@@ -234,9 +193,7 @@ class AlertEngine:
         self.queue(f"{self.instance_name} на {self.node_name} — {rule.headline}",
                    self._compose(rule.headline, message), kind=rule.kind)
 
-    # -- letters -------------------------------------------------------------
     def queue(self, subject, body, kind=""):
-        """Put one letter in the spool. Returns True if it got there."""
         return self.spool.put(f"[every-camera] {subject}", body,
                               to=self.recipients, kind=kind) is not None
 
@@ -286,7 +243,6 @@ class AlertEngine:
         return "\n".join(parts)
 
     def flush_digest(self):
-        """Send everything that has accumulated, if anything has."""
         with self._lock:
             entries = self._digest
             suppressed = self._suppressed
@@ -319,8 +275,7 @@ class AlertEngine:
         if free is None:
             return
         if free >= self.disk_free_min_mb:
-            # Rearmed only once there is room again, so a disk hovering on the
-            # threshold cannot produce a letter every half hour all night.
+            # One letter per drop below the threshold; rearmed once there is room again.
             self._disk_warned = False
             return
         if self._disk_warned:
@@ -333,21 +288,10 @@ class AlertEngine:
             kind="disk-low")
 
 
-# ---------------------------------------------------------------------------
-# How this process ended
-#
-# The sentinel decides that a worker crashed by finding its status file with a
-# dead PID behind it. That is a sound signal but a mute one: it knows something
-# died and nothing about why. These markers are the worker's chance to say so
-# on its way out — and, just as important, the clean-exit marker is how an
-# orderly shutdown is told apart from a crash at all.
-# ---------------------------------------------------------------------------
+# A dead PID tells the sentinel that a worker died, not why. The crash marker says
+# why; the clean-exit marker is what tells an orderly stop from a crash.
 def marker_key(status_path=None):
-    """The name the sentinel tracks this worker under.
-
-    The stem of its status file, so that two cameras in one GUI process are two
-    workers here as well.
-    """
+    """Status file stem, so two cameras in one GUI process are two workers."""
     if status_path:
         return os.path.splitext(os.path.basename(str(status_path)))[0]
     return str(os.getpid())
@@ -362,7 +306,6 @@ def _write_marker(directory, key, payload):
 
 
 def take_marker(directory, key):
-    """Read a marker and remove it. None if there is not one."""
     path = os.path.join(directory, f"{key}.json")
     try:
         with open(path, encoding="utf-8") as handle:
@@ -377,11 +320,7 @@ def take_marker(directory, key):
 
 
 def note_clean_exit(status_path=None, reason=""):
-    """Say that this worker is stopping on purpose.
-
-    Called from the shutdown path. Without it every orderly stop — an operator
-    at the console, ``systemctl stop``, a reboot — would reach the sentinel as
-    a process that vanished, and be reported as a crash.
+    """Without this an orderly stop reaches the sentinel as a vanished process: a crash.
     """
     key = marker_key(status_path)
     _write_marker(EXIT_DIR, key, {
@@ -392,7 +331,6 @@ def note_clean_exit(status_path=None, reason=""):
 
 
 def note_crash(status_path=None, reason="", detail=""):
-    """Leave a crash report for the sentinel to put in the letter."""
     key = marker_key(status_path)
     _write_marker(CRASH_DIR, key, {
         "pid": os.getpid(),
@@ -403,12 +341,9 @@ def note_crash(status_path=None, reason="", detail=""):
 
 
 def take_crash(key):
-    """Everything this process managed to say about its death, as one block.
+    """Joins the exception hook's JSON report and the ``faulthandler`` dump.
 
-    Two sources, because they catch different deaths: the JSON report written by
-    the exception hook, and the raw dump ``faulthandler`` leaves when the
-    interpreter itself goes down inside a C library and no Python code runs
-    again at all. The second is the only trace a PICAM or DCAM segfault leaves.
+    The dump is the only trace a PICAM or DCAM segfault leaves.
     """
     parts = []
     report = take_marker(CRASH_DIR, key) or {}
@@ -431,14 +366,8 @@ def take_crash(key):
 
 
 def install_crash_handler(status_path=None):
-    """Make this process leave a note if it dies without shutting down.
-
-    Two hooks, for the two ways that happens. An unhandled exception unwinds
-    normally and can be described in Python; a segfault in a ctypes driver
-    cannot, and ``faulthandler`` writing to a file descriptor opened now is the
-    only thing that will still work at that point.
-
-    Returns True if at least one of them is in place.
+    """Installs an exception hook and, for segfaults in ctypes drivers,
+    ``faulthandler``.
     """
     key = marker_key(status_path)
     installed = False
@@ -459,8 +388,7 @@ def install_crash_handler(status_path=None):
 
     try:
         os.makedirs(CRASH_DIR, exist_ok=True)
-        # Kept open for the life of the process on purpose: at the moment this
-        # is needed, opening a file is exactly what cannot be done any more.
+        # Kept open for the life of the process: by then no file can be opened any more.
         handle = open(os.path.join(CRASH_DIR, f"{key}.fault"), "w",
                       encoding="utf-8")
         faulthandler.enable(file=handle)
@@ -471,19 +399,15 @@ def install_crash_handler(status_path=None):
     return installed
 
 
-# ---------------------------------------------------------------------------
-# Module-level engine, mirroring console_ui's shape: drivers call start() once.
-# ---------------------------------------------------------------------------
 _engine = None
 
 
 def start(cfg, node_name, instance_name, camera_type, log_path=None,
           status_provider=None, status_path=None):
-    """Begin watching this process's log. Returns the engine, or None if disabled.
+    """Returns the engine, or None if disabled.
 
-    Safe to call when nothing is configured: a station with no recipients is a
-    station that has not been set up yet, and that is worth exactly one line in
-    the log rather than a failure to start measuring.
+    No recipients means a station not set up yet: one log line, not a failure to
+    measure.
     """
     global _engine
     cfg = cfg or {}
@@ -502,11 +426,8 @@ def start(cfg, node_name, instance_name, camera_type, log_path=None,
         console_ui.log(f"Alerts: {mailer.account_summary(account)} "
                        f"→ {', '.join(recipients)}")
     if status_provider is None and status_path:
-        # The worker already writes everything worth putting in a letter into
-        # its status file, several times a minute. Reading it back is both
-        # cheaper than threading a callback through six drivers and truthful in
-        # the case that matters: whatever the letter quotes is exactly what the
-        # monitor was showing at the time.
+        # The status file already holds what a letter quotes, exactly as the monitor
+        # shows it, and saves threading a callback through six drivers.
         status_provider = lambda: _read_status(status_path)      # noqa: E731
 
     stop()
@@ -526,7 +447,6 @@ def _read_status(path):
 
 
 def stop():
-    """Stop watching and flush whatever the digest was holding."""
     global _engine
     if _engine is not None:
         try:

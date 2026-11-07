@@ -1,9 +1,7 @@
-"""Synthetic camera with the same interface as :class:`camera.PixisCamera`.
+"""Synthetic camera with the interface of :class:`camera.PixisCamera`, for machines with
+no SDK.
 
-Selected with ``[camera] backend = sim``. It exists so the scheduler, the filter
-sequencing, the dashboard and the FITS output can be exercised end to end on a
-machine with no camera and no PICAM SDK installed. Exposures really do take the
-requested time, so timing behaviour matches a real run.
+Exposures really take the requested time, so timing matches a real run.
 """
 from __future__ import annotations
 
@@ -43,7 +41,6 @@ class SimCamera:
         self.current_readout_speed: float = cfg.readout_speed
         self.current_gain: int = cfg.gain
 
-    # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> SimCamera:
         console_ui.log("Camera backend: SIMULATOR (no hardware in use)")
         if self._cooling and self._cooling.enabled:
@@ -56,7 +53,6 @@ class SimCamera:
         if self._cooling and self._cooling.enabled and self._cooling.warm_on_exit:
             self.warm_up()
 
-    # --- configuration ------------------------------------------------------
     def set_exposure(self, sec: float) -> None:
         self.current_exposure = sec
 
@@ -66,7 +62,6 @@ class SimCamera:
     def set_gain(self, gain: int) -> None:
         self.current_gain = gain
 
-    # --- cooling ------------------------------------------------------------
     @property
     def target_temperature(self) -> float | None:
         if not (self._cooling and self._cooling.enabled):
@@ -130,7 +125,6 @@ class SimCamera:
             warm_temp, self._cooling.warm_timeout, "Warm-up"
         )
 
-    # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
         self._advance_temperature()
         return self._temp + float(self._rng.normal(0.0, 0.05))
@@ -146,7 +140,6 @@ class SimCamera:
         frame = signal * self.current_gain + 600.0 + self._rng.normal(0.0, 25.0, (h, w))
         return np.clip(frame, 0, 65535).astype("<u2")
 
-    # --- identification -----------------------------------------------------
     def info(self) -> dict:
         return {
             "vendor": "Princeton Instruments (simulated)",
@@ -157,11 +150,10 @@ class SimCamera:
             "camera_version": "sim",
             "driver_version": "sim",
             "module_version": "simulated sensor",
-            "bit_depth": 16,        # the simulator hands out 16-bit frames
+            "bit_depth": 16,
         }
 
     def info_rows(self) -> list:
-        """``(label, value)`` rows describing the camera, for the console block."""
         info = self.info()
         width, height = self._sensor
         rows = [

@@ -1,31 +1,6 @@
 #!/usr/bin/env bash
-#
-# Install every-camera as a systemd system service.
-#
-#   sudo systemd/install.sh asi
-#   sudo systemd/install.sh asi --user alex --python /usr/bin/python3
-#   sudo systemd/install.sh asi --uninstall
-#
-# What it does, and nothing more:
-#   * copies systemd/every-camera@.service to /etc/systemd/system/ with the
-#     paths of this checkout filled in;
-#   * copies config.json to /etc/every-camera/<type>.json if that file does not
-#     exist yet, so the service has a config of its own to edit;
-#   * for sptt, installs the udev rules that give the camera's USB device to
-#     ordinary users, so the program also runs without root by hand;
-#   * enables and starts every-camera@<type>;
-#   * installs the alert watchdog, every-camera-sentinel, which is one per
-#     machine rather than one per camera. It is what sends the mail, and what
-#     reports a camera process that died — so it has to be installed whether
-#     or not anyone has configured an address yet, or the first thing it
-#     would miss is the fault that made somebody want it.
-#
-# All of it is reversible: --uninstall stops the service, disables the autostart
-# and removes the unit. The config in /etc/every-camera and the archive are left
-# alone — losing a station's programme to a flag is not a thing this script does.
-#
-# Running the program by hand is unaffected: `python3 main.py --type asi` keeps
-# working against the checkout's own config.json exactly as before.
+# The watchdog is installed even with no address configured: otherwise it would
+# miss the first fault. --uninstall keeps the config and the archive.
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,8 +46,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$CAMERA" ]] || { usage; exit 1; }
-# A label after the type (sptt-north) makes a separate service with a config
-# of its own, for a second camera of one type on this machine.
 case "${CAMERA%%-*}" in
     asi|japan|sentry|cannon|sptt|infra) ;;
     *) die "unknown camera type '$CAMERA'" ;;
@@ -81,18 +54,13 @@ esac
 [[ $DRY_RUN -eq 1 || $EUID -eq 0 ]] || die "run me with sudo — this writes to $UNIT_DIR"
 
 if [[ $UNINSTALL -eq 1 ]]; then
-    # Stopping goes through the normal path, so the camera still shoots its
-    # closing darks and warms the sensor before the unit disappears.
     echo "stopping every-camera@$CAMERA (closing darks and warm-up run first)…"
     systemctl disable --now "every-camera@$CAMERA" || true
-    # The unit file is shared by every instance, so it only goes when the last
-    # one does.
+    # The unit file is shared by every instance.
     remaining="$(systemctl list-units --all --no-legend 'every-camera@*' 2>/dev/null | wc -l)"
     if [[ "$remaining" -eq 0 ]]; then
         rm -f "$UNIT_DIR/every-camera@.service"
         echo "removed $UNIT_DIR/every-camera@.service"
-        # The watchdog serves every camera on the machine, so it goes only
-        # when the last of them does.
         systemctl disable --now every-camera-sentinel 2>/dev/null || true
         rm -f "$UNIT_DIR/every-camera-sentinel.service"
         echo "removed $UNIT_DIR/every-camera-sentinel.service"
@@ -110,8 +78,7 @@ fi
 
 [[ -f "$TEMPLATE" ]] || die "template not found: $TEMPLATE"
 
-# SUDO_USER is who called sudo; falling back to root would silently put the
-# logs somewhere the operator does not look.
+# Falling back to root would put the logs where the operator does not look.
 OWNER="${OWNER:-${SUDO_USER:-}}"
 [[ -n "$OWNER" ]] || die "cannot tell whose home to use — pass --user NAME"
 USER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
@@ -120,8 +87,6 @@ USER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 PYTHON="${PYTHON:-$(command -v python3 || true)}"
 [[ -x "$PYTHON" ]] || die "python3 not found — pass --python /path/to/python3"
 
-# The service gets its own config so that editing the station's programme does
-# not mean editing a file inside a git checkout.
 TARGET_CONFIG="$CONFIG_DIR/$CAMERA.json"
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "--- would write $UNIT_DIR/every-camera@.service ---"
@@ -167,8 +132,7 @@ chmod 644 "$UNIT"
 chmod +x "$APP_DIR/run.sh"
 echo "installed $UNIT"
 
-# One per machine, and rewritten on every install so that an upgraded
-# checkout does not leave an old unit pointing at the wrong interpreter.
+# Rewritten every time, so an upgrade cannot leave the wrong interpreter.
 if [[ -f "$SENTINEL_TEMPLATE" ]]; then
     SENTINEL_UNIT="$UNIT_DIR/every-camera-sentinel.service"
     sed -e "s|@APP_DIR@|$APP_DIR|g" \
@@ -180,8 +144,6 @@ if [[ -f "$SENTINEL_TEMPLATE" ]]; then
     echo "installed $SENTINEL_UNIT"
 fi
 
-# The SPTT camera is a plain libusb device: without a rule only root may open
-# it. Installed here so the hand-run program works as the operator too.
 if [[ "${CAMERA%%-*}" == sptt ]]; then
     RULES="$APP_DIR/systemd/99-every-camera-sptt.rules"
     install -m 644 "$RULES" /etc/udev/rules.d/

@@ -1,16 +1,4 @@
-"""Compatibility shim — the module now lives in ``cameras/common/schedule.py``.
-
-The schedule vocabulary there is the union of both imagers': ``sun_cycle`` and
-per-slot ``gain`` are ASI-only, and it is each camera's ``config.py`` that decides
-what it accepts.
-
-The explicit re-export list below is load-bearing, not decoration. Tests reach
-into the driver's module reference — ``monkeypatch.setattr(asi_driver.asi_schedule,
-"next_minute_boundary", ...)`` — and ``asi_driver`` calls these as attributes of
-that module object, so patching this shim still intercepts them. What a patch here
-does *not* reach is a cross-call made inside ``cameras/common/schedule.py`` itself;
-a test that needs that should patch ``cameras.common.schedule`` instead.
-"""
+"""Compatibility shim for ``cameras/common/schedule.py``; tests patch the names below."""
 from ..common.schedule import *          # noqa: F401, F403
 from ..common.schedule import (          # noqa: F401
     CYCLE_MODES, Entry, FILE_OVERRIDE_KEYS, FILTER_MAX, FILTER_MIN,

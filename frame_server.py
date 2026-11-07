@@ -1,39 +1,12 @@
-"""
-Local HTTP frame server — browse captured frames and watch a live view over the LAN.
+"""Local HTTP frame server: the archive and a live view over the LAN.
 
-Runs inside the camera process on daemon threads, next to the measurement
-worker. It is wired so that it can never interfere with measurements:
+Runs on daemon threads inside the camera process and must never interfere with
+measurements. A failed start only logs a warning. Handlers never touch the camera
+object: live data comes from :class:`camera_service.CameraService`, archive data from
+disk, so a hung worker leaves the archive answering. MJPEG streams and listing sizes
+are capped.
 
-  * Started through :func:`start_frame_server`, which swallows every startup
-    error — a busy port or a missing permission logs a warning and the camera
-    keeps working.
-  * Handler threads never touch the camera object. Live data comes from
-    :class:`camera_service.CameraService`; archive data comes from the file
-    system. If the worker hangs, the archive endpoints still answer.
-  * ``ThreadingHTTPServer`` with ``daemon_threads``, a cap on simultaneous
-    MJPEG streams, and a cap on listing sizes, so a careless client cannot
-    exhaust the machine.
-
-Access is unauthenticated by design (the operator asked for an open server):
-run it on a trusted network, not on a public interface.
-
-Endpoints
----------
-    GET  /                       built-in HTML viewer
-    GET  /api/info               instance name, camera type, capabilities
-    GET  /api/status             worker status snapshot
-    GET  /api/dates              days present in the archive
-    GET  /api/frames             archive listing (date/limit/offset)
-    GET  /api/composite          per-filter difference frame from three frames
-    GET  /api/frame              one archived frame (as=jpeg|raw)
-    GET  /api/thumb              small JPEG preview of an archived frame
-    GET  /api/stats              statistics + histogram of a frame
-    GET  /api/latest.jpg         newest live frame
-    GET  /api/live.mjpg          live MJPEG stream (focus_app)
-    GET  /api/params             current parameters + editable schema
-    POST /api/params             request a parameter change
-    GET  /api/params/<id>        result of a parameter request
-    POST /api/focus              start/extend/stop focus mode
+Unauthenticated by design: run it on a trusted network, not a public interface.
 """
 import errno
 import json
@@ -57,9 +30,8 @@ import intensity
 SERVER_VERSION = "every-camera/1.0"
 
 DEFAULT_PORT = 8765
-# How many ports above the configured one to try when it is already taken.
-# Several cameras are meant to run from one identical config.json, so a busy
-# port is a normal situation, not a misconfiguration.
+# Ports above the configured one to try: several cameras run from one identical
+# config.json, so a busy port is normal.
 DEFAULT_PORT_SEARCH = 20
 DEFAULT_LIST_LIMIT = 200
 MAX_LIST_LIMIT = 2000
@@ -70,19 +42,15 @@ THUMB_CACHE_SIZE = 64
 
 
 class _FrameHTTPServer(ThreadingHTTPServer):
-    """The server class, with SO_REUSEPORT explicitly off.
-
-    SO_REUSEADDR (inherited) only shortens TIME_WAIT. SO_REUSEPORT would let a
-    second instance bind the *same* port and have the kernel split requests
-    between two unrelated cameras at random — the opposite of what the port
-    search below is for, so it must stay off however the stdlib default moves.
+    """SO_REUSEPORT stays off: a second instance could bind the *same* port and the
+    kernel would split requests between two unrelated cameras at random.
     """
     allow_reuse_port = False
     daemon_threads = True
 
 
 class _ThumbCache:
-    """Tiny mtime-aware cache so scrolling a listing does not re-decode FITS."""
+    """Keyed with mtime, so scrolling a listing does not re-decode FITS."""
 
     def __init__(self, size=THUMB_CACHE_SIZE):
         self._size = size
@@ -104,8 +72,6 @@ class _ThumbCache:
 
 
 class FrameServer:
-    """Handle returned by :func:`start_frame_server`."""
-
     def __init__(self, httpd, thread, responder, port):
         self._httpd = httpd
         self._thread = thread
@@ -143,9 +109,6 @@ def _local_ip():
         return "127.0.0.1"
 
 
-# ---------------------------------------------------------------------------
-# Request handler
-# ---------------------------------------------------------------------------
 class _Handler(BaseHTTPRequestHandler):
     server_version = SERVER_VERSION
     protocol_version = "HTTP/1.1"
@@ -159,7 +122,6 @@ class _Handler(BaseHTTPRequestHandler):
     gateway = None
     verbose = False
 
-    # -- plumbing ------------------------------------------------------
     def log_message(self, fmt, *args):
         if self.verbose:
             console_ui.log(f"{self.address_string()} - {fmt % args}")
@@ -226,7 +188,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    # -- routing -------------------------------------------------------
     def do_GET(self):
         path = urlparse(self.path).path
         try:
@@ -290,7 +251,6 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._error(404, f"Unknown endpoint: {path}")
 
-    # -- the fleet -----------------------------------------------------
     def _hops(self):
         try:
             return int(self.headers.get(gateway.HOP_HEADER) or 0)
@@ -298,18 +258,13 @@ class _Handler(BaseHTTPRequestHandler):
             return 0
 
     def _get_nodes(self):
-        """Every camera this node knows about, including itself."""
         if self.gateway is None:
             self._send_json({"nodes": [], "gateway": False})
             return
         self._send_json({"nodes": self.gateway.nodes(), "gateway": True})
 
     def _proxy(self, path, method):
-        """Make a request to another node on the caller's behalf.
-
-        Streamed rather than buffered, because one of the things worth
-        forwarding is ``/api/live.mjpg``, which does not end.
-        """
+        """Streamed, not buffered: ``/api/live.mjpg`` does not end."""
         if self.gateway is None:
             self._error(503, "This node does not forward requests")
             return
@@ -339,8 +294,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(404, str(exc))
             return
         except RecursionError:
-            # Two nodes that know each other could otherwise pass one
-            # request back and forth until a thread pool ran out.
+            # Two nodes that know each other could otherwise pass one request back and
+            # forth until a thread pool ran out.
             self._error(508, "Request forwarded too many times")
             return
         except ValueError as exc:
@@ -353,7 +308,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._stream_upstream(upstream)
 
     def _stream_upstream(self, upstream):
-        """Copy an upstream response through, headers first, then chunks."""
         try:
             self.send_response(upstream.status)
             content_type = upstream.headers.get("Content-Type",
@@ -385,7 +339,6 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # -- handlers ------------------------------------------------------
     def _get_info(self):
         info = self.service.info()
         info.update({
@@ -407,20 +360,12 @@ class _Handler(BaseHTTPRequestHandler):
         listing["output_dir"] = self.service.output_dir
         self._send_json(listing)
 
-    # -- the per-filter difference frame -------------------------------
     def _get_composite(self):
-        """Combine three named frames into one difference frame, as a JPEG.
+        """The caller names the frames: re-deriving them here, off a period the operator
+        may have overridden in the viewer, could disagree with the branch that asked.
 
-        The caller names the frames, because the caller is the thing holding the
-        tree: ``frame_grouping`` decided which cycle and filter each frame
-        belongs to, and re-deriving that here — off a period the operator may
-        have overridden in the viewer — would let the picture disagree with the
-        branch that asked for it.
-
-        What is left here is what has to be here: the pixels. Three japan frames
-        are ~24 MB of raw data against ~200 KB for the answer, and
-        ``frame_archive`` is already the one place that turns sensor counts into
-        a picture.
+        Only the pixels have to be here: ~24 MB of raw frames against ~200 KB for the
+        answer.
         """
         query = self._query()
         names = [self._arg(query, key)
@@ -513,7 +458,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, jpeg, "image/jpeg")
 
     def _send_file(self, path):
-        """Stream the original file, so the observer can download raw data."""
         try:
             size = os.path.getsize(path)
             with open(path, "rb") as fh:
@@ -559,20 +503,11 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, cached, "image/jpeg")
 
     def _merge_written_header(self, meta):
-        """Fill a live frame's metadata from the file the driver just wrote.
+        """Adds the FITS header of the file the driver just wrote: a live frame carries
+        only a few facts of its own.
 
-        The camera publishes the newest frame as pixels and three or four facts
-        about it; the FITS header an observer actually reads — exposure, filter,
-        temperature, the instrument's own record of itself — exists only in the
-        file. The driver hands over that file's path, so the live frame can be
-        described out of exactly the same function the archive is described with,
-        and the info panel stops going blank the moment "Follow live" is ticked.
-
-        The path comes from this program's own driver, never from the request, so
-        it needs no traversal check — only the ordinary "is it still there".
-        ``resolve_frame_path`` would refuse it anyway: the ASI archive is a date
-        tree and that function takes plain names. The path is dropped afterwards
-        because it is a fact about this machine's disk, not about the frame.
+        ``meta["path"]`` is dropped afterwards: it describes this machine's disk, not
+        the frame.
         """
         path = meta.pop("path", None)
         if not path:
@@ -586,8 +521,7 @@ class _Handler(BaseHTTPRequestHandler):
             written = frame_archive.frame_metadata(path)
         except (OSError, ValueError):
             return
-        # The live facts win: they describe the frame in hand, and the file is
-        # only being consulted for what the frame itself cannot say.
+        # The live facts win: the file only fills in what the frame itself cannot say.
         for key, value in written.items():
             meta.setdefault(key, value)
 
@@ -619,9 +553,8 @@ class _Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self._error(415, f"Could not decode live frame: {exc}")
                     return
-                # Canon publishes an 8-bit JPEG. Its file stays as it is, but
-                # the numbers an observer reads are on the one scale the rest
-                # of the program uses.
+                # Canon publishes an 8-bit JPEG; the numbers an observer reads stay on
+                # the program's one scale.
                 frame = intensity.rescale_to_full(frame, 255)
             meta = dict(meta or {})
             meta["timestamp"] = ts.isoformat() if ts else None
@@ -651,10 +584,8 @@ class _Handler(BaseHTTPRequestHandler):
         })
 
     def _get_live(self):
-        """MJPEG stream of live frames, for focus_app and browsers.
-
-        Requesting the stream also keeps focus mode alive: the camera only
-        runs its free-running capture while somebody is actually watching.
+        """Requesting the stream keeps focus mode alive: the camera free-runs only while
+        somebody is watching.
         """
         if not self.stream_slots.acquire(blocking=False):
             self._error(503, f"Too many live streams (max {MAX_MJPEG_CLIENTS})")
@@ -718,8 +649,8 @@ class _Handler(BaseHTTPRequestHandler):
         if req_id is None:
             self._error(409, "This camera does not accept remote parameters")
             return
-        # A parameter change is applied by the worker between frames, which
-        # only happens while focus mode is on — keep it alive here too.
+        # The worker applies parameters between frames, only while focus mode is on, so
+        # this keeps it alive too.
         self.service.request_focus(self.focus_ttl)
         self._send_json({"id": req_id, "accepted": True, "params": params})
 
@@ -736,15 +667,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(self.service.request_focus(ttl, hold=hold))
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 def start_frame_server(server_cfg, service, verbose=False):
-    """Start the frame server for ``service``. Returns a handle or None.
-
-    Every failure mode — disabled in config, port in use, no permission — logs
-    a warning and returns None. Callers do not need a try/except: losing the
-    viewer must never stop a measurement run.
+    """Returns a handle, or None with a warning on any failure: callers need no
+    try/except, since losing the viewer must never stop a measurement run.
     """
     cfg = server_cfg or {}
     if not cfg.get("enabled", True):
@@ -753,11 +678,10 @@ def start_frame_server(server_cfg, service, verbose=False):
 
     wanted_port = int(cfg.get("port", DEFAULT_PORT))
     bind = cfg.get("bind", "0.0.0.0")
-    # 0 restores the old strict behaviour: use the configured port or nothing.
+    # 0 means strict: the configured port or nothing.
     port_search = max(0, int(cfg.get("port_search", DEFAULT_PORT_SEARCH)))
 
-    # One per server, started below once the port is known. It is what makes
-    # a single reachable camera a way in to every camera beside it.
+    # Makes a single reachable camera a way in to every camera beside it.
     fleet = gateway.Gateway(service)
     handler = type("_BoundHandler", (_Handler,), {
         "service": service,
@@ -796,8 +720,7 @@ def start_frame_server(server_cfg, service, verbose=False):
                               daemon=True, name="everycam-frame-server")
     thread.start()
 
-    # The gateway lists this node among the others, so it has to know which
-    # port the search above actually settled on.
+    # The gateway lists this node too, so it must know the port the search settled on.
     try:
         service.http_port = port
     except Exception:
@@ -815,8 +738,7 @@ def start_frame_server(server_cfg, service, verbose=False):
             # Several instances can share a hostname; the pid tells them apart
             # in the observer's list even before the ports are noticed.
             info["pid"] = os.getpid()
-            # node_name comes from the service (config); the hostname is the
-            # fallback the observer's programs show when no name was configured.
+            # The hostname is the fallback when no node name was configured.
             if not info.get("node_name"):
                 info["node_name"] = info["hostname"]
             return info
@@ -829,9 +751,6 @@ def start_frame_server(server_cfg, service, verbose=False):
     return FrameServer(httpd, thread, responder, port)
 
 
-# ---------------------------------------------------------------------------
-# Built-in browser page
-# ---------------------------------------------------------------------------
 _INDEX_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -945,23 +864,15 @@ boot();
 """
 
 
-# ---------------------------------------------------------------------------
-# Standalone mode — serve an existing directory of captures, no camera needed
-# ---------------------------------------------------------------------------
 def _schedule_from_config(config_path, camera_type):
-    """The observing programme from a config.json, for ``/api/info``.
-
-    Imported here rather than at module scope: the camera config modules are
-    pure Python, but this file is also the one an observer runs against a
-    directory of frames, and it should not grow a package dependency for a flag
-    that is usually unset.
+    """Imports are local: this file also runs on an observer's directory of frames and
+    must not grow a package dependency for a flag that is usually unset.
     """
     try:
         from cameras.common.schedule import schedule_snapshot
         section = str(camera_type or "").strip().lower()
-        # Read the file directly rather than through ``utils.load_config``: that
-        # one writes a default config when the path is missing, which is not
-        # something a read-only archive server should do to a mistyped path.
+        # Not ``utils.load_config``: it writes a default config when the path is
+        # missing, which a read-only archive server must not do to a mistyped path.
         with open(config_path) as fh:
             cfg = json.load(fh).get(section, {})
         if section == "japan":
@@ -1004,9 +915,8 @@ def main():
 
     service = NullService(args.output_dir, args.name, args.camera_type,
                           node_name=args.node_name)
-    # An archive served without its camera still groups into cycles on the
-    # right period, as long as the schedule that produced it is at hand.
-    # Without it the viewer falls back to working the period out of the frames.
+    # With the schedule at hand an archive groups into cycles on the right period;
+    # without it the viewer works the period out of the frames.
     if args.config:
         service.set_schedule(_schedule_from_config(args.config,
                                                    args.camera_type))

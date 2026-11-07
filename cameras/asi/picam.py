@@ -1,12 +1,7 @@
 """Minimal ctypes binding to the Princeton Instruments PICAM library (Linux).
 
-Covers exactly what the imager needs: opening a camera, reading/writing the
-parameters used by the schedule, committing them to hardware, and acquiring
-single readouts.
-
-Everything here is transcribed from the vendor header shipped with the legacy
-project, ``imagerd_rt/src/imagerd_rt/src/include/picam.h`` (and
-``pil_platform.h`` for the native type sizes on ``PIL_LIN64``).
+Transcribed from the vendor's ``picam.h``, and ``pil_platform.h`` for the native type
+sizes on ``PIL_LIN64``.
 """
 from __future__ import annotations
 
@@ -26,7 +21,6 @@ from ctypes import (
 from dataclasses import dataclass
 from enum import IntEnum
 
-# --- native types (pil_platform.h, PIL_LIN64) -------------------------------
 piint = c_int
 piflt = c_double
 pibln = c_int
@@ -58,7 +52,7 @@ class PicamConstraintType(IntEnum):
 
 
 def _pi_v(value_type: PicamValueType, constraint_type: PicamConstraintType, n: int) -> int:
-    """The PI_V macro from picam.h:634 that encodes a PicamParameter constant."""
+    """The PI_V macro of picam.h, which encodes a PicamParameter constant."""
     return (int(constraint_type) << 24) + (int(value_type) << 16) + n
 
 
@@ -180,7 +174,6 @@ STRING_SIZE_FIRMWARE_NAME = 64
 STRING_SIZE_FIRMWARE_DETAIL = 256
 
 
-# --- structures (picam.h) ---------------------------------------------------
 class PicamCameraID(Structure):
     _fields_ = [
         ("model", piint),
@@ -327,7 +320,6 @@ then written unchecked, as they were before, instead of refusing to start."""
 
 
 def _declare(lib: ctypes.CDLL) -> None:
-    """Attach argtypes/restype to every function this module calls."""
     sigs = {
         "Picam_InitializeLibrary": ([], piint),
         "Picam_UninitializeLibrary": ([], piint),
@@ -391,8 +383,8 @@ def _declare(lib: ctypes.CDLL) -> None:
             fn = getattr(lib, name)
         except AttributeError as exc:
             if name in OPTIONAL_FUNCTIONS:
-                # Only used to explain what a camera accepts; without it the
-                # values go through unchecked, exactly as they did before.
+                # Only used to explain what a camera accepts; without it values go
+                # through unchecked.
                 continue
             raise OSError(
                 f"The PICAM library at {lib._name} does not export {name}; "
@@ -403,7 +395,6 @@ def _declare(lib: ctypes.CDLL) -> None:
 
 
 def error_string(code: int) -> str:
-    """Human-readable name of a PicamError code (falls back to the number)."""
     if code == 0:
         return "None"
     try:
@@ -421,7 +412,6 @@ def error_string(code: int) -> str:
 
 
 def enum_string(enum_type: PicamEnumeratedType, value: int) -> str:
-    """Human-readable name of any PICAM enumeration value."""
     lib = _load()
     s = c_char_p()
     if lib.Picam_GetEnumerationString(int(enum_type), int(value), byref(s)) != 0:
@@ -440,7 +430,6 @@ def _call(name: str, *args) -> None:
     _check(name, getattr(_load(), name)(*args))
 
 
-# --- library lifetime -------------------------------------------------------
 def initialize_library() -> None:
     _call("Picam_InitializeLibrary")
 
@@ -461,7 +450,6 @@ def library_version() -> str:
     return f"{major.value}.{minor.value}.{distribution.value}.{released.value}"
 
 
-# --- camera access ----------------------------------------------------------
 def open_first_camera() -> PicamHandle:
     handle = PicamHandle()
     _call("Picam_OpenFirstCamera", byref(handle))
@@ -510,7 +498,6 @@ def firmware_details(cid: PicamCameraID) -> list[tuple[str, str]]:
         _load().Picam_DestroyFirmwareDetails(array)
 
 
-# --- parameters -------------------------------------------------------------
 def get_int(handle: PicamHandle, parameter: PicamParameter) -> int:
     value = piint()
     _call("Picam_GetParameterIntegerValue", handle, int(parameter), byref(value))
@@ -572,11 +559,8 @@ def sensor_size(handle: PicamHandle) -> tuple[int, int]:
         _load().Picam_DestroyRoisConstraints(rois)
 
 
-# --- constraints ------------------------------------------------------------
-# A camera only accepts a limited set of values per parameter, and which values
-# those are differs between models (a setpoint one PIXIS cools to is out of
-# range on the next). PICAM answers "Invalid Parameter Value" with no hint of
-# what it would have accepted, so ask it first and say so in the message.
+# Which values a parameter accepts differs between models, and PICAM's "Invalid
+# Parameter Value" gives no hint of them, so ask first and say so in the message.
 @dataclass(frozen=True)
 class FloatRange:
     """A PicamRangeConstraint, without the ctypes memory behind it."""
@@ -588,7 +572,7 @@ class FloatRange:
 
 
 def value_type(parameter: PicamParameter) -> PicamValueType:
-    """The value type PI_V encoded into the parameter constant (picam.h:634)."""
+    """The value type PI_V encoded into the parameter constant."""
     return PicamValueType((int(parameter) >> 16) & 0xFF)
 
 
@@ -639,11 +623,10 @@ def constraint(
 ) -> FloatRange | list[float] | None:
     """What this camera accepts for ``parameter``.
 
-    ``Required`` is what is valid given everything else currently set, so it is
-    asked for first; ``Capable`` (what the hardware can ever do) is the
-    fall-back. ``None`` means the parameter is unconstrained, irrelevant for
-    this model, or the SDK would not describe it — in which case the value is
-    passed through untouched and the camera has the last word.
+    ``Required`` (valid given everything else currently set) is asked first,
+    ``Capable`` (what the hardware can ever do) is the fall-back. ``None`` means
+    unconstrained, irrelevant for this model, or undescribed: the value then goes
+    through and the camera has the last word.
     """
     kind = constraint_type(parameter)
     if kind == PicamConstraintType.Range:
@@ -669,10 +652,8 @@ def _nearly(a: float, b: float, scale: float = 1.0) -> bool:
 def clamp_to_constraint(
     limits: FloatRange | list[float] | None, value: float
 ) -> tuple[float, bool]:
-    """Nearest value ``limits`` allows, and whether that differs from ``value``.
-
-    Pure arithmetic on the description read from the camera — no SDK calls — so
-    it is testable without hardware.
+    """Nearest value ``limits`` allows, and whether that differs from ``value``. No SDK
+    calls.
     """
     value = float(value)
     if limits is None:
@@ -713,7 +694,6 @@ def _first_allowed(limits: FloatRange, value: float) -> float:
 
 
 def describe_constraint(limits: FloatRange | list[float] | None) -> str:
-    """One line naming what is allowed, for warnings and for --probe."""
     if limits is None:
         return "unconstrained"
     if isinstance(limits, list):
@@ -746,13 +726,11 @@ def are_parameters_committed(handle: PicamHandle) -> bool:
     return bool(committed.value)
 
 
-# --- acquisition ------------------------------------------------------------
 def acquire(handle: PicamHandle, readout_count: int, timeout_ms: int) -> tuple[int, int, int]:
-    """Acquire ``readout_count`` readouts.
+    """Returns ``(buffer_address, readouts_returned, acquisition_errors_mask)``.
 
-    Returns ``(buffer_address, readouts_returned, acquisition_errors_mask)``.
-    The buffer belongs to PICAM and is reused by the next acquisition, so the
-    caller must copy out of it before acquiring again.
+    PICAM owns the buffer and reuses it on the next acquisition, so copy out of it
+    first.
     """
     data = PicamAvailableData()
     errors = piint()

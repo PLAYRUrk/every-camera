@@ -1,15 +1,8 @@
-"""
-Shared plumbing for the camera workers (console and Qt alike).
+"""Status publishing and stop handling shared by the camera workers.
 
-Every driver used to carry its own near-identical copy of the status publishing
-and the error reporting. This module holds one copy of each, so a fix lands
-everywhere.
-
-One call to :meth:`WorkerBus.publish_status` reaches every reader there is:
-
-    CameraService  -> the frame server, so /api/status and everything past it
-    status file    -> ~/.every_camera/status/{pid}.json, watched by sentinel.py
-                      and read by a monitor running on the same machine
+One :meth:`WorkerBus.publish_status` reaches every reader: CameraService for
+/api/status, and ~/.every_camera/status/{pid}.json, watched by sentinel.py and read by a
+monitor on the same machine.
 """
 import json
 import os
@@ -26,17 +19,12 @@ from utils import (
     STATUS_MIN_INTERVAL, write_status_file, cleanup_stale_status_files,
 )
 
-# Status name published while a camera is up for focusing only.
 SETUP_STATUS = "setup"
 
 
 def announce_setup_mode(reason=None):
-    """Explain why the camera is running without a schedule.
-
-    A missing or empty schedule used to abort the program, which made a newly
-    installed camera impossible to focus: focus_app.py needs the driver running
-    to get live frames from it. Now it is an ordinary state, and this is the one
-    place that words it.
+    """Setup mode exists so a new camera can be focused: focus_app.py needs the driver
+    running to get live frames from it.
     """
     console_ui.warn(f"Setup mode: {reason or 'requested with --setup'}.")
     console_ui.log("No scheduled captures will be taken. Connect focus_app.py "
@@ -45,14 +33,11 @@ def announce_setup_mode(reason=None):
 
 
 def empty_schedule_reason(section, configured, errors=()):
-    """Word an empty schedule the way the operator can act on it.
+    """A configured schedule that came out empty is a different problem from one never
+    written, so "add slots" would mislead.
 
-    A schedule that *was* configured and came out empty is a different problem
-    from one that was never written, and telling the operator to "add slots"
-    when the slots are right there in front of them sends them looking in the
-    wrong place. That happens most often when ``mode`` and the slots disagree —
-    cycle modes need a ``delta``, ``sun`` mode needs ``seconds`` — so the first
-    rejection is quoted here rather than left in the warnings above.
+    Usually ``mode`` and the slots disagree (cycle modes need ``delta``, ``sun`` mode
+    needs ``seconds``), so the first rejection is quoted.
     """
     # No trailing full stop: the callers punctuate the sentence they build.
     if configured:
@@ -64,18 +49,12 @@ def empty_schedule_reason(section, configured, errors=()):
 
 
 def publish_current_params(service, snapshot):
-    """Hand ``focus_app`` the camera's parameter values, as of now.
-
-    ``snapshot`` is a callable returning the driver's current values, called
-    here so that a camera that cannot answer costs a warning rather than a
+    """``snapshot`` runs here so a camera that cannot answer costs a warning, not a
     broken status tick.
 
-    Every driver used to publish this once at startup and again only after a
-    change *it had been asked for*, which made it a lie for most of a night: a
-    schedule moves the exposure, the filter and the ASI shutter by itself, so an
-    observer connecting later was shown the values the process had started with.
-    Drivers therefore call this on their status cadence. It must stay cheap and
-    hardware-free — the values it reads are ones the driver already caches.
+    Drivers call this on their status cadence, because a schedule moves the exposure,
+    the filter and the ASI shutter by itself. It must stay cheap and hardware-free: the
+    values it reads are ones the driver already caches.
     """
     if service is None:
         return
@@ -86,15 +65,11 @@ def publish_current_params(service, snapshot):
 
 
 def publish_schedule_state(service, active):
-    """Say whether the camera is inside its measuring cycle right now.
+    """``focus_app`` asks before connecting: taking a measuring camera costs frames and
+    needs agreement, while taking an idle one must not nag.
 
-    ``focus_app`` asks for this before it connects: taking a camera that is
-    measuring costs the operator frames and has to be agreed to, while taking
-    an idle one — daytime, outside the schedule's intervals, or a station with
-    no schedule at all — costs nothing and must not nag.
-
-    Drivers call this on the status cadence they already have, so a camera that
-    crosses into its observing window while the tool is open reports it.
+    Drivers call this on their status cadence, so a camera crossing into its observing
+    window while the tool is open reports it.
     """
     if service is None:
         return
@@ -105,11 +80,8 @@ def publish_schedule_state(service, active):
 
 
 def serving_focus_hold(service, held):
-    """Confirm to observers that the worker has paused (or resumed).
-
-    Separate from :func:`publish_schedule_state` because the two answer
-    different questions: that one is "would connecting interrupt anything",
-    this one is "did the interruption actually take effect".
+    """Whether the interruption took effect; :func:`publish_schedule_state` says whether
+    connecting would interrupt anything.
     """
     if service is None:
         return
@@ -120,23 +92,9 @@ def serving_focus_hold(service, held):
 
 
 class WorkerBus:
-    """Status publishing for one camera worker.
-
-    Two concerns the drivers used to duplicate:
-
-    * **Throttling.** Outside the schedule a worker loops twice a second. It
-      may call :meth:`publish_status` every iteration; only one publication per
-      ``STATUS_MIN_INTERVAL`` actually goes out, plus every status *change*.
-    * **One call, every reader.** A status goes to the frame server, for
-      ``/api/status`` and everything downstream of it, and to the status file
-      under ``~/.every_camera/status``, which is what the sentinel watches and
-      what a monitor on this machine reads.
-
-    It used to publish to a broker as well, and to carry frames there —
-    downscaled to fit a payload ceiling, one at a time, on request. All of
-    that is gone: the frame server serves the archive, the live stream and
-    the parameters over the same network, without a broker to configure or a
-    240 KB limit to squeeze a frame into.
+    """Outside the schedule a worker loops twice a second and may call
+    :meth:`publish_status` every time: one publication per ``STATUS_MIN_INTERVAL`` goes
+    out, plus every status *change*.
     """
 
     def __init__(self, camera_type, instance_name, status_dir,
@@ -144,8 +102,7 @@ class WorkerBus:
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.status_dir = status_dir
-        # Stamped onto every status snapshot so the monitor can say which
-        # machine a camera is on without every driver remembering to add it.
+        # Stamped here so no driver has to remember to add it.
         self.node_name = node_name or ""
         self._service = service
 
@@ -156,23 +113,16 @@ class WorkerBus:
         self._last_status_name = None
         self._last_status_at = 0.0
 
-    # ------------------------------------------------------------------
     def prepare_status_dir(self):
-        """Create the status dir and drop files left by dead processes."""
         os.makedirs(self.status_dir, exist_ok=True)
         removed = cleanup_stale_status_files(self.status_dir)
         if removed:
             console_ui.log(f"Removed {removed} stale status file(s) from "
                            f"{self.status_dir}")
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
     def publish_status(self, payload, force=False):
-        """Write the status file and publish it, subject to throttling.
-
-        ``force=True`` bypasses the throttle (used for terminal states).
-        Returns True if the status actually went out.
+        """``force=True`` bypasses the throttle, for terminal states. Returns True if it
+        went out.
         """
         if self.node_name and not payload.get("node_name"):
             payload = dict(payload, node_name=self.node_name)
@@ -196,15 +146,6 @@ class WorkerBus:
         return True
 
     def publish_error(self, kind, error, ts_iso=None):
-        """Record something that went wrong, where observers will see it.
-
-        This used to publish to the broker and nowhere else, which meant that
-        on a station with the broker off — the default — every one of these
-        calls did nothing at all. The frame that returned no image, the write
-        that failed, the filter that was never reached: all reported, all
-        discarded. Now it reaches ``/api/status``, which is what the monitor
-        draws and what an alert letter quotes.
-        """
         if self._service is None:
             return
         try:
@@ -213,14 +154,10 @@ class WorkerBus:
             pass
 
     def shutdown(self, reason="stopped normally"):
-        """Remove the status file, having first said this was on purpose.
+        """The clean-exit marker goes down *before* the status file goes away.
 
-        The clean-exit marker goes down *before* the status file goes away, and
-        that order is the whole point of it: the sentinel decides a worker
-        crashed by finding a status file with a dead process behind it, and
-        without a marker written first, every orderly stop — an operator at the
-        console, ``systemctl stop``, a reboot — would reach it as a crash and
-        wake somebody up for nothing.
+        The sentinel reads a status file with a dead process behind it as a crash, and
+        without the marker every orderly stop would wake somebody up for nothing.
         """
         try:
             alerts.note_clean_exit(self.status_path, reason)
@@ -234,33 +171,24 @@ class WorkerBus:
             pass
 
 
-
 # Kept alive for the life of the process: ``SetConsoleCtrlHandler`` stores the
-# pointer and calls back through it, and a callback the garbage collector has
-# reclaimed is a crash at the worst possible moment — the machine shutting down.
+# pointer, and a garbage-collected callback is a crash as the machine shuts down.
 _console_ctrl_handler = None
 
-# The console events Windows delivers that mean "this process is going away".
-# CTRL_C and CTRL_BREAK arrive as signals as well and are handled there; these
-# three do not, and are the ones that used to cost a station its closing darks.
+# Windows console events meaning "this process is going away". CTRL_C and CTRL_BREAK
+# arrive as signals; these three do not.
 _WINDOWS_CLOSE_EVENTS = (2, 5, 6)      # CTRL_CLOSE, CTRL_LOGOFF, CTRL_SHUTDOWN
 
 
 def _install_windows_console_handler(handler):
-    """Give the closing darks a chance when the console window is shut.
+    """Gives the closing darks a chance when the console window is shut.
 
-    Windows never delivers SIGTERM of its own accord, so on that platform the
-    signal handlers above cover Ctrl+C and Ctrl+Break and nothing else: closing
-    the console window, logging off or shutting the machine down would take the
-    process out mid-exposure, with the shutter open and no closing darks — the
-    exact failure ``install_stop_handler`` exists to prevent on Linux.
+    Windows never sends SIGTERM itself, so closing the console, logging off or shutting
+    down would end the process mid-exposure, shutter open, with no closing darks.
 
-    ``SetConsoleCtrlHandler`` is the hook for those three. It runs the callback
-    on a thread of the OS's making, so all it does is call the same handler the
-    signals call — which only sets an event — and then return True to say the
-    event was handled. Windows still ends the process after a timeout (about
-    five seconds for CTRL_CLOSE), so this buys the shutdown path a chance, not a
-    guarantee; a long closing dark run may still be cut short.
+    The callback runs on an OS thread, so it only calls the handler the signals call,
+    which sets an event. Windows still ends the process after a timeout (about five
+    seconds for CTRL_CLOSE): a long closing dark run may be cut short.
     """
     global _console_ctrl_handler
     import ctypes
@@ -278,28 +206,17 @@ def _install_windows_console_handler(handler):
 
 
 def install_stop_handler(handler):
-    """Route every stop signal to ``handler``: Ctrl+C and ``systemctl stop``.
+    """Routes Ctrl+C and ``systemctl stop`` to ``handler``.
 
-    Every driver used to listen for SIGINT alone, which is fine at a terminal
-    and wrong under a service manager: ``systemctl stop`` and a reboot send
-    SIGTERM, whose default disposition kills the process outright. For a camera
-    that means the closing dark frames are lost — and, on the ASI, that the
-    sensor never runs its warm-up, because that lives in the shutdown path the
-    process no longer reaches. The signals mean the same thing to us, so they
-    get the same handler.
+    SIGTERM's default kills the process outright, losing the closing darks and, on the
+    ASI, the sensor warm-up, which lives in the shutdown path.
 
-    On Windows two more routes lead here: ``SIGBREAK`` (Ctrl+Break), which that
-    platform has and POSIX does not, and the console-close events, which arrive
-    through :func:`_install_windows_console_handler` rather than as signals.
-    SIGTERM is still registered there — it exists, and another process may raise
-    it — but nothing in Windows itself ever sends it.
-
-    Python delivers signals on the main thread only, so this has to be called
-    from there; every driver does, from its ``run_*`` entry point.
+    On Windows ``SIGBREAK`` and the console-close events lead here too; nothing in
+    Windows itself sends SIGTERM. Python delivers signals on the main thread only, so
+    call this from there.
     """
     signals = [signal.SIGINT, signal.SIGTERM]
-    # Windows only; getattr rather than a platform test, because the attribute
-    # is the thing actually being asked about.
+    # Windows only.
     sigbreak = getattr(signal, "SIGBREAK", None)
     if sigbreak is not None:
         signals.append(sigbreak)
@@ -315,11 +232,7 @@ def install_stop_handler(handler):
 
 
 def stop_signal_name(sig):
-    """What to call the signal in a log line.
-
-    "Ctrl+C" is what the operator did at a terminal, and nonsense in a journal
-    where the request came from ``systemctl stop``.
-    """
+    """A journal must not say "Ctrl+C" when the request came from ``systemctl stop``."""
     if sig == signal.SIGINT:
         return "Ctrl+C"
     if sig == getattr(signal, "SIGBREAK", None):
@@ -328,11 +241,8 @@ def stop_signal_name(sig):
 
 
 def run_focus_iteration(service, grab, on_error=None):
-    """Grab one live frame for the focus tool and hand it to the service.
-
-    Any failure is counted; after ``FOCUS_MAX_ERRORS`` in a row the service
-    turns focus mode off by itself, so a broken camera can never keep the
-    worker spinning in a failing capture loop.
+    """After ``FOCUS_MAX_ERRORS`` in a row the service turns focus off, so a broken
+    camera cannot keep the worker spinning in a failing capture loop.
     """
     try:
         frame = grab()

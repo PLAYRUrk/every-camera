@@ -1,28 +1,14 @@
-"""
-Sentry camera driver: Princeton Instruments CCD via imagerd_rt daemon.
+"""Princeton Instruments CCD driven by the pre-built imagerd_rt daemon (PicamSDK + eBUS).
 
-The sentry camera is controlled by the pre-compiled `imagerd_rt` binary
-(Keo Scientific / Princeton Instruments PicamSDK + Pleora eBUS SDK).
-This driver acts as a supervisor: it generates the schedule.conf, starts
-the daemon, monitors its outputs, and publishes status and frames to the LAN
-frame server.
+This driver only supervises: it writes schedule.conf, starts the daemon, reads
+its outputs and publishes them.
 
-Interface with imagerd_rt:
-  Input:   <imagerd_rt_dir>/schedule.conf   — imaging schedule
-  Output:  <imagerd_rt_dir>/aux/meta-data.txt  — current frame metadata
-           <imagerd_rt_dir>/aux/image.fits      — latest captured frame
-           <imagerd_rt_dir>/aux/seqno.txt       — sequence counter
-  Control: <imagerd_rt_dir>/aux/stop_file      — write "10" to stop,
-                                                  write "11" to resume
-
-Config in config.json (human-readable, replaces raw schedule.conf):
-  sentry.imagerd_rt_dir  — installation directory (default /usr/local/imagerd_rt)
-  sentry.output_dir      — where FITS images are archived
-  sentry.device_id       — camera device ID (e.g. "ASI1")
-  sentry.site_id         — station identifier
-  sentry.zenith_angle_start — solar zenith angle to begin night (default -10)
-  sentry.schedule_len_ms — duration of one imaging cycle in ms (default 1440000)
-  sentry.slots           — list of imaging slots (see DEFAULT_CONFIG in utils.py)
+imagerd_rt files, under its install directory:
+  schedule.conf      imaging schedule (input)
+  aux/meta-data.txt  current frame metadata
+  aux/image.fits     latest frame
+  aux/seqno.txt      sequence counter
+  aux/stop_file      write "10" to stop, "11" to resume
 """
 import os
 import sys
@@ -52,9 +38,6 @@ from worker_common import (
     publish_schedule_state, install_stop_handler, stop_signal_name,
 )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 SENTRY_CAPTURE_SECONDS = [0, 30]
 
 _SCHEDULE_CONF_HEADER = """\
@@ -70,20 +53,9 @@ _SCHEDULE_CONF_HEADER = """\
 """
 
 
-# ---------------------------------------------------------------------------
-# Schedule.conf generation
-# ---------------------------------------------------------------------------
 def generate_schedule_conf(cfg: dict) -> str:
-    """Generate imagerd_rt schedule.conf text from every-camera sentry config.
-
-    Args:
-        cfg: the ``sentry`` sub-dict from config.json.
-
-    Returns:
-        String content ready to write to schedule.conf.
-    """
     device_id = cfg.get("device_id", "ASI1")
-    # imaging_mode: "schedule" (0) or "rapid" (1) — also accepts legacy int 0/1
+    # Older configs hold an int here.
     mode_val = cfg.get("imaging_mode", cfg.get("image_mode", "schedule"))
     if isinstance(mode_val, int):
         image_mode = mode_val
@@ -109,13 +81,11 @@ def generate_schedule_conf(cfg: dict) -> str:
 
     for slot in slots:
         filter_num = slot.get("filter_num", 1)
-        # start_ms is the new name; start_time_ms kept for backward compat
+        # The second key of each pair is the name in older configs.
         start_time = slot.get("start_ms", slot.get("start_time_ms", 0))
         exposure_len = slot.get("exposure_ms", 55000)
         binning = slot.get("binning", 2)
-        # gain is the new name; ccd_gain kept for backward compat
         ccd_gain = slot.get("gain", slot.get("ccd_gain", 3))
-        # readout_ms is the new name; prep_time_ms kept for backward compat
         prep_time = slot.get("readout_ms", slot.get("prep_time_ms", 5000))
 
         lines += [
@@ -146,7 +116,7 @@ def generate_schedule_conf(cfg: dict) -> str:
 
 
 def parse_metadata(text: str) -> dict:
-    """Parse imagerd_rt aux/meta-data.txt (tab-separated key-value pairs)."""
+    """aux/meta-data.txt holds tab-separated key-value pairs."""
     meta = {}
     for line in text.splitlines():
         line = line.strip()
@@ -155,7 +125,6 @@ def parse_metadata(text: str) -> dict:
         if "\t" in line:
             key, _, val = line.partition("\t")
         elif " " in line:
-            # fallback for space-separated
             key, _, val = line.partition(" ")
         else:
             continue
@@ -163,15 +132,8 @@ def parse_metadata(text: str) -> dict:
     return meta
 
 
-# ---------------------------------------------------------------------------
-# SentryCamera — low-level wrapper around imagerd_rt
-# ---------------------------------------------------------------------------
 class SentryCamera:
-    """Supervisor wrapper for the imagerd_rt daemon.
-
-    Does NOT communicate with the CCD hardware directly; instead it manages
-    the imagerd_rt process, reads its output files, and writes schedule.conf.
-    """
+    """Manages the imagerd_rt process and its files; never talks to the CCD itself."""
 
     def __init__(self, imagerd_rt_dir: str = "/usr/local/imagerd_rt"):
         self._dir = Path(imagerd_rt_dir)
@@ -184,15 +146,10 @@ class SentryCamera:
         self._image_file = self._aux_dir / "image.fits"
         self._schedule_conf = self._dir / "schedule.conf"
 
-    # ------------------------------------------------------------------
-    # Availability checks
-    # ------------------------------------------------------------------
     def is_available(self) -> bool:
-        """Return True if the imagerd_rt installation is present."""
         return self._start_bin.exists() and self._aux_dir.is_dir()
 
     def is_running(self) -> bool:
-        """Return True if an imagerd_rt process is alive."""
         try:
             result = subprocess.run(
                 ["pgrep", "-f", "imagerd_rt"],
@@ -202,11 +159,7 @@ class SentryCamera:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
     def start(self):
-        """Launch imagerd_rt_start as a detached background process."""
         if not self._start_bin.exists():
             raise FileNotFoundError(
                 f"imagerd_rt_start not found: {self._start_bin}\n"
@@ -221,7 +174,6 @@ class SentryCamera:
         console_ui.log(f"Launched {self._start_bin}")
 
     def stop(self):
-        """Request graceful shutdown by writing '10' to stop_file."""
         try:
             self._stop_file.write_text("10")
             console_ui.log("Wrote stop_file=10, daemon will stop after current cycle.")
@@ -229,38 +181,27 @@ class SentryCamera:
             console_ui.log(f"Could not write stop_file: {exc}")
 
     def resume(self):
-        """Resume imaging by writing '11' to stop_file."""
         try:
             self._stop_file.write_text("11")
             console_ui.log("Wrote stop_file=11, resuming imaging.")
         except Exception as exc:
             console_ui.log(f"Could not write stop_file: {exc}")
 
-    # ------------------------------------------------------------------
-    # Status reads
-    # ------------------------------------------------------------------
     def get_seqno(self) -> int:
-        """Return current sequence number, or -1 on error."""
         try:
             return int(self._seqno_file.read_text().strip())
         except Exception:
             return -1
 
     def get_metadata(self) -> dict:
-        """Parse and return aux/meta-data.txt as a dict."""
         try:
             return parse_metadata(self._meta_file.read_text())
         except Exception:
             return {}
 
     def get_latest_image(self) -> "np.ndarray | None":
-        """Read aux/image.fits on the program's intensity scale, or None.
-
-        The file belongs to imagerd_rt, so its depth is whatever that daemon
-        wrote; reading it through the archive helper applies the header's
-        BZERO/BSCALE and lifts a shallower frame, instead of casting the raw
-        values to uint16 and hoping.
-        """
+        """The daemon decides the file's depth: the archive helper applies BZERO/BSCALE
+        and lifts a shallower frame."""
         try:
             frame, _scale = frame_archive.read_frame_with_scale(
                 str(self._image_file))
@@ -269,12 +210,7 @@ class SentryCamera:
             return None
 
     def archive_latest_image(self, output_dir, timestamp=None):
-        """Copy aux/image.fits into the archive directory.
-
-        imagerd_rt only ever rewrites its single ``aux/image.fits``; without
-        this the configured ``sentry.output_dir`` stayed empty forever and
-        there was no archive for the viewer to browse.
-        """
+        """imagerd_rt only rewrites its single aux/image.fits, so the archive is built here."""
         if not output_dir or not self._image_file.exists():
             return None
         stamp = (timestamp or dt.now()).strftime("%Y%m%dT%H%M%S")
@@ -293,11 +229,7 @@ class SentryCamera:
                 pass
             return None
 
-    # ------------------------------------------------------------------
-    # Schedule generation
-    # ------------------------------------------------------------------
     def write_schedule_conf(self, sentry_cfg: dict):
-        """Write schedule.conf from the sentry config dict."""
         text = generate_schedule_conf(sentry_cfg)
         tmp = str(self._schedule_conf) + ".tmp"
         with open(tmp, "w") as f:
@@ -306,22 +238,14 @@ class SentryCamera:
         console_ui.log(f"Wrote {self._schedule_conf}")
 
 
-# Kept as module-level names for backwards compatibility; the implementations
-# are shared with every other camera driver in frame_archive.
 _read_fits_minimal = frame_archive.read_fits_minimal
 
 
 def frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
-    """Convert a 16-bit (or any) numpy frame to JPEG bytes."""
     return frame_archive.to_jpeg_bytes(frame)
 
 
-# ---------------------------------------------------------------------------
-# Console worker
-# ---------------------------------------------------------------------------
 class SentryWorkerConsole(threading.Thread):
-    """Monitors the imagerd_rt daemon and publishes status and frames."""
-
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam: SentryCamera, output_dir: str, instance_name: str,
@@ -350,12 +274,11 @@ class SentryWorkerConsole(threading.Thread):
     def run(self):
         self._bus.prepare_status_dir()
 
-        # Start daemon if not already running
         if not self.cam.is_running():
             console_ui.log("imagerd_rt not running — starting daemon...")
             try:
                 self.cam.start()
-                time.sleep(2)  # give it a moment to initialise
+                time.sleep(2)
             except Exception as exc:
                 console_ui.error(f"Could not start imagerd_rt: {exc}")
 
@@ -372,13 +295,11 @@ class SentryWorkerConsole(threading.Thread):
         while not self._stop_event.is_set():
             now = dt.now()
 
-            # Periodic publish at configured capture_seconds
             fire_key = (now.minute, now.second)
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 seqno = self.cam.get_seqno()
                 if seqno != self._last_seqno and seqno > 0:
-                    # New frame available
                     self._last_seqno = seqno
                     self._archive_latest(now)
                     self._send_latest_frame()
@@ -394,7 +315,6 @@ class SentryWorkerConsole(threading.Thread):
 
             self._stop_event.wait(0.1)
 
-        # Graceful stop
         if self.cam.is_running():
             console_ui.log("Stopping imagerd_rt daemon...")
             self.cam.stop()
@@ -404,7 +324,6 @@ class SentryWorkerConsole(threading.Thread):
         console_ui.log("Sentry measurement worker stopped")
 
     def _archive_latest(self, now):
-        """Keep a dated copy of the daemon's latest FITS in output_dir."""
         if not self.output_dir:
             return
         path = self.cam.archive_latest_image(self.output_dir, now)
@@ -412,12 +331,7 @@ class SentryWorkerConsole(threading.Thread):
             console_ui.log(f"SENTRY archived: {os.path.basename(path)}")
 
     def _handle_focus(self, now):
-        """Publish new daemon frames to the LAN live view.
-
-        imagerd_rt owns the schedule and exposure, so there is nothing to
-        drive here — the focus tool simply sees each new frame as the daemon
-        produces it.
-        """
+        """imagerd_rt owns schedule and exposure: focus just sees each new daemon frame."""
         if self._service is None or not self._service.focus_active():
             return
         seqno = self.cam.get_seqno()
@@ -429,7 +343,6 @@ class SentryWorkerConsole(threading.Thread):
             self._service.publish_frame(frame, now, self.cam.get_metadata())
 
     def _send_latest_frame(self):
-        """Read aux/image.fits and hand the frame to the frame server."""
         frame = self.cam.get_latest_image()
         if frame is None:
             self._bus.publish_error(
@@ -452,9 +365,8 @@ class SentryWorkerConsole(threading.Thread):
     def _save_status(self, status: str, force: bool = False):
         meta = self.cam.get_metadata()
         seqno = self.cam.get_seqno()
-        # The daemon is the one measuring, so "is the schedule running" is the
-        # same question as "is imagerd_rt alive". Focus cannot pause it either
-        # way; reporting it honestly is what stops focus_app promising it can.
+        # The daemon does the measuring, so the schedule runs exactly while it is alive.
+        # Focus cannot pause it, and reporting that keeps focus_app from promising to.
         publish_schedule_state(self._service,
                                not self.setup_mode and self.cam.is_running())
         payload = {
@@ -472,7 +384,6 @@ class SentryWorkerConsole(threading.Thread):
             "setup_mode": self.setup_mode,
             "last_update": dt.now().isoformat(),
         }
-        # Embed key metadata fields as top-level for monitor display
         for key in ("CCDTemp", "Exposure", "Binning", "CCDGain", "FilterPo",
                     "SiteID", "DeviceID"):
             if key in meta:
@@ -497,11 +408,7 @@ class SentryWorkerConsole(threading.Thread):
         self._bus.publish_status(payload, force=force)
 
 
-# ---------------------------------------------------------------------------
-# Preview mode
-# ---------------------------------------------------------------------------
 def run_preview_sentry(cam: SentryCamera, instance_name: str):
-    """Continuously read aux/image.fits and overwrite preview_{name}.fits."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.fits")
     console_ui.log(f"SENTRY preview: reading {cam._image_file} → {preview_path}")
     console_ui.log("Press Ctrl+C to stop.")
@@ -537,12 +444,8 @@ def run_preview_sentry(cam: SentryCamera, instance_name: str):
         time.sleep(0.5)
 
 
-# ---------------------------------------------------------------------------
-# Console entry point
-# ---------------------------------------------------------------------------
 def run_console_sentry(config_path=None, preview=False, verbose=False,
                        setup_mode=False):
-    """Run Sentry (imagerd_rt) camera in console mode."""
     from utils import load_config, get_node_name
 
     cfg = load_config(config_path)
@@ -558,10 +461,8 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
     capture_seconds = sentry_cfg.get("capture_seconds", SENTRY_CAPTURE_SECONDS)
 
     dash = console_ui.start_dashboard("sentry", instance_name, verbose=verbose)
-    # Alert mail, started before the camera is opened so that a camera which
-    # will not open — and a filter controller that answers nothing — is already
-    # something somebody hears about. The crash handler goes first: it is the
-    # only thing that can speak for a process killed outright.
+    # Before the camera is opened, so a camera that will not open still raises an alert.
+    # The crash handler goes first: it alone can speak for a process killed outright.
     alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
     alerts.install_crash_handler(alert_status_path)
     alerts.start(cfg.get("alerts", {}), node_name, instance_name, "sentry",
@@ -587,9 +488,8 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
             run_preview_sentry(cam, instance_name)
             return
 
-        # Write schedule.conf from config if slots are defined. Without slots
-        # and without a schedule.conf left by an earlier run, imagerd_rt has no
-        # programme to follow — that is setup mode, not a failure.
+        # Without slots or a leftover schedule.conf imagerd_rt has no programme: that is
+        # setup mode, not a failure.
         if sentry_cfg.get("slots"):
             try:
                 cam.write_schedule_conf(sentry_cfg)
@@ -610,13 +510,11 @@ def run_console_sentry(config_path=None, preview=False, verbose=False,
             os.makedirs(output_dir, exist_ok=True)
 
 
-        # LAN frame server (archive browsing + live view). Never fatal.
-        # imagerd_rt owns exposure/schedule, so no remote parameter editing.
+        # A frame server failure is never fatal.
         from camera_service import CameraService
         from frame_server import start_frame_server
-        # Live frames can be streamed, but the measurements cannot be paused
-        # for them: the schedule belongs to imagerd_rt, and stopping that
-        # daemon from here would be reaching into another program's run.
+        # The schedule belongs to imagerd_rt, so no remote parameters and no pausing for
+        # live frames: stopping that daemon would reach into another program's run.
         service = CameraService("sentry", instance_name, output_dir,
                                 supports_params=False, supports_hold=False,
                                 node_name=node_name, setup_mode=setup_mode)

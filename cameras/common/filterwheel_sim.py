@@ -1,7 +1,5 @@
-"""Filter wheel stand-in with the same interface as :class:`filterwheel.FilterWheel`.
-
-Selected with ``[filter_wheel] port = sim``. Moves take a realistic ~1 s so the
-scheduler's dead-time behaviour is exercised the same way as with real hardware.
+"""Filter wheel stand-in. Moves take about a second, so the scheduler's dead time behaves
+as with real hardware.
 """
 from __future__ import annotations
 from time import sleep
@@ -16,13 +14,11 @@ MOVE_SECONDS = 1.0
 class SimFilterWheel:
     def __init__(self, port: str = "sim", baudrate: int = 9600,
                  move_timeout: float = 8.0) -> None:
-        # None until homed, exactly as the real controller — see filterwheel.py.
+        # None until homed, as on the real controller.
         self.current_filter: int | None = None
         self.shutter_open: bool = False
-        # Moves to refuse before behaving again. A wheel that does not arrive is
-        # a state the driver has to handle — it costs the frame its filter tag —
-        # and without this hook there is no way to reach that path at all off
-        # hardware. Set it from a test; a run never touches it.
+        # Moves to refuse before behaving again, so a test can reach the
+        # unconfirmed-move path off hardware.
         self.fail_selects: int = 0
 
     def __enter__(self) -> SimFilterWheel:

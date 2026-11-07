@@ -1,43 +1,8 @@
 #!/usr/bin/env python3
-"""
-Every Camera — Unified camera control for Canon, SPTT, Infra, Sentry, ASI and Japan.
-
-Usage:
-    python main.py                         # Auto-detect: GUI if display, else error
-    python main.py --type cannon           # Console mode, Canon DSLR
-    python main.py --type sptt             # Console mode, CSDU-429 scientific camera
-    python main.py --type infra            # Console mode, SW1300 SWIR camera
-    python main.py --type sentry           # Console mode, Princeton/imagerd_rt camera
-    python main.py --type asi              # Console mode, ASI all-sky imager (PICAM)
-    python main.py --type japan            # Console mode, Japan all-sky imager (DCAM)
-    python main.py --type asi --verbose    # Plain log lines instead of the dashboard
-    python main.py --type asi --probe      # Print what the camera accepts, then exit
-    python main.py --gui                   # GUI mode (all camera types)
-    python main.py --gui --type cannon     # GUI mode, Canon only
-    python main.py --config path.json      # Use custom config file
-
-Console mode draws one live status screen that is redrawn in place (console_ui.py)
-and writes a full log to ~/.every_camera/logs/. Use --verbose, or redirect the
-output, to get plain timestamped lines instead.
-
-Monitor is a separate program: python monitor_app.py
-
-Camera drivers live in the cameras/ package:
-    cameras/cannon_driver.py  — Canon DSLR via gphoto2
-    cameras/sptt_driver.py    — CSDU-429 via USB (FITS)
-    cameras/infra_driver.py   — Tanho SW1300 SWIR (TIFF/PNG/FITS)
-    cameras/sentry_driver.py  — Princeton CCD via imagerd_rt daemon (FITS)
-    cameras/asi_driver.py     — ASI all-sky imager: Princeton PIXIS via PICAM (FITS)
-    cameras/japan_driver.py   — Japan all-sky imager: Hamamatsu via DCAM-API (FITS)
-
-What asi and japan share — the filter wheel, the schedule arithmetic, the solar
-altitude and the FITS core — lives in cameras/common/.
-"""
 import argparse
 import sys
 import os
 
-# Ensure the project root is in the path so all imports resolve correctly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import can_use_gui
@@ -46,11 +11,10 @@ CAMERA_TYPES = ("cannon", "sptt", "infra", "sentry", "asi", "japan")
 
 
 def camera_type(value):
-    """``--type``: a camera type, optionally with a ``-label`` after it.
+    """A camera type, optionally with a ``-label``.
 
-    The systemd unit passes its instance name as the type, so a second SPTT
-    service on one machine, every-camera@sptt-north, arrives here as
-    "sptt-north". The label only tells services and their configs apart; the
+    The systemd unit passes its instance name as the type, so every-camera@sptt-north
+    arrives as "sptt-north". The label only tells services and their configs apart; the
     camera itself is picked by sptt.usb_port in that config.
     """
     base = value.split("-", 1)[0]
@@ -117,9 +81,7 @@ that mode explicitly, even when a schedule is configured.
         print("Error: --probe is only available for --type asi, japan and sptt.")
         sys.exit(1)
 
-    # Determine mode
     if args.type and not args.gui:
-        # Explicit console mode
         if args.type == "cannon":
             from cameras.cannon_driver import run_console_cannon
             run_console_cannon(args.config, preview=args.preview,
@@ -163,11 +125,9 @@ that mode explicitly, even when a schedule is configured.
                               verbose=args.verbose,
                               setup_mode=args.setup)
     elif args.gui or (can_use_gui() and not args.type):
-        # GUI mode
         from gui_app import run_gui
         run_gui(args)
     else:
-        # No display, no --type
         print("Error: No display available. "
               "Use --type <cannon|sptt|infra|sentry|asi|japan> for console mode.")
         print("       Or use --gui to force GUI mode (requires DISPLAY).")

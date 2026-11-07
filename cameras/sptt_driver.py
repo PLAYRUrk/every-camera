@@ -1,7 +1,4 @@
-"""
-SPTT (CSDU-429/423, CSDU-285C) camera driver: firmware loading, capture, FITS
-output, workers. Uses pyusb for camera control.
-"""
+"""SPTT cameras (CSDU-429/423, CSDU-285C) over pyusb."""
 import os
 import sys
 import json
@@ -47,9 +44,6 @@ from .sptt_timing import (
 import usb.core
 import usb.util
 
-# ---------------------------------------------------------------------------
-# Camera command IDs (CSDU-429 protocol)
-# ---------------------------------------------------------------------------
 CMD_GET_STATUS      = 0x00
 CMD_SET_EXP         = 0x01
 CMD_SET_GAIN        = 0x02
@@ -74,65 +68,49 @@ ENCODING_12BPP = 1
 USB_CMD_TIMEOUT = 10000
 USB_READ_TIMEOUT = 10000
 
-# How often to ask whether a frame has landed. The next integration only starts
-# when the read is finished and the FIFO is re-armed, so this interval is dead
-# time added to every frame — and because it lands wherever the poll happens to
-# fall, it makes the dead time differ from frame to frame at one exposure. The
-# vendor's own program polls at 5 ms; this driver used to poll at 50 ms.
+# Dead time added to every frame, and uneven, since the next integration starts
+# only when the read is done and the FIFO re-armed. The vendor's program polls at 5 ms.
 FIFO_POLL_INTERVAL = 0.005
 
-# Status byte bits (SPTT-CAM/capture.py print_status).
 STATUS_FIFO_EMPTY = 0x08
 STATUS_FIFO_FULL = 0x10
 
-# Bytes asked for per bulk read of a frame. The driver used to ask for 512 at
-# a time — 4209 USB calls for one CSDU-285C frame, which took longer than the
-# camera's frame period, so the next frame was already pouring into the FIFO
-# when this one was done. Large requests let libusb queue the packets itself;
-# a multiple of 512 so a request never ends inside a packet.
+# A multiple of 512, so a request never ends inside a packet. Large requests let
+# libusb queue the packets: 512 at a time took longer than the frame period.
 BULK_CHUNK = 64 * 1024
 
 # When a frame takes longer to collect than the camera takes to produce the
 # next one, the period is raised to the time it took times this, plus the pad.
 TRANSFER_SLACK = 1.25
 TRANSFER_PAD_US = 50_000
-# The gap between two frames of a live stream that counts towards that: the
-# debayer, JPEG and publish of the focus loop. Capped so that a stream paused
-# for a scheduled capture does not read as seconds of processing.
+# The gap between two live frames that counts towards that: the focus loop's debayer,
+# JPEG and publish. Capped so a stream paused for a scheduled capture does not count.
 PROCESSING_CAP_S = 0.5
 
-# Default capture seconds (can be overridden in config)
 SPTT_CAPTURE_SECONDS = [0, 30]
 
-# Colour-filter layouts a CSDU-285C frame can be read under, named from the
-# top-left 2x2 cell as FITS BAYERPAT does. RGGB is the ICX285AQ's own layout;
-# sptt.bayer_pattern is there so a camera that reads out differently can be
-# put right on site.
+# Named from the top-left 2x2 cell, as FITS BAYERPAT does. RGGB is the ICX285AQ's
+# layout; sptt.bayer_pattern corrects a camera that reads out differently.
 BAYER_PATTERNS = ("RGGB", "GRBG", "GBRG", "BGGR")
 DEFAULT_BAYER_PATTERN = "RGGB"
 
-# Peltier set-point range the vendor documents (SPTT-CAM/capture.py).
+# Peltier set-point range the vendor documents.
 TARGET_TEMP_MIN = -30
 TARGET_TEMP_MAX = 30
 
-# Argument default meaning "leave this setting as the camera already has it".
-# configure() is called again whenever binning or encoding changes, and a plain
-# default would silently revert the operator's period and trigger mode there.
+# "Leave this as the camera has it": configure() runs again on every binning or
+# encoding change, and a plain default would revert the operator's period and trigger mode.
 KEEP = object()
 
 
 class ExposureNotHonoured(RuntimeError):
-    """The camera did not take the exposure or period it was given.
-
-    Raised rather than logged because a silently shortened exposure corrupts
-    every measurement taken under it while looking like a working night — the
-    same reasoning as the ASI driver's refusal to clamp (cameras/asi/camera.py).
-    """
+    """Raised, not logged: a silently shortened exposure corrupts every measurement
+    while looking like a working night."""
 
 
 def make_command(cmd_id, value=0):
-    # Checked here rather than in the callers because this is where a value too
-    # wide for the wire would be masked into something small and plausible.
+    # Checked here because this is where a value too wide for the wire would be masked
+    # into something small and plausible.
     if not 0 <= value <= CMD_VALUE_MAX:
         raise ValueError(f"Command 0x{cmd_id:02X}: value {value} does not fit "
                          "the four bytes on the wire")
@@ -148,9 +126,7 @@ def make_command(cmd_id, value=0):
 def target_temp_byte(target_temp):
     """The CCD set-point as the one signed byte the camera takes, or None.
 
-    setup_app stores the set-point from a float spin box, so -10.0 is what
-    arrives here; ``-10.0 & 0xFF`` is a TypeError, which used to stop the
-    camera from being configured at all once cooling was switched on.
+    setup_app stores it from a float spin box.
     """
     if target_temp is None:
         return None
@@ -192,11 +168,7 @@ def read_crb(ep_wr, ep_rd):
 
 
 def read_raw_frame(size, ep_tr):
-    """Read one frame of ``size`` bytes off the transfer endpoint.
-
-    Counted by what each read actually returned: the endpoint may hand back
-    less than was asked for, and assuming otherwise loses the frame's tail.
-    """
+    """The endpoint may return less than asked for: count what each read returned."""
     chunks = []
     remaining = size
     while remaining > 0:
@@ -212,13 +184,9 @@ def read_raw_frame(size, ep_tr):
 def decode_frame(raw_chunks, w, h, encoding, binning=0, interlaced=True):
     """Unpack one raw USB transfer into a frame on the program's 0..65535 scale.
 
-    The sensor digitises 12 bits (or 8, in the low-bandwidth encoding); this is
-    the one place that knows it, so the shift up to full scale happens here and
-    nothing downstream has to ask how deep a SPTT pixel is.
-
-    Same unpacking as ``SPTT-CAM/capture.py``, done with numpy: the vendor's
-    per-pixel Python loops take about a second on a full 744x576 frame, which
-    is dead time in the focus loop and delay in answering a stop.
+    The one place that knows the sensor's depth: 12 bits, or 8 in the low-bandwidth
+    encoding. Done in numpy: per-pixel Python loops take about a second on a full
+    744x576 frame, which is dead time in the focus loop and delays a stop.
     """
     raw = np.frombuffer(b"".join(bytes(buf) for buf in raw_chunks), dtype=np.uint8)
 
@@ -252,10 +220,8 @@ def decode_frame(raw_chunks, w, h, encoding, binning=0, interlaced=True):
 
 
 def is_mosaic(model, binning):
-    """Whether a frame is a Bayer mosaic rather than a grey image.
-
-    Binning adds neighbouring pixels of different colours together on the
-    chip, so a binned frame from the colour camera is grey.
+    """Binning adds neighbouring colours together on the chip, so a binned colour frame
+    is grey.
     """
     return model.color and binning == 0
 
@@ -263,10 +229,7 @@ def is_mosaic(model, binning):
 def debayer(mosaic, pattern=DEFAULT_BAYER_PATTERN):
     """Bilinear demosaic: a (3, H, W) R, G, B cube of ``mosaic``'s dtype.
 
-    Each colour is the weighted mean of its own samples in the 3x3
-    neighbourhood (weights 1-2-1), which is plain bilinear interpolation, and
-    a pixel keeps its own value in its own colour. numpy only, so the SPTT
-    node needs nothing beyond what it already installs.
+    numpy only, so the SPTT node needs nothing beyond what it already installs.
     """
     pattern = pattern.upper()
     if pattern not in BAYER_PATTERNS:
@@ -299,38 +262,27 @@ def debayer(mosaic, pattern=DEFAULT_BAYER_PATTERN):
 
 
 def seconds_to_next_capture(now, capture_seconds):
-    """Seconds from ``now`` until the next scheduled capture second begins."""
     sec = now.second + now.microsecond / 1_000_000
     ahead = [s - sec for s in capture_seconds if s > sec]
     return min(ahead) if ahead else 60 - sec + min(capture_seconds)
 
 
 def focus_frame_fits(now, capture_seconds, cam):
-    """Whether a focus frame started at ``now`` ends before the next capture.
-
-    Checking only that ``now`` is not a capture second let a focus frame begun
-    at :59.3 run past :00; by the time the loop looked again it was :01 and
-    the scheduled frame was simply never taken.
+    """A focus frame begun at :59.3 would run past :00 and the scheduled frame would never
+    be taken, so ``now`` not being a capture second is not enough.
     """
     if now.second in capture_seconds:
         return False
     return seconds_to_next_capture(now, capture_seconds) > cam.frame_time_estimate()
 
 
-# ---------------------------------------------------------------------------
-# Camera class
-# ---------------------------------------------------------------------------
 class SpttCamera:
-    """Manages USB connection and CSDU camera operations."""
-
     def __init__(self, backend, model=CSDU429, port=None):
         self.backend = backend
         self.model = model
-        # The USB port of the camera this object drives (None: the only one),
-        # so two of them on one machine never open the same device.
+        # None: the only camera. Two cameras on one machine must never open the same device.
         self.port = port
-        # How the colour camera's mosaic is laid out (sptt.bayer_pattern). The
-        # ROI origin is always even (see _configure), so a ROI never shifts it.
+        # The ROI origin is always even (see _configure), so a ROI never shifts the mosaic.
         self.bayer_pattern = DEFAULT_BAYER_PATTERN
         self.dev = None
         self.ep_wr = None
@@ -343,40 +295,34 @@ class SpttCamera:
         self.exposure = 0.88
         self.gain = 100
         self._running = False
-        # Frame timing. period_us is what the camera was last told; the
-        # override is the operator's sptt.period_us (None = derive it from the
-        # exposure), and min_period_us is the floor the firmware reports for
-        # the current binning and ROI.
+        # period_us is what the camera was last told; the override is sptt.period_us
+        # (None: derive from the exposure); min_period_us is the firmware's floor for the
+        # current binning and ROI.
         self.period_us = None
         self.period_override_us = None
         self.trigmode = 0
         self.min_period_us = 0
-        # A setting changed, so the frame the sensor is part-way through began
-        # under the old one and has to be thrown away before anything is read.
+        # The frame in progress began under an old setting and has to be dropped.
         self._params_dirty = False
-        # When the integration behind the last frame was allowed to start, and
-        # how long the frame took to arrive after that — the archived DATE-OBS
-        # comes from the first of these.
+        # When the integration behind the last frame was allowed to start, for DATE-OBS,
+        # and how long the frame took to arrive after that.
         self.last_frame_started = None
         self.last_frame_lag = None
-        # How long the USB transfer of the last frame took. Longer than the
-        # frame period means the camera outruns the reads (see _read_one_frame).
+        # USB transfer time of the last frame. Longer than the period means the camera
+        # outruns the reads.
         self.last_read_s = None
         self._slow_read_warned_at = None
-        # The shortest period at which this camera's frames can be collected
-        # here, learnt from the transfers (see _keep_up_with_transfer); 0 until
-        # one has been too slow. And, for a live stream, the time between the
-        # end of one read and the request for the next.
+        # transfer_floor_us: the shortest period at which frames can be collected here,
+        # learnt from the transfers; 0 until one was too slow. _processing_s: in a live
+        # stream, the time between the end of one read and the request for the next.
         self.transfer_floor_us = 0
         self._read_done_at = None
         self._processing_s = 0.0
         self._armed_at = None
-        # Bumped by every setting change, so a frame wait that a change from
-        # another thread overtook can tell its frame is no longer wanted.
+        # Lets a frame wait tell that a change from another thread overtook it.
         self._settings_gen = 0
-        # One USB conversation at a time. The GUI changes exposure and gain from
-        # its own thread while a worker is reading frames, and a status request
-        # interleaved with a frame readout gets the wrong bytes back.
+        # One USB conversation at a time: the GUI changes settings from its own thread, and
+        # a status request interleaved with a frame readout gets the wrong bytes back.
         self._lock = threading.RLock()
 
     def open(self):
@@ -423,11 +369,10 @@ class SpttCamera:
     def configure(self, exposure=0.88, gain=100, binning=0, encoding=ENCODING_12BPP,
                   r_offset=None, g_offset=None, trigmode=KEEP, period_us=KEEP,
                   draft=False, roi_org=None, roi_size=None, target_temp=None):
-        """Apply all camera parameters. Exposure is in seconds.
+        """Exposure is in seconds.
 
-        ``period_us`` and ``trigmode`` default to :data:`KEEP` so that the
-        reconfigure a binning change triggers inherits what the operator set;
-        pass ``None`` for either to mean "derive it" / "continuous".
+        ``period_us`` and ``trigmode`` default to KEEP, so a reconfigure after a binning
+        change inherits what the operator set; None means "derive it" / "continuous".
         """
         with self._lock:
             return self._configure(exposure, gain, binning, encoding, r_offset,
@@ -436,8 +381,7 @@ class SpttCamera:
 
     def _configure(self, exposure, gain, binning, encoding, r_offset, g_offset,
                    trigmode, period_us, draft, roi_org, roi_size, target_temp):
-        # Checked before anything is sent, so a bad value does not leave the
-        # camera half reconfigured.
+        # Before anything is sent, so a bad value does not leave the camera half reconfigured.
         temp_byte = target_temp_byte(target_temp)
         wr = self._write_cmd
         self.exposure = exposure
@@ -474,9 +418,8 @@ class SpttCamera:
         if temp_byte is not None:
             wr(CMD_SET_TARGET_TEMP, temp_byte)
 
-        # Read back before the period is sent: the firmware's minimum period
-        # depends on the frame size, so it only means anything once binning,
-        # ROI and encoding are in force.
+        # Before the period is sent: the firmware's minimum period depends on the frame
+        # size, so it means nothing until binning, ROI and encoding are in force.
         _, sl = read_crb(self.ep_wr, self.ep_rd)
         self._set_frame_size(sl[17], sl[18])
         self.min_period_us = sl[14]
@@ -490,12 +433,10 @@ class SpttCamera:
         self._settings_gen += 1
 
     def _set_frame_size(self, w, h):
-        """Take the frame size the firmware reports, as the vendor's code does.
+        """Trust the firmware's size: a table keyed on binning is wrong under an ROI.
 
-        This driver used to overwrite it from a table keyed on binning, which
-        is wrong under an ROI (and its 4x4 entry, 188, is not 744/4) — and the
-        size decides how many bytes are asked for, so a wrong one leaves the
-        rest of the frame in the FIFO to be read as the next one.
+        The size decides how many bytes are asked for, and a wrong one leaves the rest of
+        the frame in the FIFO to be read as the next one.
         """
         expected = self.model.nominal_sizes.get(self.binning)
         if not w or not h:
@@ -513,11 +454,10 @@ class SpttCamera:
         self.w, self.h = int(w), int(h)
 
     def _apply_period(self, verify=True):
-        """Send the frame period that matches the exposure now in force.
+        """The single place a period is computed or written.
 
-        The single place a period is computed or written. Every path that
-        changes the exposure ends here, because a period left behind at its old
-        value truncates the new exposure without saying so.
+        Every exposure change ends here: a period left at its old value truncates the new
+        exposure without saying so.
         """
         exposure_us = exposure_to_us(self.exposure)
         period = derive_period_us(
@@ -538,7 +478,6 @@ class SpttCamera:
         return sl
 
     def _verify_timing(self, requested_exposure_us, sl):
-        """Check what the camera says it is doing against what it was told."""
         console_ui.log(describe_timing(requested_exposure_us, sl))
         problems = [p for p in (exposure_mismatch(requested_exposure_us, sl[5]),
                                 period_mismatch(sl[5], sl[6])) if p]
@@ -548,11 +487,7 @@ class SpttCamera:
             raise ExposureNotHonoured("; ".join(problems))
 
     def set_exposure(self, value):
-        """Set exposure in seconds.
-
-        The period follows it. Leaving the old, shorter one in place is what
-        made a live exposure change do nothing visible to the frames.
-        """
+        """Exposure is in seconds. The period has to follow it, or the frames do not change."""
         exposure_us = exposure_to_us(value)
         with self._lock:
             self._write_cmd(CMD_SET_EXP, exposure_us)
@@ -619,27 +554,23 @@ class SpttCamera:
                 self._running = False
 
     def _frame_wait_budget(self):
-        """How long one frame may take before something is wrong.
-
-        Worst case the wait starts just after an integration did, so a whole
-        period can pass before the next one even begins. The old
-        ``exposure + 5`` was written when the period was always 75 ms.
+        """Worst case the wait starts just after an integration did, so a whole period can
+        pass before the next one begins.
         """
         period_s = (self.period_us or 0) / 1_000_000.0
         return max(period_s + self.exposure + 5.0, 3.0)
 
     def frame_time_estimate(self):
-        """How long a grab usually takes: up to a period for the frame under
-        way to finish, another for the one dropped after a setting change, and
-        the readout. Keeps focus frames clear of a scheduled capture; the
-        timeout is :meth:`_frame_wait_budget`, not this.
+        """A grab's usual duration: up to a period for the frame under way, another for the
+        one dropped after a setting change, and the readout.
+
+        Keeps focus frames clear of a scheduled capture; the timeout is _frame_wait_budget.
         """
         period_us = (self.period_us
                      or exposure_to_us(self.exposure) + PERIOD_READOUT_MARGIN_US)
         return 2 * period_us / 1_000_000.0 + 1.0
 
     def _rearm(self):
-        """Drop whatever is queued and note when the next frame may start."""
         self._read_done_at = None
         _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
         self.last_frame_started = dt.now(timezone.utc)
@@ -662,10 +593,7 @@ class SpttCamera:
         raise RuntimeError("FIFO timeout — no frame data")
 
     def _read_one_frame(self):
-        """Pull one frame off the FIFO; returns the arguments for decode_frame.
-
-        Decoding is left to the caller so it happens outside the USB lock.
-        """
+        """Returns the arguments for decode_frame: decoding happens outside the USB lock."""
         w, h = self.w, self.h
 
         if self.encoding == ENCODING_12BPP:
@@ -678,12 +606,9 @@ class SpttCamera:
         raw_chunks = read_raw_frame(frame_size, self.ep_tr)
         self.last_read_s = time.monotonic() - t0
         self._check_read_time()
-        # Reset the FIFO only if it is empty. When the camera has already begun
-        # the next frame, what is in the FIFO is that frame from its first
-        # byte; resetting cut its head off, the next read started part-way
-        # through it, and with three bytes to every two pixels every frame from
-        # then on decoded as noise — the live view that "swims" after a good
-        # first frame. Left alone it is read whole, in step, next time.
+        # Reset the FIFO only if it is empty. Otherwise it holds the next frame from its
+        # first byte, and with three bytes to two pixels a cut head turns every later
+        # frame into noise. Left alone it is read whole next time.
         sb, _ = read_crb(self.ep_wr, self.ep_rd)
         if sb & STATUS_FIFO_EMPTY:
             _usb_write_retry(self.ep_wr, make_command(CMD_FIFO_INIT))
@@ -694,20 +619,13 @@ class SpttCamera:
                 self.model.interlaced)
 
     def _keep_up_with_transfer(self):
-        """Slow the camera down to the pace its frames can be collected at.
+        """Slow the camera to the pace its frames can be collected at; True if it did.
 
-        In continuous mode the camera starts the next frame one period after
-        the last, whether or not that one has been read. A CSDU-285C frame can
-        take longer than that to come over USB, and the bytes that do not fit
-        are lost at the join: the first frame after a start is fine, the next
-        is shifted sideways with a strip of another on its edge, and once the
-        loss is not a whole number of pixels everything decodes as noise.
-
-        So when collecting a frame (plus, in a live stream, handling it) took
-        longer than the period, the period is raised to fit with room to spare
-        and the run is restarted, which puts the FIFO back in step. Returns
-        True when it did. A period the operator set, or a trigger mode, is
-        theirs: that only gets the warning.
+        In continuous mode the next frame starts one period after the last, read or not,
+        and bytes that do not fit are lost at the join: frames shift sideways, then decode
+        as noise. So when collecting and handling a frame outlasts the period, the period
+        is raised and the run restarted, which puts the FIFO back in step. A period the
+        operator set, or a trigger mode, only gets the warning.
         """
         if self.last_read_s is None or not self.period_us:
             return False
@@ -730,7 +648,6 @@ class SpttCamera:
         return True
 
     def _check_read_time(self):
-        """Say so, once a minute at most, when a transfer outlasts the period."""
         period_s = (self.period_us or 0) / 1_000_000.0
         if not period_s or self.last_read_s <= period_s:
             return
@@ -746,16 +663,13 @@ class SpttCamera:
     def grab_frame(self):
         """One frame, integrated under the settings currently in force.
 
-        After a parameter change the sensor is already part-way through a frame
-        that began under the old ones; it is discarded here so that no caller
-        has to know the difference. This is why the fix reaches the Qt worker
-        in gui_app.py without that copy being touched. A change made from
-        another thread while this one waits starts the wait over the same way.
+        After a change the sensor is part-way through a frame under the old ones; it is
+        discarded here so no caller has to know. A change from another thread during the
+        wait starts the wait over the same way.
         """
         while True:
             with self._lock:
-                # Time since the last read finished: the live loop's own work,
-                # which the camera does not wait for either.
+                # The live loop's own work, which the camera does not wait for either.
                 self._processing_s = (time.monotonic() - self._read_done_at
                                       if self._read_done_at is not None else 0.0)
                 discard = self._params_dirty
@@ -768,10 +682,8 @@ class SpttCamera:
                 if self._settings_gen != gen:
                     continue                # overtaken by a change
                 if sb & STATUS_FIFO_FULL:
-                    # Frames piled up faster than they were read and the FIFO
-                    # ran over: nothing in it can be trusted to start at a
-                    # frame. A restart is what reliably puts it back in step
-                    # (the first frame after one is always whole).
+                    # The FIFO ran over, so nothing in it can be trusted to start at a frame.
+                    # A restart puts it back in step: the first frame after one is always whole.
                     console_ui.warn("SPTT FIFO overflowed — restarting the run")
                     self._start(1)
                     continue
@@ -785,28 +697,24 @@ class SpttCamera:
     def grab_fresh_frame(self):
         """A frame whose integration was allowed to start at this call.
 
-        The camera free-runs, so between two scheduled shots the FIFO fills
-        with frames up to half a minute old; archiving one of those under the
-        tick's DATE-OBS records a time the frame was never taken at.
+        The camera free-runs, so between shots the FIFO fills with frames up to half a
+        minute old, which would be archived under a DATE-OBS they were not taken at.
         """
         with self._lock:
             self._rearm()
         return self.grab_frame()
 
     def is_mosaic(self):
-        """Whether frames grabbed now are a raw Bayer mosaic."""
         return is_mosaic(self.model, self.binning)
 
     def for_display(self, frame):
-        """``frame`` as it should be looked at: a raw mosaic demosaiced to an
-        (H, W, 3) RGB image, which is how the live view, focus_app and the
-        previews take colour; anything else unchanged."""
+        """A raw mosaic demosaiced to an (H, W, 3) RGB image, the form the live view,
+        focus_app and the previews take colour in; anything else unchanged."""
         if not self.is_mosaic():
             return frame
         return np.moveaxis(self.to_rgb(frame), 0, -1)
 
     def to_rgb(self, frame):
-        """``frame`` demosaiced to an (3, H, W) R, G, B cube."""
         return debayer(frame, self.bayer_pattern)
 
     def get_status(self):
@@ -814,7 +722,6 @@ class SpttCamera:
             return read_crb(self.ep_wr, self.ep_rd)
 
     def get_status_info(self):
-        """Get detailed status dict for monitoring."""
         try:
             sb, sl = self.get_status()
             return {
@@ -847,19 +754,11 @@ class SpttCamera:
             return {}
 
 
-# ---------------------------------------------------------------------------
-# Firmware loading
-# ---------------------------------------------------------------------------
 def ensure_firmware_loaded(backend, firmware_dir=None, usb_port=None):
-    """Load firmware if the camera is not yet configured.
+    """Return the camera's CameraLocation once it is up, else None.
 
-    Returns the camera's :class:`CameraLocation` (model and USB port, truthy)
-    once it is up, or ``None`` when there is no camera or it could not be
-    brought up.
-
-    ``firmware_dir`` is ``sptt.firmware_dir`` from the config; empty or absent
-    means the ``firmware/`` directory next to the program. ``usb_port`` is
-    ``sptt.usb_port``: which camera, when the machine has several.
+    ``firmware_dir`` empty means ``firmware/`` next to the program. ``usb_port`` picks
+    the camera when the machine has several.
     """
     try:
         found = select_camera(backend, usb_port)
@@ -883,8 +782,8 @@ def ensure_firmware_loaded(backend, firmware_dir=None, usb_port=None):
     try:
         fx2_blocks, fpga_data = load_firmware_files(firmware_dir, model)
     except (FileNotFoundError, ValueError) as exc:
-        # Same shape as "no camera found" above: the caller decides what to do,
-        # and the operator gets the path that was actually searched.
+        # As with "no camera found": the caller decides, and the operator gets the path
+        # that was actually searched.
         console_ui.error(str(exc))
         return None
 
@@ -898,7 +797,6 @@ def ensure_firmware_loaded(backend, firmware_dir=None, usb_port=None):
 
 
 def _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
-    """The USB half of :func:`ensure_firmware_loaded`; True once it is up."""
     console_ui.log(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
     load_fx2_firmware(dev_raw, fx2_blocks)
@@ -937,22 +835,12 @@ def _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
     return False
 
 
-# ---------------------------------------------------------------------------
-# FITS file writing
-# ---------------------------------------------------------------------------
 def frame_metadata(cam, when, status=None, debayered=False):
     """The FITS header for one archived SPTT frame.
 
-    For the colour camera a raw frame says how its mosaic is laid out
-    (``BAYERPAT``, which DS9, Siril and astropy-based tools read), and a
-    demosaiced one says its three planes are R, G, B.
-
-    Records what the camera says it did as well as what it was asked for. The
-    two used to be assumed equal, which is how a driver that cut every 0.88 s
-    exposure down to 75 ms went on filing frames stamped ``EXPTIME = 0.88``.
-    ``EXPTIME`` therefore now carries the hardware's own figure, since that is
-    the number any photometry has to divide by, and ``EXPREQ`` keeps the
-    request. Every key stays within the eight characters FITS allows.
+    EXPTIME is the hardware's own figure, the one photometry has to divide by; EXPREQ
+    keeps the request. A raw colour frame gives its mosaic layout in BAYERPAT, read by
+    DS9, Siril and astropy-based tools. Keys stay within the eight characters of FITS.
     """
     if status is None:
         status = cam.get_status_info()
@@ -972,9 +860,7 @@ def frame_metadata(cam, when, status=None, debayered=False):
         "GAIN": cam.gain,
         "BINNING": cam.binning,
         "ENCODING": "12bit" if cam.encoding == ENCODING_12BPP else "8bit",
-        # ENCODING says how the sensor digitised; this says what scale the
-        # pixels in this file are actually on, which is the same for every
-        # camera in this program.
+        # ENCODING is the sensor's digitisation; this is the scale of the pixels in this file.
         "ADCFULL": intensity.FULL_SCALE,
     }
     if is_mosaic(cam.model, cam.binning):
@@ -1001,7 +887,6 @@ def frame_metadata(cam, when, status=None, debayered=False):
 
 
 def save_fits(filepath, frame, metadata=None):
-    """Save frame as FITS file with metadata in header."""
     try:
         from astropy.io import fits
     except ImportError:
@@ -1025,20 +910,16 @@ def save_fits(filepath, frame, metadata=None):
 
 
 def _save_fits_minimal(filepath, frame, metadata=None):
-    """Minimal FITS writer without astropy."""
     import struct as st
 
     # A demosaiced colour frame is a (3, H, W) cube; FITS lists axes fastest
     # first, so NAXIS1 is the width and NAXIS3 the colour.
     axes = frame.shape[::-1]
     bitpix = 16 if frame.dtype in (np.uint16, np.int16) else 8
-    # FITS has no unsigned 16-bit type: the values go out as signed shorts with
-    # an offset, which is what astropy writes for a uint16 array too. Without
-    # this the frame silently wrapped into negative numbers above 32767 —
-    # harmless while the sensor filled only 12 bits, wrong now that it fills 16.
+    # FITS has no unsigned 16-bit type: values go out as signed shorts with an offset,
+    # which is what astropy writes for a uint16 array too.
     unsigned = bitpix == 16 and frame.dtype == np.uint16
 
-    # Build header
     cards = []
     cards.append(f"SIMPLE  =                    T / FITS standard")
     cards.append(f"BITPIX  = {bitpix:>20d} / bits per pixel")
@@ -1065,21 +946,18 @@ def _save_fits_minimal(filepath, frame, metadata=None):
 
     cards.append(f"END")
 
-    # Pad header to multiple of 2880 bytes
     header_str = ""
     for card in cards:
         header_str += card.ljust(80)
     while len(header_str) % 2880 != 0:
         header_str += " " * 80
 
-    # Write
     if bitpix == 16:
         values = (frame.astype(np.int32) - 32768) if unsigned else frame
         data = values.astype(">i2").tobytes()
     else:
         data = frame.astype(np.uint8).tobytes()
 
-    # Pad data to multiple of 2880
     pad_len = (2880 - len(data) % 2880) % 2880
     data += b'\x00' * pad_len
 
@@ -1088,9 +966,6 @@ def _save_fits_minimal(filepath, frame, metadata=None):
         f.write(data)
 
 
-# ---------------------------------------------------------------------------
-# Console worker
-# ---------------------------------------------------------------------------
 class SpttWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
@@ -1099,8 +974,7 @@ class SpttWorkerConsole(threading.Thread):
                  setup_mode=False, debayer=False):
         super().__init__(daemon=True)
         self.cam = cam
-        # sptt.debayer: archive the colour camera's frames as R, G, B cubes
-        # instead of the raw mosaic. Ignored for a grey camera.
+        # Archive the colour camera's frames as R, G, B cubes instead of the raw mosaic.
         self.debayer = bool(debayer)
         self.output_dir = output_dir
         self.instance_name = instance_name
@@ -1118,11 +992,10 @@ class SpttWorkerConsole(threading.Thread):
         self._errors = 0
         self._last_shot = None
         self._last_frame = None
-        # Whether the last loop pass ran under a focus hold, so the transitions
-        # in and out of it are logged once rather than ten times a second.
+        # Whether the last pass ran under a focus hold: entering and leaving it are
+        # logged once, not ten times a second.
         self._held = False
-        # Camera and filesystem status, refreshed on the status cadence rather
-        # than on every pass of the measurement loop — see _camera_status.
+        # Refreshed on the status cadence, not on every loop pass: see _camera_status.
         self._cam_status = {}
         self._cam_status_at = None
         self._system_info = None
@@ -1158,8 +1031,7 @@ class SpttWorkerConsole(threading.Thread):
                         encoding=encoding,
                     )
                 finally:
-                    # configure() refuses a timing the camera did not take, so
-                    # the restart has to happen either way — a rejected change
+                    # configure() refuses a timing the camera did not take, and a rejected change
                     # must not leave the schedule with a stopped camera.
                     self.cam.start()
                 applied["binning"] = binning
@@ -1168,15 +1040,11 @@ class SpttWorkerConsole(threading.Thread):
             errors.append(str(e))
         return applied, errors
 
-    # ------------------------------------------------------------------
-    # Live view for the LAN focus tool
-    # ------------------------------------------------------------------
     def _push_live_frame(self, frame, ts):
         if self._service is not None:
             try:
-                # Demosaiced rather than raw: a mosaic is a checkerboard of
-                # colours, which the focus measures would read as fine detail.
-                # Sharpness and stats are taken over the mean of the colours.
+                # Demosaiced: the focus measures would read a mosaic's colour checkerboard as fine
+                # detail. Sharpness and stats are taken over the mean of the colours.
                 self._service.publish_frame(self.cam.for_display(frame), ts)
             except Exception:
                 pass
@@ -1190,15 +1058,11 @@ class SpttWorkerConsole(threading.Thread):
         }
 
     def _focus_holding(self):
-        """True while a focus session has asked the schedule to stand down."""
         return self._service is not None and self._service.focus_hold()
 
     def _handle_focus(self, now):
-        """Grab one extra frame for the focus tool.
-
-        Held sessions get every tick, the same as setup mode: the operator has
-        agreed to interrupt the measurements, so there is no capture second to
-        keep clear any more.
+        """Held sessions get every tick, like setup mode: the operator agreed to interrupt
+        the measurements.
         """
         if self._service is None or not self._service.focus_active():
             return
@@ -1210,9 +1074,8 @@ class SpttWorkerConsole(threading.Thread):
             applied, errors = self._apply_params(params)
             self._service.complete_param_request(req_id, applied, errors)
             self._service.set_current_params(self._current_params())
-        # Only the frame right after a change is worth waiting a full period
-        # for; grab_frame already drops the contaminated one either way, so the
-        # rest of the focus loop keeps its rate.
+        # Only the frame right after a change is worth a full period: grab_frame drops
+        # the contaminated one anyway, so the focus loop otherwise keeps its rate.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
             self._service, lambda: self.cam.for_display(grab()),
@@ -1234,7 +1097,6 @@ class SpttWorkerConsole(threading.Thread):
             console_ui.log("SPTT measurement started (captures at :00 and :30)")
             self._save_status("running", force=True)
 
-        # Start continuous capture
         try:
             self.cam.start()
         except Exception as exc:
@@ -1245,8 +1107,6 @@ class SpttWorkerConsole(threading.Thread):
             return
 
         while not self._stop_event.is_set():
-            # Handle on-demand capture requests (outside schedule)
-
             now = dt.now()
 
             fire_key = (now.minute, now.second)
@@ -1299,8 +1159,7 @@ class SpttWorkerConsole(threading.Thread):
         timestamp = now.strftime("%Y%m%dT%H%M%S")
         filepath = os.path.join(self.output_dir, f"{timestamp}.fit")
         try:
-            # A frame started at the tick, not whichever one has been sitting
-            # in the FIFO since the last capture half a minute ago.
+            # Started at the tick, not one sitting in the FIFO since the last capture.
             frame = self.cam.grab_fresh_frame()
             debayered = self.debayer and self.cam.is_mosaic()
             metadata = frame_metadata(self.cam, now, debayered=debayered)
@@ -1323,12 +1182,9 @@ class SpttWorkerConsole(threading.Thread):
     def _camera_status(self, force=False):
         """The camera's own status block, at the cadence the status goes out.
 
-        The measurement loop calls _save_status ten times a second, but a
-        status only leaves every ``STATUS_MIN_INTERVAL``. Asking the camera on
-        every pass put ten control transfers a second on the very endpoint the
-        frame readout uses, so the gap between frames grew by however much USB
-        traffic happened to collide with it — visible as dead time that varies
-        while the exposure does not.
+        The loop calls _save_status ten times a second. Asking the camera each time puts
+        control transfers on the endpoint the readout uses, which shows as dead time that
+        varies while the exposure does not.
         """
         now = time.monotonic()
         if (not force and self._cam_status_at is not None
@@ -1348,9 +1204,7 @@ class SpttWorkerConsole(threading.Thread):
         return self._cam_status
 
     def _save_status(self, status, force=False):
-        # focus_app only sees the values published from here, so they are
-        # refreshed on the status cadence rather than left as they were at
-        # startup — see worker_common.publish_current_params.
+        # focus_app only sees the values published here, so they follow the status cadence.
         publish_current_params(self._service, self._current_params)
         cam_status = self._camera_status(force)
 
@@ -1378,9 +1232,8 @@ class SpttWorkerConsole(threading.Thread):
             "last_update": dt.now().isoformat(),
         }
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
-        # Cached on the same cadence and for the same reason as the camera
-        # status: this stats the output filesystem, which on a network share is
-        # not a free call to make ten times a second between frames.
+        # Cached like the camera status: this stats the output filesystem, which is not
+        # free on a network share.
         if self._system_info is not None:
             payload["system"] = self._system_info
 
@@ -1388,8 +1241,7 @@ class SpttWorkerConsole(threading.Thread):
                           output_dir=self.output_dir)
         console_ui.set_section("camera", [
             ("Exposure / gain:", f"{self.cam.exposure} s  ·  {self.cam.gain}"),
-            # On screen because a period shorter than the exposure is what
-            # silently truncated every frame this camera ever took.
+            # On screen because a period shorter than the exposure silently truncates frames.
             ("Frame period:", f"{self.cam.period_us} us  "
                               f"(min {self.cam.min_period_us})"),
             ("Frame size:", f"{self.cam.w}x{self.cam.h}"),
@@ -1399,11 +1251,7 @@ class SpttWorkerConsole(threading.Thread):
         self._bus.publish_status(payload, force=force)
 
 
-# ---------------------------------------------------------------------------
-# Console entry point
-# ---------------------------------------------------------------------------
 def run_preview_sptt(cam, instance_name):
-    """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
     from PIL import Image
 
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
@@ -1448,7 +1296,6 @@ def run_preview_sptt(cam, instance_name):
 
 
 def bayer_pattern_setting(sptt_cfg):
-    """``sptt.bayer_pattern``, checked once at start rather than on every frame."""
     pattern = str(sptt_cfg.get("bayer_pattern") or DEFAULT_BAYER_PATTERN).upper()
     if pattern not in BAYER_PATTERNS:
         raise ValueError(f"sptt.bayer_pattern {pattern!r} is not one of "
@@ -1457,15 +1304,13 @@ def bayer_pattern_setting(sptt_cfg):
 
 
 def usb_port_setting(sptt_cfg):
-    """``sptt.usb_port``; empty means "the only camera on this machine"."""
+    """Empty means the only camera on this machine."""
     return str(sptt_cfg.get("usb_port") or "").strip() or None
 
 
 def run_probe_sptt(config_path=None):
-    """``--type sptt --probe``: list the SPTT cameras on this machine and exit.
-
-    Opens nothing and loads no firmware, so it is safe while other runs are
-    using their cameras. The port column is what goes into sptt.usb_port.
+    """Opens nothing and loads no firmware, so it is safe while other runs use their
+    cameras. The port column is what goes into sptt.usb_port.
     """
     from utils import load_config
     configured = usb_port_setting(load_config(config_path).get("sptt", {}))
@@ -1484,18 +1329,12 @@ def run_probe_sptt(config_path=None):
 
 
 def colour_offsets(sptt_cfg):
-    """``sptt.r_offset`` / ``g_offset`` as configure() takes them.
-
-    Unset means the camera keeps its own. The vendor's programs send both to
-    every camera; on a grey one they are simply not used.
-    """
+    """Unset means the camera keeps its own; on a grey camera they are simply unused."""
     return {key: None if sptt_cfg.get(key) is None else int(sptt_cfg[key])
             for key in ("r_offset", "g_offset")}
 
 
 def make_camera(backend, found, sptt_cfg):
-    """An unopened SpttCamera for ``found`` (the CameraLocation that
-    ensure_firmware_loaded returns) with the config's colour settings."""
     cam = SpttCamera(backend, found.model, found.port)
     cam.bayer_pattern = bayer_pattern_setting(sptt_cfg)
     return cam
@@ -1503,7 +1342,6 @@ def make_camera(backend, found, sptt_cfg):
 
 def run_console_sptt(config_path=None, preview=False, verbose=False,
                      setup_mode=False):
-    """Run SPTT camera measurement in console mode."""
     from utils import load_config, get_node_name
 
     cfg = load_config(config_path)
@@ -1526,10 +1364,8 @@ def run_console_sptt(config_path=None, preview=False, verbose=False,
     capture_seconds = sptt_cfg.get("capture_seconds", SPTT_CAPTURE_SECONDS)
 
     dash = console_ui.start_dashboard("sptt", instance_name, verbose=verbose)
-    # Alert mail, started before the camera is opened so that a camera which
-    # will not open — and a filter controller that answers nothing — is already
-    # something somebody hears about. The crash handler goes first: it is the
-    # only thing that can speak for a process killed outright.
+    # Before the camera is opened, so a camera that will not open still raises an alert.
+    # The crash handler goes first: it alone can speak for a process killed outright.
     alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
     alerts.install_crash_handler(alert_status_path)
     alerts.start(cfg.get("alerts", {}), node_name, instance_name, "sptt",
@@ -1563,8 +1399,6 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
                       exposure, gain, binning, encoding, target_temp,
                       capture_seconds, setup_mode=False, period_us=None,
                       trigmode=None, firmware_dir=""):
-    """Body of :func:`run_console_sptt`, with the dashboard already running."""
-
     if preview:
         console_ui.log("Initializing SPTT camera...")
         backend = find_libusb_backend()
@@ -1622,7 +1456,6 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
 
-    # Load firmware and connect
     console_ui.log("Initializing SPTT camera...")
     backend = find_libusb_backend()
     found = ensure_firmware_loaded(backend, firmware_dir,
@@ -1640,8 +1473,7 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
             target_temp=target_temp, period_us=period_us, trigmode=trigmode,
             **colour_offsets(sptt_cfg),
         )
-        # configure() has already refused anything the camera did not take, so
-        # this line is the confirmation rather than the check.
+        # configure() has already refused anything the camera did not take.
         console_ui.log(f"{found.model.name} (USB port {found.port}) ready: "
                        f"{cam.w}x{cam.h} — "
                        f"exposure {sl[5] / 1e6:.3f} s, period {sl[6]} us "
@@ -1651,7 +1483,7 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         sys.exit(1)
 
 
-    # LAN frame server (archive browsing + live view). Never fatal.
+    # A frame server failure is never fatal.
     from camera_service import CameraService
     from frame_server import start_frame_server
     service = CameraService("sptt", instance_name, output_dir,
@@ -1690,8 +1522,7 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         if server:
             server.stop()
     if worker.failed:
-        # Exit code 0 here kept systemd (Restart=on-failure) from ever
-        # restarting a camera that had given up after repeated errors.
+        # Non-zero so that systemd's Restart=on-failure restarts a camera that gave up.
         console_ui.error("SPTT measurement gave up — exiting with an error.")
         sys.exit(1)
     console_ui.log("Done.")

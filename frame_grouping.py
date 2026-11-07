@@ -1,40 +1,12 @@
-"""Grouping an archive listing the way the night was actually measured.
+"""Groups an archive listing into sessions, cycles and filters.
 
-``frame_archive`` answers "which files are there"; this answers "which day, which
-cycle, which filter". It is what turns the viewer's one-thousand-file ribbon into
-a tree an observer can walk.
+Standard library only: it runs on an observer's machine, and the cycle arithmetic must
+be testable without a display or a camera.
 
-Deliberately pure — no Qt, no numpy, no camera drivers, nothing but the standard
-library — for the same reason as ``frame_archive``: it has to run on an observer's
-machine, and the cycle arithmetic is the subtle part, so it has to be testable
-without a display or a camera.
-
-The hard part is the cycle. The driver knows exactly which iteration of the
-general cycle a frame belongs to (``cameras/common/schedule.next_cycle_slot``)
-but never writes it down: not in the filename (``cameras/japan/paths.frame_name``
-carries only the stamp and the wheel position), not in the FITS header
-(``cameras/common/fits`` writes ``FILTER``, not a cycle), and not in
-``/api/status``, which publishes ``mode`` and ``next_slot`` but neither
-``t_start`` nor the period. So the period is *recovered* here from the one thing
-the archive does record — when each filter came round again — and the operator can
-override it when the guess is wrong.
-
-The other thing that is not what it looks like is the day. A measuring session is
-a *night*, and a night is not a calendar day: the station's evening can fall on
-one side of UTC midnight and its morning on the other, so one night's frames
-carry two dates. Grouping by date would then put the beginning of a run in one
-list and its end in another. Sessions are therefore cut by the gap between
-frames, not by midnight.
-
-Provides:
-  - frame_timestamp()      — capture time of a listing entry, and where it came from
-  - frame_day()            — the ``YYYY-MM-DD`` a frame belongs to
-  - group_by_session()     — measuring sessions, newest first (every camera)
-  - parse_japan_frame()    — stamp / wheel position / dark flag off a japan name
-                             (flat ``sun``/``time`` names and ``sun_cycle``'s
-                             imagerd_rt-layout names alike)
-  - detect_cycle_period()  — the general cycle's period, guessed from the frames
-  - group_japan_cycles()   — sessions -> cycles -> filters (japan, ``time`` mode)
+Neither the filename nor the FITS header records a frame's cycle, so the period is
+recovered from when each filter came round again; the operator can override it.
+A session is a night, not a calendar day: one night's frames can carry two UTC dates,
+so sessions are cut by the gap between frames, not by midnight.
 """
 import math
 import os
@@ -43,42 +15,32 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-# ---------------------------------------------------------------------------
-# Names
-# ---------------------------------------------------------------------------
-# Both archives stamp UTC and both put it first, but they punctuate it
-# differently: japan writes ``20260729T140530_3.fits``
-# (``cameras/japan/paths.py``), the imagerd_rt layout the ASI kept writes
-# ``20260729_140530_TOR_ASI_5577_055000ms.fits`` (``cameras/asi/paths.py``).
+# Both stamp UTC first but punctuate it differently: japan writes
+# ``20260729T140530_3.fits``, the imagerd_rt layout
+# ``20260729_140530_TOR_ASI_5577_055000ms.fits``.
 NAME_TIME_LENGTH = 15
 NAME_TIME_FORMATS = ("%Y%m%dT%H%M%S", "%Y%m%d_%H%M%S")
 
-# Shown for frames whose day cannot be established at all — no usable name and no
-# modification time. Sorted last, never silently folded into a real day.
+# For frames with no usable name and no mtime. Sorted last, never folded into a real
+# day.
 UNKNOWN_DAY = "unknown date"
 
-# What separates two measuring sessions. Longer than any pause a schedule leaves
-# inside a night — a ``time``-mode general cycle is minutes long, and ``sun`` mode
-# fires continuously while the sun is below its limit — and far shorter than the
-# daylight between two nights. This is what keeps a run that starts in the evening
-# and ends after midnight in one group instead of two.
+# Longer than any pause inside a night (a ``time``-mode cycle is minutes long, ``sun``
+# mode fires continuously), far shorter than the daylight between two nights.
 SESSION_GAP = timedelta(hours=6)
 
 JAPAN_NAME_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)(_bg)?$", re.IGNORECASE)
 
-# The imagerd_rt layout: ``YYYYMMDD_hhmmss_SITE_DEV_WAVE_EEEEEEms[_DARK][_pf]``.
-# The japan camera writes it in ``sun_cycle`` mode (``cameras/common/
-# archive_paths.py``). The wavelength tag may itself hold underscores — the OH
-# channel is ``OH__`` — so it is matched lazily up to the exposure field.
+# ``YYYYMMDD_hhmmss_SITE_DEV_WAVE_EEEEEEms[_DARK][_pf]``, written by japan in
+# ``sun_cycle`` mode. The wavelength tag may hold underscores (``OH__``), so it is
+# matched lazily up to the exposure field.
 ARCHIVE_NAME_RE = re.compile(
     r"^(\d{8}_\d{6})_([^_]+)_([^_]+)_(.+?)_(\d{6})ms(_DARK)?(_pf)?$",
     re.IGNORECASE)
 
-# Wavelength tag -> wheel position, for reading a position back off an
-# imagerd_rt-layout name, which carries the tag instead. The Tory wheel, as in
-# ``cameras/common/filters.DEFAULT_FILTERS`` — spelled out here rather than
-# imported, this module staying free of the camera packages; a test keeps the
-# two in step.
+# Wavelength tag -> wheel position. The Tory wheel, as in
+# ``cameras/common/filters.DEFAULT_FILTERS``: spelled out to stay free of the camera
+# packages; a test keeps the two in step.
 ARCHIVE_WAVELENGTH_SLOTS = {
     "5577": 1,
     "6300": 2,
@@ -88,10 +50,8 @@ ARCHIVE_WAVELENGTH_SLOTS = {
     "8570": 6,
 }
 
-# Wheel positions of the Hamamatsu instrument, as the station's schedule file
-# documents them (see the comment at ``cameras/common/schedule.py:36``). The
-# japan driver has no filter table of its own — it writes the bare position into
-# ``FILTER`` — so the names live here, and only ever for a label.
+# Hamamatsu wheel positions, from the station's schedule file. Labels only: the japan
+# driver writes the bare position into ``FILTER``.
 JAPAN_FILTER_NAMES = {
     0: "home / unknown",
     1: "557.7 nm",
@@ -102,26 +62,19 @@ JAPAN_FILTER_NAMES = {
     6: "857.0 nm",
 }
 
-# Period detection thresholds. A night has to show at least a few cycles before a
-# period means anything, and the cycles it implies have to be both uniform and
-# dense for most of the night, or the answer is "no cycle here" — which is the
-# truth for a ``sun``-mode night, where frames follow seconds-within-a-minute.
+# A night must show a few uniform, dense cycles, or the answer is "no cycle here":
+# the truth for a ``sun``-mode night, where frames follow seconds-within-a-minute.
 MIN_LIGHTS_FOR_PERIOD = 4
 MIN_CYCLES = 3
 MIN_SCORE = 0.6
 
 
 def frame_timestamp(name, mtime=None):
-    """``(timestamp, from_name)`` for one listing entry.
+    """``(timestamp, from_name)``.
 
-    The filename is the authority whenever it follows the capture convention —
-    the same rule the camera uses to decide which day a frame belongs to
-    (``frame_archive._matches_day``), because a frame captured last night but
-    copied today must not group under today. That stamp is **UTC**.
-
-    Everything else falls back to ``mtime``, which is a **local** time on the
-    machine reading it. The flag says which of the two was used, so a caller can
-    label the two differently instead of presenting one as the other.
+    The name's stamp is UTC and is the authority, as in ``frame_archive._matches_day``;
+    the ``mtime`` fallback is local to the reading machine, so a caller can label the
+    two apart.
     """
     stem = str(name or "")
     if len(stem) >= NAME_TIME_LENGTH and stem[:8].isdigit():
@@ -140,19 +93,17 @@ def frame_timestamp(name, mtime=None):
 
 
 def entry_timestamp(frame):
-    """:func:`frame_timestamp` for a ``{name, mtime, ...}`` listing entry."""
     frame = frame or {}
     return frame_timestamp(frame.get("name"), frame.get("mtime"))
 
 
 def frame_day(name, mtime=None):
-    """The ``YYYY-MM-DD`` a frame belongs to, matching ``frame_archive.list_dates``."""
+    """Must match ``frame_archive.list_dates``."""
     stamp, _ = frame_timestamp(name, mtime)
     return stamp.strftime("%Y-%m-%d") if stamp else UNKNOWN_DAY
 
 
 def session_label(start, end):
-    """``2026-07-29``, or ``2026-07-29 → 2026-07-30`` for a night across midnight."""
     if start is None or end is None:
         return UNKNOWN_DAY
     if start.date() == end.date():
@@ -161,20 +112,7 @@ def session_label(start, end):
 
 
 def group_by_session(frames, gap=SESSION_GAP):
-    """Cut a listing into measuring sessions, newest session first.
-
-    Returns one dict per session::
-
-        {"label": "2026-07-29 → 2026-07-30", "start": dt, "end": dt,
-         "dates": ["2026-07-29", "2026-07-30"], "frames": [...]}
-
-    A session ends where the archive falls quiet for longer than ``gap``, which is
-    what keeps a run that begins in the evening and ends in the morning together
-    even though its frames carry two dates. Works for every camera: the capture
-    time comes from the filename where there is one and from ``mtime`` otherwise.
-
-    Frames whose time cannot be established at all go into one last group rather
-    than being attached to a session they may not belong to.
+    """Frames with no known time go into one last group, not a session they may not fit.
     """
     dated, undated = [], []
     for frame in frames or []:
@@ -205,23 +143,16 @@ def group_by_session(frames, gap=SESSION_GAP):
     return sessions
 
 
-# ---------------------------------------------------------------------------
-# japan: cycles and filters
-# ---------------------------------------------------------------------------
 def japan_filter_label(position):
-    """``Filter 3 — OH (broadband)``, or the bare position for an unknown one."""
     name = JAPAN_FILTER_NAMES.get(position)
     return f"Filter {position} — {name}" if name else f"Filter {position}"
 
 
 def parse_japan_frame(frame):
-    """Read the capture time, wheel position and dark flag off a japan name.
+    """Reads both japan namings; a wavelength tag the Tory wheel lacks gives position 0.
 
-    Both of the camera's namings are read: the flat ``sun``/``time`` one and the
-    imagerd_rt layout ``sun_cycle`` writes, whose wavelength tag is mapped back
-    to a wheel position (0 for a tag the Tory wheel does not carry). ``None``
-    for anything else — a hand-copied file, a screenshot — so a caller can show
-    those unchanged rather than invent a cycle for them.
+    ``None`` for anything else, such as a hand-copied file, so a caller can show it
+    unchanged rather than invent a cycle for it.
     """
     name = frame.get("name") if isinstance(frame, dict) else frame
     stem = os.path.splitext(os.path.basename(str(name or "")))[0]
@@ -237,7 +168,6 @@ def parse_japan_frame(frame):
 
 
 def _parse_archive_frame(frame, stem):
-    """``parse_japan_frame`` for an imagerd_rt-layout (``sun_cycle``) name."""
     match = ARCHIVE_NAME_RE.match(stem)
     if not match:
         return None
@@ -251,19 +181,13 @@ def _parse_archive_frame(frame, stem):
 
 
 def cycle_score(lights, period):
-    """How well ``period`` explains ``lights`` as a repeating cycle, 0..1.
+    """A product of two conditions, since either alone is easy to satisfy by accident.
 
-    Two things have to hold, and the score is their product because either alone
-    is easy to satisfy by accident:
+    Uniform: most cycles carry the same multiset of filters. The first and last may hold
+    a subset of it: a run rarely starts or stops on a boundary.
 
-    *Uniform* — a cycle is identified by the multiset of filters in it, since that
-    is what a schedule repeats, and most cycles should carry the same one. The
-    first and last are allowed to be incomplete, a run rarely starting or
-    stopping on a boundary, but only as a *subset* of the usual cycle.
-
-    *Dense* — nearly every cycle the night spans should actually contain frames.
-    Without this a night shot at one filter would score perfectly on any period
-    short enough to give each frame a cycle of its own.
+    Dense: nearly every cycle spanned has frames. Otherwise a one-filter night scores
+    perfectly on any period short enough to give each frame its own cycle.
     """
     if not lights or period <= 0:
         return 0.0
@@ -293,17 +217,12 @@ def cycle_score(lights, period):
 
 
 def detect_cycle_period(parsed):
-    """The general cycle's period in seconds, guessed from the frames alone.
+    """Candidates are gaps between frames of one filter: exposed once per cycle, that
+    gap is the period.
 
-    Candidates are the gaps between successive frames of the *same* filter: for a
-    filter exposed once per cycle that gap **is** the period. Each candidate is
-    then scored by :func:`cycle_score` and the best wins, ties going to the
-    shortest — a multiple of the true period splits the night just as uniformly,
-    and would hide half the cycles.
-
-    ``None`` when nothing scores well enough. That is the honest answer for a
-    ``sun``-mode night, and it leaves the caller free to fall back to a plainer
-    grouping instead of drawing cycles that do not exist.
+    Ties go to the shortest, since a multiple of the true period splits the night just
+    as uniformly and hides cycles. ``None`` when nothing scores well, as on a
+    ``sun``-mode night.
     """
     lights = sorted((e for e in parsed or [] if not e["dark"]),
                     key=lambda e: e["time"])
@@ -330,7 +249,6 @@ def detect_cycle_period(parsed):
 
 
 def _anchor_for(first_light, anchor):
-    """Where cycle numbering starts: a given time, else the night's first frame."""
     if anchor is None:
         return first_light
     if isinstance(anchor, datetime):
@@ -342,7 +260,6 @@ def _anchor_for(first_light, anchor):
 
 
 def _by_filter(entries):
-    """``[{filter, frames}, ...]`` by wheel position, newest frame first."""
     grouped = defaultdict(list)
     for entry in entries:
         grouped[entry["filter"]].append(entry)
@@ -354,32 +271,16 @@ def _by_filter(entries):
 
 
 def group_japan_cycles(frames, period=None, anchor=None):
-    """Sessions -> cycles -> filters for a japan archive.
+    """Cycles are counted within the session, so a night through midnight keeps one
+    rising sequence. ``filters`` appears on a session only when it has no period.
 
-    Returns one dict per measuring session (see :func:`group_by_session`), newest
-    first, each carrying that session's fields plus::
+    ``anchor`` is a ``datetime.time`` or a ``datetime``, read as UTC: filenames are UTC,
+    the camera's ``t_start`` is station-local, and the viewer never learns the offset.
 
-        {"period": 160.0, "period_auto": True, "darks": [...], "unparsed": [...],
-         "filters": [...],                      # only when there is no period
-         "cycles": [{"index": 7, "start": dt, "first": dt, "last": dt,
-                     "count": 2, "filters": [{"filter": 3, "frames": [...]}]}]}
-
-    Cycles are counted within the session, so a night that runs through midnight
-    keeps one rising sequence of cycle numbers instead of restarting at the date
-    boundary.
-
-    ``period`` and ``anchor`` override the automatic detection. ``anchor`` is a
-    ``datetime.time`` (combined with the session's first evening) or a full
-    ``datetime``, and it is read as **UTC**: japan filenames are UTC while the
-    camera's ``t_start`` is the station's local time, and the viewer never learns
-    the station's offset — so the operator gives the anchor in the same clock the
-    names are in.
-
-    Cycle numbering is ``floor((t - anchor) / period) + 1``, the driver's own
-    arithmetic (``cameras/common/schedule.next_cycle_slot``) shifted so the first
-    cycle is 1. Numbers are therefore not contiguous: a cycle that produced no
-    frames leaves a gap, which is information, and with an explicit anchor later
-    than the first frame the early cycles are numbered zero or below.
+    Numbering is ``floor((t - anchor) / period) + 1``, the driver's arithmetic
+    (``cameras/common/schedule.next_cycle_slot``) shifted so the first cycle is 1. A
+    cycle with no frames leaves a gap, and an anchor after the first frame gives numbers
+    of zero or below.
     """
     sessions = group_by_session(frames)
     for session in sessions:
@@ -416,7 +317,5 @@ def group_japan_cycles(frames, period=None, anchor=None):
                     "filters": _by_filter(entries),
                 })
         else:
-            # No cycle to be found: still worth grouping the night by filter,
-            # which is the other question an observer asks of these frames.
             session["filters"] = _by_filter(lights)
     return sessions

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""
-Firmware loader for CSDU cameras — 429/423 and 285C (Cypress FX2 + Xilinx FPGA).
+"""Firmware loader for CSDU cameras: 429/423 and 285C (Cypress FX2 + Xilinx FPGA).
 
-Loads, for whichever model is on the bus:
-1. FX2 8051 firmware via vendor request 0xA0
-2. Xilinx FPGA bitstream via vendor request 0xF1
+Loads FX2 8051 firmware via vendor request 0xA0, then the Xilinx FPGA bitstream via
+0xF1.
 
 Usage:
     sudo python -m cameras.sptt_load_firmware
@@ -16,7 +14,6 @@ Firmware files (in the program's firmware/ directory):
     fpga_bitstream.bin - 54908 bytes, CSDU-429 Xilinx FPGA bitstream
 
 Requires: pyusb, libusb
-    pip install pyusb
 """
 
 import sys
@@ -33,7 +30,6 @@ from utils import APP_DIR
 
 from .sptt_spt import extract_firmware
 
-# Camera USB IDs
 VID = 0xDCDC
 PID_RAW = 0xF429        # FX2 before firmware load
 PID_CONFIGURED = 0xE429  # FX2 after firmware load
@@ -51,10 +47,10 @@ FPGA_CHUNK_SIZE = 64
 
 @dataclass(frozen=True)
 class SpttModel:
-    """One camera of the CSDU family, as far as this program has to tell them apart.
+    """One camera of the CSDU family.
 
-    Everything else — the command set, the status block, the 12-bit packing —
-    is shared: the vendor drives all of them through the one stt_cam.dll.
+    The command set, the status block and the 12-bit packing are shared: the vendor
+    drives all of them through the one stt_cam.dll.
     """
     name: str
     pid_raw: int
@@ -97,9 +93,8 @@ UDEV_RULES = "systemd/99-every-camera-sptt.rules"
 def explain_usb_error(exc):
     """``exc`` as a message an operator can act on.
 
-    Finding the camera needs no rights at all, so a program not run as root
-    gets as far as the first transfer and then fails with a bare
-    ``[Errno 13] Access denied``. That case gets the fix spelled out.
+    Finding the camera needs no rights, so a run without them fails at the first
+    transfer with a bare ``[Errno 13] Access denied``.
     """
     if getattr(exc, "errno", None) == 13 or "Access denied" in str(exc):
         return (f"No permission to use the camera's USB device ({exc}). "
@@ -110,16 +105,13 @@ def explain_usb_error(exc):
     return str(exc)
 
 
-# One camera on the bus. ``port`` is the physical USB port, e.g. "1-2.3": the
-# same string Linux uses in /sys/bus/usb/devices. It is what tells two cameras
-# of one model apart — the firmware gives them no serial number to go by — and
-# it survives the re-enumeration after the firmware is loaded, which a bus
-# address does not.
+# ``port`` is the physical USB port, e.g. "1-2.3", as in /sys/bus/usb/devices. The
+# firmware gives two cameras of one model no serial number to tell them apart, and the
+# port survives the re-enumeration after firmware load, which a bus address does not.
 CameraLocation = namedtuple("CameraLocation", "model port configured")
 
 
 def usb_port(dev):
-    """The physical port ``dev`` is plugged into, as "bus-port.port…"."""
     ports = getattr(dev, "port_numbers", None)
     if ports:
         return f"{dev.bus}-" + ".".join(str(p) for p in ports)
@@ -129,14 +121,12 @@ def usb_port(dev):
 
 
 def find_device(backend, pid, port=None):
-    """The device with ``pid`` on ``port``, or on any port when it is None."""
     match = None if port is None else (lambda dev: usb_port(dev) == port)
     return usb.core.find(idVendor=VID, idProduct=pid, backend=backend,
                          custom_match=match)
 
 
 def list_cameras(backend):
-    """Every SPTT camera on the bus, configured or not, ordered by port."""
     found = []
     for model in MODELS:
         for pid, configured in ((model.pid_configured, True),
@@ -158,9 +148,8 @@ def describe_cameras(cameras):
 def select_camera(backend, port=None):
     """The camera this run is to drive, or LookupError saying why there is none.
 
-    With one camera on the machine ``port`` may be left empty, as before. With
-    several it has to be given: taking "the first" would let two runs pick the
-    same camera, or swap the two cameras' archives after a reboot.
+    With several cameras ``port`` is required: taking "the first" would let two runs
+    pick the same camera, or swap their archives after a reboot.
     """
     cameras = list_cameras(backend)
     if port:
@@ -181,7 +170,6 @@ def select_camera(backend, port=None):
 
 
 def find_libusb_backend():
-    """Try to find libusb backend."""
     import platform
     system = platform.system()
 
@@ -202,14 +190,11 @@ def find_libusb_backend():
 
 
 def firmware_path(firmware_dir=None):
-    """Where the two firmware blobs live.
+    """Where the firmware files live: ``sptt.firmware_dir``, or ``firmware/`` in the
+    program root.
 
-    ``firmware_dir`` is the ``sptt.firmware_dir`` config key; empty means the
-    ``firmware/`` directory shipped with the program. That default is anchored
-    to :data:`utils.APP_DIR` — the program root — and not to this file, which
-    lives one level down in ``cameras/``. Deriving it from ``__file__`` is what
-    made the loader look for ``cameras/firmware/``, a directory that has never
-    existed, so no firmware could be found and the camera never came up.
+    Anchored to :data:`utils.APP_DIR`, not to this file, which lives one level down in
+    ``cameras/``.
     """
     if firmware_dir:
         return (firmware_dir if os.path.isabs(firmware_dir)
@@ -218,12 +203,11 @@ def firmware_path(firmware_dir=None):
 
 
 def load_firmware_files(firmware_dir=None, model=CSDU429):
-    """Read the FX2 firmware and the FPGA bitstream for ``model``.
+    """Returns ``(fx2_blocks, fpga_data)``, ``fx2_blocks`` being ``(address, bytes)``
+    pairs.
 
-    Returns ``(fx2_blocks, fpga_data)``, ``fx2_blocks`` being ``(address,
-    bytes)`` pairs. The vendor's ``.spt`` script is used when it is in the
-    directory; the CSDU-429 also still loads from the two blobs it has always
-    shipped with.
+    The vendor's ``.spt`` script is used when present; the CSDU-429 can also load from
+    its two blobs.
     """
     directory = firmware_path(firmware_dir)
     spt_path = os.path.join(directory, model.spt_name)
@@ -249,10 +233,8 @@ def _load_429_blobs(directory):
     fx2_path = os.path.join(directory, "fx2_firmware.bin")
     fpga_path = os.path.join(directory, "fpga_bitstream.bin")
 
-    # Raised, not sys.exit: this is called from the GUI's connect button and
-    # from the console worker, and both need to report it rather than take the
-    # whole program down. SystemExit would not even be caught by their
-    # ``except Exception`` handlers.
+    # Raised, not sys.exit: the GUI's connect button and the console worker must
+    # report it, and their ``except Exception`` handlers would not catch SystemExit.
     missing = [p for p in (fx2_path, fpga_path) if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(
@@ -278,7 +260,6 @@ def _load_429_blobs(directory):
 
 
 def detach_kernel_driver(dev):
-    """Detach kernel driver on Linux if attached."""
     try:
         if dev.is_kernel_driver_active(0):
             dev.detach_kernel_driver(0)
@@ -301,11 +282,9 @@ def load_fx2_firmware(dev, fx2_blocks):
     """
     print("Loading FX2 firmware...")
 
-    # Step 1: Assert reset
     print("  CPUCS = 0x01 (assert reset)")
     dev.ctrl_transfer(0x40, 0xA0, 0xE600, 0x0000, b'\x01')
 
-    # Step 2: Write firmware blocks
     for addr, block in fx2_blocks:
         print(f"  Write {len(block)} bytes to 0x{addr:04X}")
         CHUNK = 4096
@@ -313,7 +292,7 @@ def load_fx2_firmware(dev, fx2_blocks):
             chunk = block[off:off + CHUNK]
             dev.ctrl_transfer(0x40, 0xA0, addr + off, 0x0000, chunk, timeout=5000)
 
-    # Step 3: Verify before releasing reset (CPU halted, RAM readable)
+    # Verify before releasing reset: the CPU is halted and RAM is readable.
     print("  Verifying firmware in RAM...")
     verify_ok = True
     for addr, expected in fx2_blocks:
@@ -337,7 +316,7 @@ def load_fx2_firmware(dev, fx2_blocks):
         print("ERROR: Firmware verification failed! Aborting.")
         sys.exit(1)
 
-    # Step 4: Release reset — 8051 starts executing
+    # Release reset: the 8051 starts executing.
     print("  CPUCS = 0x00 (release reset)")
     dev.ctrl_transfer(0x40, 0xA0, 0xE600, 0x0000, b'\x00')
 
@@ -345,11 +324,7 @@ def load_fx2_firmware(dev, fx2_blocks):
 
 
 def wait_for_configured_device(backend, timeout=10.0, model=CSDU429, port=None):
-    """Wait for device to re-enumerate after FX2 firmware load.
-
-    ``port`` keeps the wait on the camera being loaded: with several on the
-    machine, any other one would otherwise do.
-    """
+    """``port`` keeps the wait on the camera being loaded, with several on the machine."""
     print("Waiting for FX2 firmware to initialize...")
     time.sleep(2)
 
@@ -380,14 +355,12 @@ def load_fpga_bitstream(dev, fpga_data):
     total = len(fpga_data)
     print(f"Loading FPGA bitstream ({total} bytes)...")
 
-    # Step 1: Init FPGA programming mode
     print("  Sending F0 init command...")
     dev.ctrl_transfer(0x40, 0xF0, 0x0000, 0x0000, None, timeout=5000)
 
-    # Step 2: Send bitstream in 64-byte chunks
-    # Note: The FPGA may finish configuration and reset the device before
-    # all bytes are sent. This is normal — the trailing bytes are typically
-    # bitstream padding. We treat a disconnect in the last 10% as success.
+    # The FPGA may finish configuring and reset the device before all bytes are sent:
+    # the trailing bytes are typically padding, so a disconnect in the last 10% is
+    # success.
     loaded = 0
     for off in range(0, total, FPGA_CHUNK_SIZE):
         chunk = fpga_data[off:off + FPGA_CHUNK_SIZE]
@@ -437,26 +410,21 @@ def main():
     model, port = cam.model, cam.port
     print(f"Camera: {model.name} on USB port {port}")
 
-    # Step 1: Check if device is already configured
     if cam.configured:
         print("Firmware is already loaded. Ready to use.")
         return
 
-    # Load firmware files
     print("Loading firmware files...")
     fx2_blocks, fpga_data = load_firmware_files(model=model)
     print()
 
-    # Step 2: Find raw (unconfigured) FX2 device
     dev_raw = find_device(backend, model.pid_raw, port)
     print(f"Found raw FX2 device: {VID:04x}:{model.pid_raw:04x}")
     detach_kernel_driver(dev_raw)
 
-    # Step 3: Load FX2 firmware
     load_fx2_firmware(dev_raw, fx2_blocks)
     print()
 
-    # Step 4: USB bus reset and re-acquire device
     print("Sending USB bus reset...")
     try:
         dev_raw.reset()
@@ -474,18 +442,17 @@ def main():
     detach_kernel_driver(dev)
     dev.set_configuration()
 
-    # Step 5: Load FPGA bitstream
     print()
     load_fpga_bitstream(dev, fpga_data)
 
-    # Cleanup — device may have disconnected during FPGA load
+    # The device may have disconnected during the FPGA load.
     try:
         usb.util.dispose_resources(dev)
     except Exception:
         pass
     del dev
 
-    # Wait for device to re-enumerate after FPGA configuration
+    # The device re-enumerates after FPGA configuration.
     print()
     dev_final = wait_for_configured_device(backend, timeout=10.0, model=model,
                                            port=port)

@@ -1,31 +1,13 @@
-"""
-The ``japan`` section of config.json, as typed configuration objects.
+"""The ``japan`` section of config.json, as typed configuration objects.
 
-The standalone japan-camera program read a ``config.ini`` through configparser and
-a ``schedule.txt`` beside it. every-camera keeps one JSON file for every camera, so
-this module does the same job against a plain dict: validate, fill defaults, and
-hand the hardware classes the small typed objects they expect (``CameraCfg``,
-``FilterWheelCfg``, …) instead of letting them dig around in raw config keys. A
-station that already keeps a ``schedule.txt`` can point ``japan.schedule_file`` at
-it and nothing else changes.
+Problems do not raise: they are collected into ``JapanConfig.errors`` and reported on
+the console, because one bad schedule line must not cost a night. This is also where
+the camera's own policy lives (schedule modes, readout speeds, binnings), since
+``cameras/common/schedule.py`` carries both imagers' vocabularies.
 
-Validation never raises for a bad *slot* or a bad value: problems are collected
-into ``JapanConfig.errors`` and reported on the console, because losing one
-schedule line must not cost a night. This is also where the camera's own policy
-lives — which schedule modes it runs, which readout speeds and binnings the sensor
-takes — since ``cameras/common/schedule.py`` deliberately carries the union of both
-imagers' vocabularies and does not know who is asking.
-
-The ``sun_cycle`` mode brings five settings of its own, because it is the ASI
-imager's night run on this camera: its frames are filed in that archive layout,
-so ``name`` (the instrument name, written into the ``NAME`` card and into the
-file name), ``location.name`` (the observing site's name, the file name's site
-field and the ``SiteID`` record) and ``filters`` (the wheel table whose
-wavelength tags go into the name); and it runs that mode's two intensity-control
-loops, so ``preflight`` and ``overexposure`` as well. Those last two are parsed
-by ``cameras/common/exposure_config.py``, shared with the ASI imager, with one
-difference this module imposes: the split guard here runs in ``sun_cycle`` only,
-while on the ASI imager it also runs in ``time``.
+``sun_cycle`` is the ASI imager's night run on this camera, filed in that archive
+layout, hence ``name``, ``location.name``, ``filters``, ``preflight`` and
+``overexposure``.
 """
 from __future__ import annotations
 
@@ -35,28 +17,22 @@ from datetime import time
 from ..common import cfgparse
 from ..common import exposure_config
 from ..common import filters as common_filters
-# Only for ``default_port``; the module pulls in pyserial when it opens a port,
-# never at import, so reading a config still costs nothing.
+# Only for ``default_port``; pyserial is imported when a port opens, never at import.
 from ..common import filterwheel as common_filterwheel
 from ..common import schedule as schedule_mod
 
 DEFAULT_MODE = "sun"
 
-# The two schedule shapes the Hamamatsu program had, plus ``sun_cycle``: the
-# general cycle of ``time`` mode, started by the sun and phase-locked to
-# ``t_start`` in UTC, so that this camera and the ASI imager — or two stations
-# far apart — run the same cycle in step, with the same automatic twilight
-# exposure and the same slot splitting.
+# ``sun_cycle`` is the general cycle of ``time``, started by the sun and phase-locked
+# to ``t_start`` in UTC, so this camera and the ASI imager, or stations far apart, run
+# in step.
 JAPAN_MODES = ("sun", "time", "sun_cycle")
 
-# Where the split guard is allowed to drive. On the ASI imager it runs in every
-# mode that has slots; here it is a ``sun_cycle`` feature only, so that the
-# ``time`` mode this camera came with keeps shooting exactly what its schedule
-# says, one frame per slot, as the standalone program did.
+# On the ASI imager the split guard runs in every mode with slots. Here ``time`` keeps
+# shooting exactly what its schedule says, one frame per slot.
 SPLIT_MODES = ("sun_cycle",)
 
-# The intensity-control blocks are shared with the ASI imager; re-exported so
-# ``japan_config.PreflightCfg`` reads as naturally as ``asi_config``'s does.
+# Re-exported so ``japan_config.PreflightCfg`` reads as ``asi_config``'s does.
 PreflightCfg = exposure_config.PreflightCfg
 OverexposureCfg = exposure_config.OverexposureCfg
 SATURATION_ADU = exposure_config.SATURATION_ADU
@@ -65,9 +41,8 @@ SATURATION_ADU = exposure_config.SATURATION_ADU
 # separates its fields, and the rest would make a path or a broken name.
 _NAME_FORBIDDEN = frozenset('_/\\ \t:*?"<>|')
 
-# DCAM READOUTSPEED on this camera: 1 is the slow, low-noise readout and 2 the
-# fast one. The property is an enumeration, not a range, so a third value is a
-# configuration mistake rather than something to clamp.
+# DCAM READOUTSPEED: 1 is the slow, low-noise readout, 2 the fast one. An enumeration,
+# not a range, so a third value is a mistake rather than something to clamp.
 READOUT_SPEEDS = (1, 2)
 
 BINNING_MIN = 1
@@ -75,7 +50,6 @@ BINNING_MAX = 8
 
 
 def readout_text(speed) -> str:
-    """Word a READOUTSPEED setting the way the camera's manual does."""
     return {1: "1 (slow, low noise)", 2: "2 (fast)"}.get(int(speed), str(speed))
 
 
@@ -89,8 +63,8 @@ class CameraCfg:
 
 @dataclass
 class CoolingCfg:
-    # Off by default: the camera then cools itself exactly as it always has and
-    # nothing here touches the cooler.
+    # Off by default: the camera then cools itself and nothing here touches the
+    # cooler.
     enabled: bool = False
     lead_minutes: float = 30.0        # cooler on this long before the pre-darks
     target_temp: float = None         # None keeps the camera's own target
@@ -101,8 +75,8 @@ class CoolingCfg:
 
 @dataclass
 class FilterWheelCfg:
-    # Filled in by ``from_dict`` from config.json; the dataclass default is this
-    # platform's usual name. "sim" selects the simulator.
+    # ``from_dict`` fills this in; the default is this platform's usual name. "sim"
+    # selects the simulator.
     port: str = field(default_factory=common_filterwheel.default_port)
     baudrate: int = 9600
     move_timeout: float = 8.0
@@ -126,19 +100,10 @@ class ScheduleCfg:
     entries: list = field(default_factory=list)
     dark_frames: int = 3
     dead_time: float = 5.0
-    schedule_len: float = None        # time mode: explicit period, seconds
+    schedule_len: float = None        # cycle modes: explicit period, seconds
 
     @property
     def period(self):
-        """Length of one general cycle (``time`` and ``sun_cycle`` modes).
-
-        Derived from the slots — last delta plus that exposure plus the dead
-        time — which is what the Hamamatsu program did and what its schedules
-        are still written for. A schedule that states its own period wins:
-        ``period = 1440`` at the top of the file, or ``japan.schedule_len``.
-        Stating it in the file is the point — a period kept only in config.json
-        goes stale the moment the schedule beside it is swapped.
-        """
         if self.schedule_len:
             return float(self.schedule_len)
         return schedule_mod.cycle_period(self.entries, self.dead_time)
@@ -164,16 +129,14 @@ class JapanConfig:
         return self.camera.backend == "sim"
 
     def filter_info(self, number):
-        """The wheel position's wavelength tag and description (``sun_cycle``)."""
         return common_filters.lookup(self.filters, number)
 
 
 def clean_name(value, what, errors):
     """``value`` made safe for the ``sun_cycle`` file name, with a note if changed.
 
-    The name is ``..._SITE_NAME_WAVE_...``, split on underscores by whatever
-    reads it back, so an underscore inside a field would silently shift every
-    field after it.
+    The name is split on underscores, so one inside a field would shift every field
+    after it.
     """
     text = str(value or "").strip()
     cleaned = "".join("-" if ch in _NAME_FORBIDDEN else ch for ch in text)
@@ -183,24 +146,12 @@ def clean_name(value, what, errors):
     return cleaned
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def from_dict(japan_cfg):
     """Build a :class:`JapanConfig` from the ``japan`` sub-dict of config.json.
 
-    The schedule comes from ``japan.schedule`` (a list of slot objects). If
-    ``japan.schedule_file`` points at a readable file, that file wins instead —
-    a japan-camera ``schedule.txt`` is exactly the legacy text format the shared
-    parser reads, comma-separated in ``sun`` mode and semicolon-separated in
-    ``time`` mode.
-
-    Such a file may open with ``key = value`` lines, and those speak last of all
-    for the settings this camera understands — ``mode``, ``sun_max_angle``,
-    ``t_start``, ``dark_frames``, ``dead_time`` and the cycle period
-    (``period = 1440``, stored as ``schedule_len``). The period especially
-    belongs with the slots it describes: kept only in config.json, it survives
-    the schedule it was measured for.
+    A readable ``japan.schedule_file`` wins over ``japan.schedule``. Its ``key =
+    value`` lines speak last for the settings this camera understands; ``period`` is
+    stored as ``schedule_len``.
     """
     japan_cfg = japan_cfg or {}
     errors = []
@@ -287,16 +238,14 @@ def from_dict(japan_cfg):
             japan_cfg.get("schedule", []), mode, camera.binning)
     errors.extend(slot_errors)
 
-    # A slot may legitimately carry a gain for the ASI imager. This camera has no
-    # gain to set, so honouring the rest of such a slot silently would leave the
-    # operator believing a setting took effect.
+    # This camera has no gain to set, so honouring the rest of such a slot silently
+    # would leave the operator believing it took effect.
     if any(entry.gain is not None for entry in entries):
         errors.append("japan schedule slots carry 'gain', which this camera has "
                       "no equivalent for; it is ignored")
 
-    # The schedule file speaks last, but only for the keys it is allowed to and
-    # only for the ones this camera understands: ``site_id`` and ``device_id``
-    # belong to the ASI archive and are ignored here.
+    # Only the keys this camera understands: ``site_id`` and ``device_id`` belong to
+    # the ASI archive.
     settings = dict(japan_cfg)
     settings.update({key: value for key, value in overrides.items()
                      if key in ("mode", "sun_max_angle", "t_start",
@@ -315,9 +264,8 @@ def from_dict(japan_cfg):
         errors.append("japan.t_start is required in 'time' mode (HH:MM); "
                       "using 20:00")
         t_start = time(20, 0)
-    # In ``sun_cycle`` mode ``t_start`` is UTC and optional: without it the
-    # cycle is anchored to the first whole minute of the window, as the ASI
-    # imager does, and is simply not in step with any other station.
+    # Without ``t_start``, which is UTC in ``sun_cycle`` mode, the cycle is anchored
+    # to the first whole minute of the window and in step with no other station.
 
     schedule_len = None
     raw_len = settings.get("schedule_len")
@@ -353,9 +301,7 @@ def from_dict(japan_cfg):
                       f"{sched.dark_frames}; using 0")
         sched.dark_frames = 0
 
-    # The two intensity-control loops. Both are ``sun_cycle`` features on this
-    # camera — see SPLIT_MODES for why the guard is narrower here than on the
-    # ASI imager — and both switch themselves off rather than run misconfigured.
+    # Both are ``sun_cycle`` features on this camera; see SPLIT_MODES.
     preflight = exposure_config.parse_preflight(
         cfgparse.sub(japan_cfg, "preflight"), sched.mode, sched.sun_max_angle,
         errors, prefix="japan")

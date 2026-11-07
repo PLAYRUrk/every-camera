@@ -1,33 +1,14 @@
 """The FITS cards both imagers write, and the write itself.
 
-The Hamamatsu program defined this header set; the PIXIS driver inherited it and
-then added its own cards (``GAIN``, ``SETTEMP``, the intensity-control pair) and
-the sixteen records imagerd_rt attached to every frame. What is left over — the
-eighteen cards below — is genuinely the same for both instruments, down to the
-comment text, so it is written in one place.
+``DATE-OBS`` is the start of the exposure in UTC, as the FITS standard requires;
+``DATE-LOC`` keeps the local wall-clock time of the operator's night log.
 
-``DATE-OBS`` is the *start* of the exposure in UTC, as the FITS standard requires.
-Both original programs passed a naive local timestamp under a comment claiming
-UTC; converting here is a deliberate behaviour change, and ``DATE-LOC`` keeps the
-local wall-clock time that the operator's night log is written in, so nothing is
-lost by it.
+Values are written untouched, so ``READSPD`` can be ``2.0`` MHz on the PIXIS and a
+speed setting of ``2`` on the Hamamatsu; differing comment text comes in through
+``comments``.
 
-Values are written through untouched. That is what lets one function serve a
-``READSPD`` of ``2.0`` MHz for the PIXIS and an ``int`` speed setting of ``2`` for
-the Hamamatsu without either camera's spelling leaking into the other's frames;
-the differing comment text comes in through ``comments``.
-
-``instrument=False`` leaves out every card that describes the camera and its
-software (``INSTRUME``, ``VENDOR``, ``CAMSN``, ``CAMVER``, ``DRVVER``,
-``DCAMVER``). The Hamamatsu imager's ``sun_cycle`` frames are written that way:
-they carry the instrument's name in one ``NAME`` card, set in config.json, and
-nothing about which camera took them.
-
-:func:`write_legacy_keys` appends the sixteen records imagerd_rt attached to
-every frame. The ASI imager writes all of them; ``sun_cycle`` frames of the
-Hamamatsu imager write them with ``instrument=False``, which drops the four
-that describe the camera or the program (``BitDepth``, ``CCDGain``,
-``DeviceID``, ``Version``).
+``instrument=False`` leaves out what describes the camera and its software: the
+Hamamatsu's ``sun_cycle`` frames carry one ``NAME`` card instead.
 """
 from __future__ import annotations
 
@@ -45,19 +26,15 @@ import intensity
 
 from .timeutil import to_utc
 
-# The long legacy names deliberately become HIERARCH cards. astropy warns once
-# per card, which would be five lines of noise for every frame of every night;
-# the choice is made knowingly, so the warning is silenced here rather than
-# left to whoever reads the console. Only the legacy writer produces such cards.
+# The long legacy names deliberately become HIERARCH cards; astropy would warn for
+# each one on every frame.
 warnings.filterwarnings("ignore", category=VerifyWarning,
                         message=r"Keyword name .* is greater than 8 characters")
 
-# The cards that say which camera and which software took a frame. Left out of
-# the header when ``write_core_header`` is called with ``instrument=False``.
 INSTRUMENT_CARDS = ("INSTRUME", "VENDOR", "CAMSN", "CAMVER", "DRVVER", "DCAMVER")
 
-# Written where a program had a reading it could not take. imagerd_rt's value,
-# kept because the station's processing program tests for it.
+# imagerd_rt's value for a reading it could not take; the processing program tests for
+# it.
 UNKNOWN_TEMP = -999.0
 
 CORE_COMMENTS = {
@@ -84,12 +61,10 @@ CORE_COMMENTS = {
 
 
 def utc_string(timestamp: datetime) -> str:
-    """Format a timestamp as a FITS UTC string, assuming local time if naive."""
     return to_utc(timestamp).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 def local_string(timestamp: datetime) -> str:
-    """Format a timestamp as it reads on the station's own clock."""
     return timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
@@ -119,12 +94,8 @@ def write_core_header(
 ) -> None:
     """Append the shared cards to ``h``, in the order the archive has them.
 
-    ``date_loc`` has no default on purpose: whether a camera writes the local
-    timestamp is a property of its archive, and both callers say so out loud
-    rather than inheriting whatever happened to be convenient here.
-
-    ``instrument=False`` skips :data:`INSTRUMENT_CARDS`; the values passed for
-    them are then simply not used.
+    ``date_loc`` has no default on purpose: whether a camera writes it is a property
+    of its archive.
     """
     say = dict(CORE_COMMENTS, **(comments or {}))
     h["DATE-OBS"] = (utc_string(timestamp), say["DATE-OBS"])
@@ -148,11 +119,8 @@ def write_core_header(
     h["SITELAT"] = (lat, say["SITELAT"])
     h["SITELON"] = (lon, say["SITELON"])
     h["SITEELEV"] = (elevation, say["SITEELEV"])
-    # The scale the pixel values are on. Written by every camera here, so a
-    # reader never has to guess it from the data — and so a frame captured
-    # before the program standardised on 16 bits stays distinguishable. The
-    # PIXIS's own ``BitDepth`` card says the same thing in imagerd_rt's words
-    # and stays where it is, in the ASI writer.
+    # Written by every camera, so a reader never guesses the scale from the data and a
+    # frame from before the program standardised on 16 bits stays distinguishable.
     h["ADCFULL"] = (intensity.FULL_SCALE, say["ADCFULL"])
 
 
@@ -162,18 +130,11 @@ def write_legacy_keys(h, *, binning, bit_depth, gain, ccd_temp, exposure_sec,
                       fw_temp, legacy_version, instrument=True) -> None:
     """Append imagerd_rt's sixteen metadata records, in its own order.
 
-    Values keep the original formatting, down to ``Exposure`` being a string in
-    milliseconds and the coordinates being rounded to two decimals: the
-    processing program parses what the old archive contains, not what would be
-    tidier here. ``readout_speed_text`` arrives already worded, because the two
-    cameras word it differently (``2 MHz`` against ``2 (fast)``).
-
-    ``instrument=False`` drops the records that describe the camera or the
-    program rather than the frame: ``BitDepth``, ``CCDGain``, ``DeviceID`` and
-    ``Version``.
+    Values keep the original formatting (``Exposure`` as a string in ms, coordinates
+    to two decimals): the processing program parses what the old archive contains.
+    ``readout_speed_text`` arrives worded because the two cameras word it differently.
     """
-    # ``Binning`` uppercases onto the BINNING card written above — same value,
-    # same meaning, so the duplicate spelling costs nothing.
+    # ``Binning`` uppercases onto the BINNING card written above, with the same value.
     h["Binning"] = (binning, "pixel binning NxN")
     if instrument and bit_depth is not None:
         h["BitDepth"] = (bit_depth, "sensor bit depth")
@@ -200,10 +161,8 @@ def write_legacy_keys(h, *, binning, bit_depth, gain, ccd_temp, exposure_sec,
 
 
 def write_image(path: Path, data: np.ndarray | None, header) -> None:
-    """Write one frame, refusing to overwrite and refusing to file a failure.
-
-    A capture that returned nothing must not become a file: an empty frame in the
-    archive is worse than a gap, because it looks like data.
+    """Refuses to overwrite. A failed capture must not become a file: an empty frame
+    looks like data.
     """
     if data is None:
         raise ValueError(f"Cannot write FITS '{path}': image data is None "

@@ -1,33 +1,16 @@
-"""Who else is out there — remembered between runs, so discovery is not the only way.
+"""Cameras seen before, remembered between runs, so discovery is not the only way.
 
-UDP discovery finds cameras beautifully right up to the first switch that drops
-broadcast, and then it finds nothing at all. That is not an exotic failure: it is
-what a VLAN boundary does, and what a wireless bridge does, and it is why the
-program grew a second transport in the first place.
+UDP discovery stops at the first switch, VLAN boundary or wireless bridge that drops
+broadcast. So every node and observer writes down what it has seen, and on the next run
+asks those addresses by unicast too.
 
-The fix is unglamorous. Every node and every observer writes down what it has
-seen — address, port, who was there — and on the next run it asks those addresses
-directly, by unicast, alongside the broadcast probe. A camera found once stays
-findable, and no configuration was involved in either step. That is what makes
-this a *replacement* for a broker rather than a smaller version of one: the
-knowledge accumulates by itself.
+One file per peer: several cameras on a machine share this directory and write whenever
+a neighbour announces itself, and a single JSON file would lose entries to concurrent
+read-modify-write. This needs no lock and works the same on Linux and Windows.
 
-**One file per peer**, not one file with every peer in it. Several cameras run on
-one machine and share this directory, and they all write to it whenever a
-neighbour announces itself. A single JSON file meant read-modify-write from
-several processes at once, and that loses entries: two cameras remembering two
-different neighbours a moment apart, and the second write carrying the first
-one's registry as it was before it changed. It was not theoretical — the first
-two nodes tried against each other lost one of the two entries within a minute.
-A file per peer has no such window, needs no lock, and works the same on Linux
-and Windows.
-
-The directory is small, human-readable and safe to delete: losing it costs one
-round of broadcast discovery, nothing more.
+Safe to delete: losing it costs one round of broadcast discovery.
 
     ~/.every_camera/peers/192.168.2.36_8765.json
-    {"host": "192.168.2.36", "http_port": 8765, "node_name": "TORY",
-     "instance_name": "ASI_ASI", "camera_type": "asi", "last_seen": 1787817250.4}
 """
 import json
 import os
@@ -36,21 +19,17 @@ import time
 from pathlib import Path
 
 PEERS_DIR = str(Path.home() / ".every_camera" / "peers")
-# A peer not heard from in this long is forgotten. Long enough that a camera
-# taken down for a fortnight's maintenance is still remembered when it comes
-# back; short enough that a decommissioned station does not haunt the list.
+# Peers older than this are forgotten. Long enough for a fortnight's maintenance,
+# short enough that a decommissioned station does not haunt the list.
 MAX_AGE_SECONDS = 30 * 24 * 3600
-# A ceiling, so that a misconfigured network cannot grow the directory without
-# bound. Applied to what is handed out, and to what is cleaned up.
+# A ceiling on what ``load`` hands out and ``save`` writes.
 MAX_PEERS = 200
 
-# What is worth keeping about a peer. Anything else in a discovery reply is
-# about that moment rather than about the peer, and would go stale on disk.
+# The rest of a discovery reply is about that moment and would go stale on disk.
 _FIELDS = ("host", "http_port", "node_name", "instance_name", "camera_type")
 
-# A scratch file this old belongs to a process that was killed between
-# writing it and renaming it. Generous, so that a slow disk mid-write is
-# never mistaken for one.
+# A scratch file this old belongs to a process killed between writing and renaming
+# it. Generous, so a slow disk mid-write is never mistaken for one.
 _TMP_MAX_AGE_SECONDS = 300
 
 
@@ -60,13 +39,13 @@ def _key(peer):
 
 
 def _filename(peer):
-    """A file name that survives IPv6 colons and anything else in a host."""
+    """Survives IPv6 colons and anything else in a host."""
     safe = "".join(ch if (ch.isalnum() or ch in "-._") else "_" for ch in _key(peer))
     return f"{safe}.json"
 
 
 def load(path=None):
-    """Remembered peers, freshest first. Never raises."""
+    """Freshest first. Never raises."""
     directory = path or PEERS_DIR
     try:
         names = os.listdir(directory)
@@ -96,7 +75,6 @@ def load(path=None):
 
 
 def _sweep_tmp(directory, name, now):
-    """Drop a scratch file left behind by a process that died mid-write."""
     full = os.path.join(directory, name)
     try:
         if now - os.path.getmtime(full) > _TMP_MAX_AGE_SECONDS:
@@ -113,22 +91,19 @@ def _remove(directory, name):
 
 
 def _write(directory, peer):
-    """One peer, atomically, in a file of its own. Returns True if it got there."""
     try:
         os.makedirs(directory, exist_ok=True)
         target = os.path.join(directory, _filename(peer))
-        # The temporary name carries the pid: two processes writing the same
-        # peer at the same moment must not share a scratch file.
+        # The pid: two processes writing one peer must not share a scratch file.
         tmp = f"{target}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(peer, handle, ensure_ascii=False, indent=2)
         os.replace(tmp, target)
         return True
     except OSError:
-        # Windows refuses to replace a file another process has open, so a
-        # simultaneous write can land here. Losing one update is fine — the
-        # peer announces itself again within the minute — but leaving the
-        # scratch file behind is not.
+        # Windows refuses to replace a file another process has open. Losing one update
+        # is fine, the peer announces itself within the minute; leaving the scratch file
+        # is not.
         try:
             os.remove(tmp)
         except (OSError, UnboundLocalError, NameError):
@@ -137,11 +112,8 @@ def _write(directory, peer):
 
 
 def save(peers, path=None):
-    """Replace the whole registry with ``peers``. Returns True if it got there.
-
-    Used by tests and by anything that wants to prune. Ordinary code calls
-    :func:`remember`, which only ever touches the peers it actually saw and so
-    cannot lose somebody else's entry.
+    """Replaces the whole registry. Ordinary code calls :func:`remember`, which cannot
+    lose somebody else's entry.
     """
     directory = path or PEERS_DIR
     wanted = {_filename(peer) for peer in peers}
@@ -158,11 +130,8 @@ def save(peers, path=None):
 
 
 def remember(nodes, path=None):
-    """Note freshly seen nodes. Returns the registry as it now stands.
-
-    Called after every discovery round and on every announcement, by cameras and
-    observers alike — which is the point: whoever has once seen a camera can
-    reach it again without discovery working at all.
+    """Returns the registry as it now stands. Whoever has once seen a camera can reach
+    it again without discovery working at all.
     """
     directory = path or PEERS_DIR
     now = time.time()
@@ -176,10 +145,8 @@ def remember(nodes, path=None):
 
 
 def addresses(path=None, exclude=()):
-    """Remembered hosts, for use as ``discovery.discover(extra_hosts=...)``.
-
-    Deduplicated by host: the probe is per address, not per camera, so a machine
-    running three cameras is asked once and answers three times.
+    """Deduplicated by host: the probe is per address, so a machine running three
+    cameras is asked once and answers three times.
     """
     skip = {str(host) for host in exclude}
     hosts = []
@@ -191,7 +158,6 @@ def addresses(path=None, exclude=()):
 
 
 def forget(host, http_port=None, path=None):
-    """Drop a peer that is not coming back. Returns how many entries went."""
     directory = path or PEERS_DIR
     gone = 0
     for peer in load(directory):

@@ -1,6 +1,3 @@
-"""
-Shared utilities: config, schedule, instance naming, status files.
-"""
 import os
 import re
 import json
@@ -12,40 +9,29 @@ from pathlib import Path
 
 import console_ui
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_STATUS_DIR = str(Path.home() / ".every_camera" / "status")
 LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 SCHEDULE_DT_FMT = "%Y-%m-%d %H:%M:%S"
 
-# Minimum interval between status publications. Outside the schedule the
-# workers loop twice a second; without this they would write the status file
-# twice a second, around the clock.
+# Outside the schedule the workers loop twice a second; without this they would
+# write the status file that often, around the clock.
 STATUS_MIN_INTERVAL = 5.0
 SCHEDULE_LINE_RE = re.compile(
     r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*-\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})$'
 )
 
 
-# ---------------------------------------------------------------------------
-# GUI availability
-# ---------------------------------------------------------------------------
 def can_use_gui():
-    """Return True if a graphical display is available."""
     import sys
     if sys.platform in ("win32", "darwin"):
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-# ---------------------------------------------------------------------------
-# Network / instance naming
-# ---------------------------------------------------------------------------
 def get_local_ip():
-    """Get local IP address (the one used for default route)."""
+    """The address used for the default route."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -57,55 +43,36 @@ def get_local_ip():
 
 
 def sanitize_name(text, fallback="node"):
-    """Reduce free text to something safe for topics, file names and locks."""
     safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_"
                    for ch in str(text or "")).strip("_")
     return safe or fallback
 
 
 def get_instance_name(camera_name, cfg=None):
-    """Build the default instance name: ``{camera_name}_{node_name}``.
+    """The name drives the log and preview files, so it must not collide across
+    machines.
 
-    It used to be ``{camera_name}_{last_IP_octet}``, which collided in two
-    common cases: two machines whose addresses end in the same octet (.5 in
-    192.168.1.x and in 10.0.0.x), and two copies of the program on one machine.
-    Since the name drives the log file and the preview file,
-    a collision meant two cameras silently overwriting each other. The node
-    name (config ``node_name``, hostname otherwise) does not have that problem.
-
-    Same-machine duplicates are handled separately by :func:`claim_instance_name`.
+    Same-machine duplicates are handled by :func:`claim_instance_name`.
     """
     return f"{camera_name}_{sanitize_name(get_node_name(cfg))}"
 
 
-# ---------------------------------------------------------------------------
-# Instance name reservation
-# ---------------------------------------------------------------------------
 INSTANCE_LOCK_DIR = str(Path.home() / ".every_camera" / "instances")
 MAX_INSTANCE_ORDINAL = 64
 
 
 class InstanceClaim:
-    """A held reservation of one instance name. Release it when the run ends."""
-
     def __init__(self, name, fd=None, path=""):
         self.name = name
         self._fd = fd
         self._path = path
 
     def release(self):
-        """Give the name back. Closing the descriptor is what drops the lock.
+        """Closing the descriptor drops the lock, as process death does on both
+        platforms: a crashed run must not leave its name reserved.
 
-        True on both platforms: a POSIX ``flock`` and a Windows ``msvcrt``
-        byte-range lock are both dropped when the last descriptor onto the file
-        is closed, and both are dropped by the kernel when the process dies —
-        which is the property the whole scheme rests on, since a crashed run must
-        not leave its name reserved.
-
-        The file itself stays: unlinking it would let a third process create a
-        fresh file at the same path and lock *that* inode while a second process
-        still holds the old one — two owners of one name. An empty leftover file
-        costs nothing and is reused by the next run.
+        The file stays: unlinking it would let a third process lock a fresh inode at the
+        same path while a second still holds the old one, two owners of one name.
         """
         if self._fd is None:
             return
@@ -124,20 +91,11 @@ class InstanceClaim:
 
 
 def _lock_file_exclusive(fd):
-    """Take a non-blocking exclusive lock on ``fd``. False when someone holds it.
+    """False when someone holds the lock. ``NotImplementedError`` where neither module
+    exists tells the caller to run without a reservation rather than not run.
 
-    Two implementations of one idea, because the two platforms spell it
-    differently and both are stations we run cameras on:
-
-    * POSIX ``fcntl.flock`` — whole-file advisory lock, dropped on close and on
-      process death.
-    * Windows ``msvcrt.locking(LK_NBLCK)`` — a *mandatory* byte-range lock, so
-      one byte is enough; also dropped on close and on process death. It needs a
-      byte to lock, and the file is created empty, so the range is taken at
-      offset 0 over a length of one whether or not that byte exists yet.
-
-    Raises ``NotImplementedError`` where neither module is available, which is
-    the caller's signal to run without a reservation rather than not run.
+    ``msvcrt.locking`` is a *mandatory* byte-range lock, and the file is created empty,
+    so it takes offset 0, length 1, whether or not that byte exists yet.
     """
     try:
         import fcntl
@@ -163,19 +121,12 @@ def _lock_file_exclusive(fd):
 
 
 def claim_instance_name(base_name, lock_dir=None):
-    """Reserve ``base_name`` for this process. Returns an :class:`InstanceClaim`.
+    """Appends ``-2``, ``-3`` ... while a *live* process holds the name, so several
+    copies can run from one identical config.json without sharing log or preview files.
 
-    While another *live* process on this machine holds the name, ``-2``, ``-3``
-    … are appended, so several copies of every-camera can run from one
-    identical config.json without sharing log files or preview
-    files. The reservation is a lock on a file in ``~/.every_camera/instances``
-    — ``flock`` on POSIX, an ``msvcrt`` byte-range lock on Windows: the kernel
-    drops either when the process dies, so a crashed run frees its name without
-    leaving anything to clean up.
-
-    A platform with neither gets the name unchanged and no reservation. That is
-    a real loss, not a formality — two copies would then share status, log and
-    preview file names — so it is worth a warning rather than a silent pass.
+    The kernel drops the lock when the process dies, so a crashed run leaves nothing to
+    clean up. A platform with no file locking gets the name unchanged, with a warning:
+    two copies would share status, log and preview file names.
     """
     base_name = sanitize_name(base_name, fallback="camera")
     directory = lock_dir or INSTANCE_LOCK_DIR
@@ -220,13 +171,8 @@ def claim_instance_name(base_name, lock_dir=None):
 
 
 def get_node_name(cfg=None):
-    """Human-readable name of this machine, for the observer's programs.
-
-    Scanning the LAN used to show bare IP addresses, which say nothing about
-    which telescope hut a node is standing in. ``node_name`` in config.json fixes
-    that; it describes the *machine*, not one camera, because a single node may
-    run several cameras. The hostname is the fallback, so the name is never
-    empty and an unconfigured node still looks sensible.
+    """Describes the *machine*, not one camera: a node may run several. The hostname is
+    the fallback, so the name is never empty.
     """
     name = ""
     if isinstance(cfg, dict):
@@ -239,9 +185,6 @@ def get_node_name(cfg=None):
         return "every-camera"
 
 
-# ---------------------------------------------------------------------------
-# Config management
-# ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
     "cannon": {
         "instance_name": "",
@@ -373,11 +316,9 @@ DEFAULT_CONFIG = {
             "elevation": 0.0,
         },
     },
-    # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor
-    # filter wheel the ASI camera uses. This is the older of the two observing
-    # programmes — no cooling control, no analog gain — so its block is smaller
-    # than the asi one above. Its sun_cycle mode is the exception: there it runs
-    # the ASI imager's night, intensity-control loops and all.
+    # Japan all-sky imager: Hamamatsu through DCAM-API + the same SmartMotor filter
+    # wheel the ASI camera uses. No cooling control, no analog gain. Its sun_cycle mode
+    # runs the ASI imager's night, intensity-control loops and all.
     "japan": {
         "instance_name": "",
         "output_dir": "",               # sun/time: frames land here flat, one dir
@@ -460,43 +401,37 @@ DEFAULT_CONFIG = {
         "capture_seconds": [0, 30],
         "slots": [],
     },
-    # Alert mail. The only key a station has to fill in is "to": the sender's
-    # credentials live in ~/.every_camera/mail_account.json, which arrives with
-    # the installation the way env.sh does, so that setting a camera up means
-    # typing the addresses to notify and nothing else. See mailer.py.
+    # Alert mail. Only "to" has to be filled in: the sender's credentials live in
+    # ~/.every_camera/mail_account.json. See mailer.py.
     "alerts": {
         "enabled": True,
-        # Who hears about it. Empty means nothing is sent — and is said once, in
-        # the log, rather than passed over in silence.
+        # Empty means nothing is sent, which is said once in the log.
         "to": [],
-        # Ordinary errors are collected and sent together this often. Faults
-        # that end a night — a camera that stopped itself, a controller that
-        # went quiet — do not wait for it.
+        # Ordinary errors are collected and sent together this often. Faults that end a
+        # night do not wait for it.
         "digest_minutes": 30,
-        # After a fault is reported, how long before the same fault is worth
-        # reporting again. The filter wheel that failed every forty seconds all
-        # night on 26 Aug 2026 is why this is an hour and not a minute.
+        # How long before the same fault is reported again: a wheel failing every forty
+        # seconds all night must stay one letter, not a thousand.
         "cooldown_minutes": 60,
         "daily_summary": "",           # "09:00" to get a morning report
         "disk_free_min_mb": 5000,      # 0 disables the check
         "status_mail_minutes": 0,      # >0 mails a status summary that often
-        # A ceiling per station per day. One mailbox serves every camera, so the
-        # provider's allowance is shared: without this, one station stuck in a
-        # repeating fault would spend everyone's before dawn.
+        # Per station per day. One mailbox serves every camera, so one station stuck in
+        # a repeating fault would otherwise spend everyone's allowance before dawn.
         "max_per_day": 50,
         "log_tail_lines": 50,
-        # "smtp": {...} may be added here for a station that needs its own
-        # mailbox; it overrides mail_account.json. Absent by default on purpose
-        # — a password per station is a password in six more places.
+        # "smtp": {...} may be added here for a station that needs its own mailbox; it
+        # is used only when there is no mail_account.json. Absent by default: a password
+        # per station is a password in six more places.
     },
     "server": {
         "enabled": True,
         "bind": "0.0.0.0",
-        # Preferred port. When it is taken — the normal case when several
-        # cameras run from this same config.json — the server moves up to
-        # port + port_search. Nothing is written back: the choice is per run.
+        # Preferred port. When taken, the normal case with several cameras on this same
+        # config.json, the server moves up to port + port_search. Nothing is written
+        # back.
         "port": 8765,
-        "port_search": 20,      # 0 = use "port" or nothing, as before
+        "port_search": 20,      # 0 = use "port" or nothing
         "discovery": True,
         "discovery_port": 45455,
         "max_list": 2000,
@@ -510,12 +445,8 @@ DEFAULT_CONFIG = {
 
 
 def _default_wheel_port():
-    """This platform's usual filter-wheel port name.
-
-    Imported here rather than at module scope: ``utils`` is what the observer
-    tools import to find their config, and they carry no ``cameras`` package
-    requirements at all. The module it reaches into pulls in pyserial only when
-    a port is opened, so the import itself is free wherever it does happen.
+    """Imported here: observer tools import ``utils`` to find their config and carry no
+    ``cameras`` requirements. The module pulls in pyserial only when a port is opened.
     """
     try:
         from cameras.common.filterwheel import default_port
@@ -524,11 +455,9 @@ def _default_wheel_port():
     return default_port()
 
 
-# The literals above are written the way a Linux station reads, because that is
-# what most of them are and a schema is easier to read spelled one way. On
-# Windows they would be a port that cannot exist, so both are replaced here —
-# and the wizard and the setup GUI ask the same function, so a fresh config.json
-# offers ``COM3`` there and ``/dev/ttyUSB0`` here.
+# The literals above read the way a Linux station does. On Windows they are a port
+# that cannot exist, so both are replaced; the wizard and the setup GUI ask the same
+# function.
 for _camera_with_a_wheel in ("asi", "japan"):
     DEFAULT_CONFIG[_camera_with_a_wheel]["filter_wheel"]["port"] = \
         _default_wheel_port()
@@ -536,12 +465,9 @@ del _camera_with_a_wheel
 
 
 def _drop_retired_keys(cfg):
-    """Remove settings that no longer do anything.
-
-    An installed station's config.json is never overwritten, so the MQTT
-    block would sit there for ever looking like a thing that could be
-    switched on. Dropped on load, and written back the next time anything
-    saves.
+    """An installed config.json is never overwritten, so the MQTT block would sit there
+    looking like something that could be switched on. Dropped on load, written back on
+    the next save.
     """
     cfg.pop("mqtt", None)
     return cfg
@@ -560,12 +486,10 @@ def _restore_tracked_config(path):
 
 
 def load_config(path=None):
-    """Load config from JSON file. Returns merged config with defaults.
+    """Returns the file merged over the defaults.
 
-    A malformed config used to be swallowed silently, so a single typo made
-    every setting revert to defaults — and the GUI then wrote those defaults
-    back over the file. Now the error is reported and the original is kept as
-    a ``.bak`` copy before anything can overwrite it.
+    A malformed file is reported and kept as ``.bak``: every setting reverts to
+    defaults, and the GUI would write those back over it.
     """
     path = path or LOCAL_CONFIG_FILE
     cfg = _deep_copy(DEFAULT_CONFIG)
@@ -595,7 +519,6 @@ def load_config(path=None):
 
 
 def save_config(cfg, path=None):
-    """Save config to JSON file."""
     path = path or LOCAL_CONFIG_FILE
     out = _deep_copy(cfg)
     try:
@@ -613,7 +536,6 @@ def _deep_copy(d):
 
 
 def _deep_merge(base, override):
-    """Recursively merge override into base dict."""
     for k, v in override.items():
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
             _deep_merge(base[k], v)
@@ -621,9 +543,6 @@ def _deep_merge(base, override):
             base[k] = v
 
 
-# ---------------------------------------------------------------------------
-# Schedule helpers
-# ---------------------------------------------------------------------------
 @dataclass
 class ScheduleEntry:
     start: dt
@@ -631,7 +550,6 @@ class ScheduleEntry:
 
 
 def parse_schedule_text(text):
-    """Parse schedule text. Returns (list[ScheduleEntry], list[str errors])."""
     entries, errors = [], []
     for lineno, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -659,16 +577,11 @@ def load_schedule_file(filepath):
 
 
 def load_schedule_safe(filepath):
-    """Load a schedule without ever raising. Returns ``(entries, errors, reason)``.
+    """Never raises. Returns ``(entries, errors, reason)``.
 
-    ``reason`` is None when a usable schedule was loaded; otherwise it is a
-    short explanation of why the camera cannot measure, and the caller is
-    expected to start in setup mode rather than abort. Aborting used to be the
-    only option, which meant a freshly installed camera could not even be
-    focused until someone invented a schedule for it.
-
-    ``errors`` holds per-line complaints from :func:`parse_schedule_text`; they
-    are worth reporting even when enough valid lines remain.
+    ``reason`` says why the camera cannot measure; the caller starts in setup mode
+    rather than abort. ``errors`` holds per-line complaints, worth reporting even when
+    enough valid lines remain.
     """
     if not str(filepath or "").strip():
         return [], [], "schedule_file is not configured"
@@ -695,11 +608,7 @@ def save_schedule_file(filepath, entries):
             f.write(f"{e.start.strftime(SCHEDULE_DT_FMT)} - {e.end.strftime(SCHEDULE_DT_FMT)}\n")
 
 
-# ---------------------------------------------------------------------------
-# Status file helpers
-# ---------------------------------------------------------------------------
 def write_status_file(path, data):
-    """Atomically write JSON status file."""
     path = str(path)
     parent = os.path.dirname(path)
     if parent:
@@ -711,7 +620,6 @@ def write_status_file(path, data):
 
 
 def pid_alive(pid):
-    """Return True if a process with this PID currently exists."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -738,10 +646,8 @@ def pid_alive(pid):
 
 
 def cleanup_stale_status_files(status_dir):
-    """Remove ``{pid}.json`` status files left behind by dead processes.
-
-    Without this, a crashed or SIGKILLed worker stays in the monitor's local
-    list forever, since only a clean shutdown removes its own file.
+    """Only a clean shutdown removes a worker's own file, so a crashed one would stay in
+    the monitor's list forever.
     """
     removed = 0
     if not status_dir or not os.path.isdir(status_dir):
@@ -767,16 +673,8 @@ def cleanup_stale_status_files(status_dir):
     return removed
 
 
-# ---------------------------------------------------------------------------
-# System info for monitoring
-# ---------------------------------------------------------------------------
 def _windows_mem_used_pct():
-    """Memory in use, as a percentage, from ``GlobalMemoryStatusEx``.
-
-    The Windows counterpart of ``/proc/meminfo``. ``dwMemoryLoad`` is exactly
-    the number wanted — the percentage of physical memory in use — so there is
-    no arithmetic to get wrong here.
-    """
+    """The Windows counterpart of ``/proc/meminfo``."""
     import ctypes
 
     class MemoryStatusEx(ctypes.Structure):
@@ -798,12 +696,8 @@ def _windows_mem_used_pct():
 
 
 def get_system_info(output_dir=None):
-    """Collect system metrics for monitoring payload.
-
-    Every metric below is optional and every reader treats it so: a key that
-    cannot be produced on this platform is left out rather than faked. On
-    Windows that is ``load_avg_1m``, which has no counterpart there — the
-    monitor shows the row it can fill and drops the one it cannot.
+    """Every metric is optional: a key this platform cannot produce is left out, not
+    faked.
     """
     import platform
     info = {
@@ -811,15 +705,13 @@ def get_system_info(output_dir=None):
         "ip": get_local_ip(),
         "platform": platform.system(),
     }
-    # CPU usage (non-blocking, quick). POSIX only: Windows keeps no load
-    # average, and the nearest thing — a CPU-time sample over an interval —
-    # would make this call block, which it must not.
+    # POSIX only: Windows keeps no load average, and sampling CPU time over an interval
+    # would make this call block.
     try:
         with open("/proc/loadavg") as f:
             info["load_avg_1m"] = float(f.read().split()[0])
     except Exception:
         pass
-    # Memory
     try:
         if os.name == "nt":
             info["mem_used_pct"] = _windows_mem_used_pct()
@@ -836,10 +728,7 @@ def get_system_info(output_dir=None):
                     )
     except Exception:
         pass
-    # Disk free. ``shutil.disk_usage`` rather than ``os.statvfs``: the latter
-    # does not exist on Windows, and the difference the two once had here —
-    # blocks free to an unprivileged user, against blocks free outright — is
-    # not worth a station that reports no free space at all.
+    # ``shutil.disk_usage``, not ``os.statvfs``: that does not exist on Windows.
     if output_dir and os.path.isdir(output_dir):
         try:
             info["disk_free_mb"] = round(
@@ -849,18 +738,13 @@ def get_system_info(output_dir=None):
     return info
 
 
-# ---------------------------------------------------------------------------
-# Interactive console configuration
-# ---------------------------------------------------------------------------
 def _ask(prompt, default=""):
-    """Ask user for input with a default value."""
     suffix = f" [{default}]" if default else ""
     val = input(f"{prompt}{suffix}: ").strip()
     return val if val else default
 
 
 def _ask_bool(prompt, default=False):
-    """Ask user for yes/no."""
     suffix = " [Y/n]" if default else " [y/N]"
     val = input(f"{prompt}{suffix}: ").strip().lower()
     if not val:
@@ -869,7 +753,6 @@ def _ask_bool(prompt, default=False):
 
 
 def _ask_int(prompt, default=0):
-    """Ask user for integer."""
     val = _ask(prompt, str(default))
     try:
         return int(val)
@@ -878,7 +761,6 @@ def _ask_int(prompt, default=0):
 
 
 def _ask_float(prompt, default=0.0):
-    """Ask user for float."""
     val = _ask(prompt, str(default))
     try:
         return float(val)
@@ -887,12 +769,7 @@ def _ask_float(prompt, default=0.0):
 
 
 def _ask_optional_int(prompt, default=None):
-    """Ask for an integer that may be left unset.
-
-    ``_ask_int`` cannot express this: an empty answer there means "keep the
-    default", while here it has to mean "let the program work it out", which is
-    a value in its own right.
-    """
+    """An empty answer means "let the program work it out", not "keep the default"."""
     val = _ask(prompt, "" if default is None else str(default)).strip()
     if not val:
         return None
@@ -903,7 +780,6 @@ def _ask_optional_int(prompt, default=None):
 
 
 def configure_console_cannon(cfg, config_path=None):
-    """Interactive configuration for Canon camera console mode."""
     cannon = cfg.get("cannon", {})
     print("\n--- Canon Camera Configuration ---\n")
 
@@ -936,7 +812,6 @@ def configure_console_cannon(cfg, config_path=None):
 
 
 def configure_console_sptt(cfg, config_path=None):
-    """Interactive configuration for SPTT camera console mode."""
     sptt = cfg.get("sptt", {})
     print("\n--- SPTT (CSDU-429/423/285C) Camera Configuration ---\n")
 
@@ -980,7 +855,6 @@ def configure_console_sptt(cfg, config_path=None):
 
 
 def configure_console_infra(cfg, config_path=None):
-    """Interactive configuration for Infra camera console mode."""
     infra = cfg.get("infra", {})
     print("\n--- Infra Camera (SW1300 SWIR) Configuration ---\n")
 
@@ -1010,7 +884,6 @@ def configure_console_infra(cfg, config_path=None):
 
 
 def configure_console_sentry(cfg, config_path=None):
-    """Interactive configuration for Sentry (imagerd_rt) camera console mode."""
     sentry = cfg.get("sentry", {})
     print("\n--- Sentry (imagerd_rt) Camera Configuration ---\n")
 
@@ -1050,7 +923,6 @@ def configure_console_sentry(cfg, config_path=None):
     except ValueError:
         sentry["capture_seconds"] = [0, 30]
 
-    # Slot editor
     if _ask_bool("Configure imaging slots now?", bool(sentry.get("slots"))):
         slots = []
         while True:
@@ -1076,7 +948,6 @@ def configure_console_sentry(cfg, config_path=None):
 
 
 def configure_console_asi(cfg, config_path=None):
-    """Interactive configuration for the ASI all-sky imager console mode."""
     asi = cfg.get("asi", _deep_copy(DEFAULT_CONFIG["asi"]))
     camera = asi.get("camera", _deep_copy(DEFAULT_CONFIG["asi"]["camera"]))
     cooling = asi.get("cooling", _deep_copy(DEFAULT_CONFIG["asi"]["cooling"]))
@@ -1143,9 +1014,8 @@ def configure_console_asi(cfg, config_path=None):
     asi["dead_time"] = _ask_float("Dead time between cycles (s)",
                                   asi.get("dead_time", 5.0))
 
-    # Both intensity loops keep the keys they are not asked about — the
-    # pedestal, the deadband, the step limits — so a station that tuned them by
-    # hand does not lose them to a pass through the wizard.
+    # Both intensity loops keep the keys they are not asked about, so a station that
+    # tuned them by hand does not lose them to a pass through the wizard.
     if asi["mode"] == "sun_cycle":
         preflight = _deep_copy(DEFAULT_CONFIG["asi"]["preflight"])
         preflight.update(asi.get("preflight") or {})
@@ -1226,7 +1096,6 @@ def configure_console_asi(cfg, config_path=None):
 
 
 def configure_console_japan(cfg, config_path=None):
-    """Interactive configuration for the Japan (Hamamatsu) imager console mode."""
     japan = cfg.get("japan", _deep_copy(DEFAULT_CONFIG["japan"]))
     camera = japan.get("camera", _deep_copy(DEFAULT_CONFIG["japan"]["camera"]))
     wheel = japan.get("filter_wheel",
@@ -1282,8 +1151,8 @@ def configure_console_japan(cfg, config_path=None):
     elif japan["mode"] == "time":
         japan["t_start"] = _ask("Cycle phase reference T_start (HH:MM)",
                                 japan.get("t_start", "20:00"))
-        # A schedule file may say this itself with a "period = 1440" header, and
-        # that is the better place for it — it cannot then outlive its slots.
+        # A schedule file may say this itself with a "period = 1440" header, the better
+        # place: it cannot then outlive its slots.
         period = _ask_float("Cycle period in seconds "
                             "(0 = derive it from the last slot)",
                             float(japan.get("schedule_len") or 0.0))
@@ -1297,10 +1166,8 @@ def configure_console_japan(cfg, config_path=None):
         "Dead time reserved between cycles for filter/binning changes (s)",
         japan.get("dead_time", 5.0))
 
-    # Both intensity loops belong to sun_cycle on this camera, and both keep the
-    # keys they are not asked about — the pedestal, the deadband, the step
-    # limits — so a station that tuned them by hand does not lose them to a pass
-    # through the wizard.
+    # Both intensity loops belong to sun_cycle on this camera, and keep the keys they
+    # are not asked about, so hand-tuned values survive a pass through the wizard.
     if japan["mode"] == "sun_cycle":
         preflight = _deep_copy(DEFAULT_CONFIG["japan"]["preflight"])
         preflight.update(japan.get("preflight") or {})
@@ -1374,7 +1241,6 @@ def configure_console_japan(cfg, config_path=None):
 
 
 def _configure_server(cfg):
-    """Interactive LAN frame-server configuration (shared)."""
     srv = cfg.get("server", _deep_copy(DEFAULT_CONFIG["server"]))
     print("\n  The LAN frame server lets viewer_app.py and focus_app.py browse")
     print("  captured frames and watch a live stream over the local network.")
@@ -1404,13 +1270,10 @@ def _configure_server(cfg):
 
 
 def _configure_alerts(cfg):
-    """Interactive alert-mail configuration: the addresses, and nothing else.
+    """Chained off the server wizard, so every camera's setup ends by asking who to
+    tell.
 
-    Chained off the end of the server wizard rather than offered separately, so
-    that every camera's setup ends by asking who should be told when that camera
-    stops working. The sender's mailbox is not asked for: it arrives with the
-    installation, in ~/.every_camera/mail_account.json, and this only reports
-    whether it is there.
+    The sender's mailbox is not asked for: it arrives with the installation.
     """
     alerts_cfg = cfg.get("alerts", _deep_copy(DEFAULT_CONFIG["alerts"]))
     print("\n  Alert mail: a letter when a camera stops, crashes, hangs, loses")

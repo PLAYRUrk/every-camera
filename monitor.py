@@ -1,9 +1,5 @@
-"""
-Camera monitor widget — the cameras running on this machine.
-
-Reads the status files under ~/.every_camera/status, so it sees every camera
-started here, console or GUI, and nothing else. The network is
-``monitor_app.py``'s business.
+"""Reads ~/.every_camera/status, so it sees every camera started on this machine,
+console or GUI, and nothing else. The network is ``monitor_app.py``'s business.
 """
 import os
 import json
@@ -23,9 +19,6 @@ from PyQt5.QtGui import QColor, QFont
 
 from utils import HOME_STATUS_DIR, pid_alive
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 STALE_THRESHOLD_SECONDS = 30
 LOCAL_REFRESH_INTERVAL_MS = 5000
 FRAME_REQUEST_TIMEOUT_MS = 10000
@@ -45,17 +38,14 @@ STATUS_COLORS = {
     "offline": QColor(200, 80, 0),
     "idle":    QColor(80, 80, 200),
     "stale":   QColor(200, 80, 0),
-    # A camera up for focusing only: nothing is being archived, which is a
-    # state of its own and not a fault. Same orange the apps badge it with.
+    # Focusing only: nothing is archived, a state of its own and not a fault. The same
+    # orange the apps badge it with.
     "setup":   QColor(200, 112, 0),
     "starting": QColor(80, 80, 200),
     "unknown": QColor(100, 100, 100),
 }
 
 
-# ---------------------------------------------------------------------------
-# Shared table logic
-# ---------------------------------------------------------------------------
 def make_table():
     table = QTableWidget(0, len(TABLE_COLUMNS))
     table.setHorizontalHeaderLabels(TABLE_COLUMNS)
@@ -96,10 +86,7 @@ def fmt_dt(iso_str):
 
 
 def _extra_info(rec):
-    """Build short extra info string from monitoring data."""
     parts = []
-    # Which machine this camera sits on — the same friendly name the observer
-    # programs show instead of an IP.
     if rec.get("node_name"):
         parts.append(f"@{rec['node_name']}")
     cam_type = rec.get("camera_type", "")
@@ -111,8 +98,7 @@ def _extra_info(rec):
     elif cam_type == "sptt":
         if rec.get("exposure_s") is not None:
             parts.append(f"Exp:{rec['exposure_s']}s")
-        # Only when the camera disagrees with the request — that divergence is
-        # the whole story of the truncated-exposure bug.
+        # Only when the camera disagrees with the request: the exposure was truncated.
         cam_exp = rec.get("cam_exposure_s")
         if cam_exp is not None and cam_exp != rec.get("exposure_s"):
             parts.append(f"hw:{cam_exp}s")
@@ -155,8 +141,8 @@ def _extra_info(rec):
         if rec.get("darks_taken"):
             parts.append(f"darks:{rec['darks_taken']}")
     elif cam_type == "japan":
-        # The same fields as asi, minus the "!" marker: this camera has no
-        # setpoint, so its temperature can never be reported as unlocked.
+        # As asi, minus the "!" marker: with no setpoint, this camera's temperature can
+        # never be reported as unlocked.
         if rec.get("phase"):
             parts.append(str(rec["phase"]))
         if rec.get("filter") is not None:
@@ -169,7 +155,6 @@ def _extra_info(rec):
             parts.append(f"T:{rec['ccd_temp']}°")
         if rec.get("darks_taken"):
             parts.append(f"darks:{rec['darks_taken']}")
-    # System info
     sys_info = rec.get("system", {})
     if sys_info.get("disk_free_mb") is not None:
         parts.append(f"Disk:{sys_info['disk_free_mb']}MB")
@@ -208,9 +193,6 @@ def populate_table(table, records):
         table.setItem(row, 9, item(fmt_dt(rec.get("last_update"))))
 
 
-# ---------------------------------------------------------------------------
-# Local files tab
-# ---------------------------------------------------------------------------
 class LocalTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -299,18 +281,7 @@ class LocalTab(QWidget):
         return records
 
 
-# ---------------------------------------------------------------------------
-# Monitor widget (embeddable in tabs)
-# ---------------------------------------------------------------------------
 class MonitorWidget(QWidget):
-    """The cameras running on this machine, read from their status files.
-
-    It used to have a second tab, fed by a broker, showing cameras anywhere.
-    That is ``monitor_app.py``'s job and it does it over the LAN, first-hand
-    and with the archive and the live view a click away. What is left here is
-    the one thing a tab inside the camera program is best placed to say.
-    """
-
     def __init__(self):
         super().__init__()
         lay = QVBoxLayout(self)

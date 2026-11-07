@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""
-Every Camera — Configuration Wizard.
-
-Standalone application for configuring every-camera.  Reads and writes
-the same config.json used by main.py and gui_app.py.
-
-GUI mode (default when a display is available):
-    python setup_app.py                       # all cameras
-    python setup_app.py --type cannon         # Canon tab only
-    python setup_app.py --config path.json    # custom config file
-
-Console mode:
-    python setup_app.py --console             # interactive prompts, all cameras
-    python setup_app.py --console --type sptt # configure SPTT only
-"""
+"""Configuration wizard, GUI or console, for the same config.json as main.py and gui_app.py."""
 import argparse
 import copy
 import os
@@ -25,10 +11,8 @@ from utils import (load_config, save_config, DEFAULT_CONFIG, can_use_gui,
                    LOCAL_CONFIG_FILE, _default_wheel_port)
 
 
-# Said in both filter-wheel tabs, and worth saying: a wheel whose port name
-# moved is indistinguishable, from inside the program, from a dead one. The
-# hazard is the same on both platforms and the remedy is not, so the tip is
-# written for whichever one the operator is sitting at.
+# A wheel whose port name moved looks like a dead one from inside the program. The
+# hazard is the same on both platforms but the remedy is not, so the tip differs.
 if os.name == "nt":
     _WHEEL_PORT_TIP = (
         "Serial port of the SmartMotor controller, or 'sim' for the simulator.\n"
@@ -49,11 +33,7 @@ else:
     )
 
 
-# ---------------------------------------------------------------------------
-# Console wizard
-# ---------------------------------------------------------------------------
 def run_console_wizard(config_path=None, camera_type=None):
-    """Interactive terminal configuration wizard."""
     from utils import (
         configure_console_cannon,
         configure_console_sptt,
@@ -88,7 +68,6 @@ def run_console_wizard(config_path=None, camera_type=None):
         fn(cfg, config_path)
         return
 
-    # Select which cameras to configure
     to_configure = []
     print("Select cameras to configure:\n")
     for name in CONFIGURATORS:
@@ -102,15 +81,11 @@ def run_console_wizard(config_path=None, camera_type=None):
     for name in to_configure:
         CONFIGURATORS[name](cfg, config_path)
 
-    # Who to tell when a camera stops working
     _configure_alerts(cfg)
     save_config(cfg, config_path)
     print("\nAll configuration saved.\n")
 
 
-# ---------------------------------------------------------------------------
-# GUI wizard helpers
-# ---------------------------------------------------------------------------
 def _browse_dir(parent, le):
     from PyQt5.QtWidgets import QFileDialog
     d = QFileDialog.getExistingDirectory(parent, "Select directory", le.text())
@@ -126,7 +101,6 @@ def _browse_file(parent, le, caption="Select file", flt="All files (*)"):
 
 
 def _add_dir_row(grid, row, label, le, parent=None):
-    """label | line_edit | Browse button  →  placed in grid at (row, 0..2)."""
     from PyQt5.QtWidgets import QLabel, QPushButton
     grid.addWidget(QLabel(label), row, 0)
     grid.addWidget(le, row, 1)
@@ -153,7 +127,6 @@ def _add_label_row(grid, row, label, widget):
 
 
 def _scrolled(widget):
-    """Wrap widget in a QScrollArea and return the scroll area."""
     from PyQt5.QtWidgets import QScrollArea
     from PyQt5.QtCore import Qt
     sa = QScrollArea()
@@ -164,7 +137,6 @@ def _scrolled(widget):
 
 
 def _group_grid(title, col_stretch=1):
-    """Return (QGroupBox, QGridLayout inside it)."""
     from PyQt5.QtWidgets import QGroupBox, QGridLayout
     box = QGroupBox(title)
     lay = QGridLayout(box)
@@ -174,12 +146,7 @@ def _group_grid(title, col_stretch=1):
     return box, lay
 
 
-# ---------------------------------------------------------------------------
-# Canon config tab
-# ---------------------------------------------------------------------------
 class CannonConfigTab:
-    """Builds and reads the Canon camera configuration form."""
-
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
             QWidget, QVBoxLayout, QLineEdit,
@@ -241,12 +208,7 @@ class CannonConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# SPTT config tab
-# ---------------------------------------------------------------------------
 class SpttConfigTab:
-    """Builds and reads the SPTT (CSDU-429/423/285C) camera configuration form."""
-
     # As in cameras/sptt_driver.BAYER_PATTERNS; repeated here because this
     # dialog has to open on machines with no libusb.
     BAYER_PATTERNS = ["RGGB", "GRBG", "GBRG", "BGGR"]
@@ -295,10 +257,8 @@ class SpttConfigTab:
         self.sb_exposure.setValue(c.get("exposure", 0.88))
         _add_label_row(grid, row, "Exposure:", self.sb_exposure); row += 1
 
-        # Frame period: the register that used to be pinned at 75 ms whatever
-        # the exposure was, quietly cutting every integration short. Auto keeps
-        # it above the exposure; the manual value is for trigger modes where
-        # the period does not gate the integration.
+        # Auto keeps the period above the exposure; the manual value is for trigger modes
+        # where the period does not gate the integration.
         from PyQt5.QtWidgets import QHBoxLayout
         period_w = QWidget()
         period_lay = QHBoxLayout(period_w)
@@ -323,7 +283,7 @@ class SpttConfigTab:
         _add_label_row(grid, row, "Frame period:", period_w); row += 1
 
         self.cb_trigmode = QComboBox()
-        # Vendor's list, see SPTT-CAM/capture.py --trigmode.
+        # The vendor's list of modes.
         self._trigmodes = [None, 0, 1, 2, 3, 5, 7]
         self.cb_trigmode.addItems([
             "default (0 — continuous)", "0 — continuous", "1 — external",
@@ -350,7 +310,6 @@ class SpttConfigTab:
         self.cb_encoding.setCurrentIndex(1 if c.get("encoding", 1) == 1 else 0)
         _add_label_row(grid, row, "Encoding:", self.cb_encoding); row += 1
 
-        # target_temp: None or float
         from PyQt5.QtWidgets import QHBoxLayout
         temp_w = QWidget()
         temp_lay = QHBoxLayout(temp_w)
@@ -411,11 +370,7 @@ class SpttConfigTab:
         root.addStretch()
 
     def _find_cameras(self):
-        """List the connected cameras; with one free choice, fill it in.
-
-        libusb is imported only here, so the form still opens on a machine
-        without it.
-        """
+        """libusb is imported only here, so the form still opens on a machine without it."""
         from PyQt5.QtWidgets import QInputDialog, QMessageBox
         try:
             from cameras.sptt_load_firmware import find_libusb_backend, list_cameras
@@ -435,10 +390,8 @@ class SpttConfigTab:
             self.le_usb_port.setText(cameras[items.index(choice)].port)
 
     def _auto_period(self):
-        """The period the driver would derive for the exposure now in the form.
-
-        Imported lazily and from cameras.sptt_timing rather than the driver:
-        this dialog has to open on machines with no libusb.
+        """Lazy, and from cameras.sptt_timing rather than the driver: this dialog has to
+        open on machines with no libusb.
         """
         from cameras.sptt_timing import derive_period_us
         return derive_period_us(self.sb_exposure.value())
@@ -478,12 +431,7 @@ class SpttConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# Infra config tab
-# ---------------------------------------------------------------------------
 class InfraConfigTab:
-    """Builds and reads the Infra (SW1300 SWIR) camera configuration form."""
-
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
             QWidget, QVBoxLayout, QLineEdit,
@@ -558,13 +506,7 @@ class InfraConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# Sentry config tab (with imaging-slot editor)
-# ---------------------------------------------------------------------------
 class SentryConfigTab:
-    """Builds and reads the Sentry (imagerd_rt) camera configuration form."""
-
-    # Table columns for the imaging slots editor
     SLOT_HEADERS  = ["Filter #", "Start (ms)", "Exposure (ms)", "Binning", "Gain", "Readout (ms)"]
     SLOT_KEYS     = ["filter_num", "start_ms",  "exposure_ms",   "binning", "gain", "readout_ms"]
     SLOT_DEFAULTS = [1,            0,            55000,           2,         3,      5000]
@@ -581,7 +523,6 @@ class SentryConfigTab:
         root = QVBoxLayout(self.widget)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ── Main settings ──────────────────────────────────────────────────
         box, grid = _group_grid("Sentry Camera (imagerd_rt supervisor)")
         row = 0
 
@@ -633,7 +574,6 @@ class SentryConfigTab:
 
         root.addWidget(box)
 
-        # ── Imaging slots editor ───────────────────────────────────────────
         from PyQt5.QtWidgets import QGroupBox
         slot_box = QGroupBox("Imaging Slots  (one row per filter position)")
         slot_root = QVBoxLayout(slot_box)
@@ -645,13 +585,11 @@ class SentryConfigTab:
         self._slot_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
         self._slot_table.setMinimumHeight(140)
 
-        # Populate existing slots
         for slot in c.get("slots", []):
             self._append_slot_row(slot)
 
         slot_root.addWidget(self._slot_table)
 
-        # Slot toolbar
         btn_bar = QHBoxLayout()
         btn_add = QPushButton("+ Add slot")
         btn_add.clicked.connect(self._add_slot)
@@ -669,7 +607,6 @@ class SentryConfigTab:
         root.addWidget(slot_box)
         root.addStretch()
 
-    # ── Slot table helpers ─────────────────────────────────────────────────
 
     def _append_slot_row(self, slot=None):
         from PyQt5.QtWidgets import QTableWidgetItem
@@ -677,7 +614,7 @@ class SentryConfigTab:
         self._slot_table.insertRow(row)
         vals = slot or {}
         for col, (key, default) in enumerate(zip(self.SLOT_KEYS, self.SLOT_DEFAULTS)):
-            # handle both old and new key names for backward compat
+            # Configs may still hold the older key names.
             if key == "start_ms":
                 v = vals.get("start_ms", vals.get("start_time_ms", default))
             elif key == "gain":
@@ -754,16 +691,9 @@ class SentryConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# ASI (Princeton PIXIS) config tab
-# ---------------------------------------------------------------------------
 class AsiConfigTab:
-    """Builds and reads the ASI all-sky imager configuration form.
-
-    The slot table serves every schedule mode: ``delta``, ``gain`` and
-    ``readout`` matter in the cycle modes (*time*, *sun_cycle*), ``seconds`` in
-    *sun* mode. All columns are always shown — switching mode should not
-    silently discard the other programme.
+    """The slot table serves every schedule mode with all columns shown: switching mode
+    must not silently discard the other programme.
     """
 
     SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Gain",
@@ -789,7 +719,6 @@ class AsiConfigTab:
         root = QVBoxLayout(self.widget)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ── Main settings ──────────────────────────────────────────────────
         box, grid = _group_grid("ASI all-sky imager (Princeton PIXIS via PICAM)")
         row = 0
 
@@ -834,7 +763,6 @@ class AsiConfigTab:
 
         root.addWidget(box)
 
-        # ── Cooling ────────────────────────────────────────────────────────
         cool_box, cgrid = _group_grid("Cooling")
         row = 0
         self.cb_cool = QCheckBox("Use the cooler")
@@ -884,7 +812,6 @@ class AsiConfigTab:
 
         root.addWidget(cool_box)
 
-        # ── Filter wheel + site ────────────────────────────────────────────
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
         self.le_port = QLineEdit(wheel.get("port") or _default_wheel_port())
@@ -943,7 +870,6 @@ class AsiConfigTab:
 
         root.addWidget(hw_box)
 
-        # ── Schedule ───────────────────────────────────────────────────────
         sched_box, sgrid = _group_grid("Schedule")
         row = 0
         self.cb_mode = QComboBox()
@@ -1015,10 +941,8 @@ class AsiConfigTab:
 
         root.addWidget(sched_box)
 
-        # ── Intensity control ──────────────────────────────────────────────
-        # Only the settings an operator changes between nights are on screen;
-        # the pedestal, the deadband and the step limits stay in the file and
-        # are carried through by get_config().
+        # Only the settings changed between nights are on screen; the rest stay in the
+        # file and are carried through by get_config().
         pre = c.get("preflight") or {}
         guard = c.get("overexposure") or {}
         int_box, igrid = _group_grid("Intensity control")
@@ -1103,7 +1027,6 @@ class AsiConfigTab:
 
         root.addWidget(int_box)
 
-        # ── Slot table ─────────────────────────────────────────────────────
         slot_box = QGroupBox("Schedule slots  (delta+binning: time mode · "
                              "seconds: sun mode)")
         slot_root = QVBoxLayout(slot_box)
@@ -1128,7 +1051,6 @@ class AsiConfigTab:
         root.addWidget(slot_box)
         root.addStretch()
 
-    # ── Slot table helpers ─────────────────────────────────────────────────
     def _append_slot_row(self, slot=None):
         from PyQt5.QtWidgets import QTableWidgetItem
         row = self._slot_table.rowCount()
@@ -1177,11 +1099,7 @@ class AsiConfigTab:
         return slots
 
     def get_config(self) -> dict:
-        """The edited section, layered over whatever was already in the file.
-
-        The caller replaces ``asi`` wholesale with what comes back, so anything
-        this form does not put on screen — the filter wavelength table, the
-        legacy version string, the demo-camera settings — has to be carried
+        """The caller replaces ``asi`` wholesale, so what this form does not show is carried
         through rather than dropped on the first save.
         """
         merged = copy.deepcopy(self._orig)
@@ -1250,16 +1168,8 @@ class AsiConfigTab:
 
 
 class JapanConfigTab:
-    """Builds and reads the Japan (Hamamatsu) all-sky imager configuration form.
-
-    Deliberately smaller than :class:`AsiConfigTab`: this camera has no cooling
-    to configure and no analog gain, so the slot table has no gain or readout
-    column — nothing here would read them. The intensity-control group is the
-    same one, with one difference stated in its caption and its tooltip: both
-    loops belong to ``sun_cycle`` here, where on the ASI imager the split guard
-    also drives ``time``. What this tab has that the ASI one does not is the
-    instrument name (the ``NAME`` card) and the site's name, which ``sun_cycle``
-    puts into every file name.
+    """Smaller than :class:`AsiConfigTab`: no cooling and no analog gain. Both intensity
+    loops belong to ``sun_cycle`` here; on ASI the split guard also drives ``time``.
     """
 
     SLOT_HEADERS = ["Filter", "Exposure (s)", "Delta (s)", "Binning", "Seconds"]
@@ -1282,7 +1192,6 @@ class JapanConfigTab:
         root = QVBoxLayout(self.widget)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ── Main settings ──────────────────────────────────────────────────
         box, grid = _group_grid("Japan all-sky imager (Hamamatsu via DCAM-API)")
         row = 0
 
@@ -1335,10 +1244,8 @@ class JapanConfigTab:
 
         root.addWidget(box)
 
-        # There is no cooling group: the camera reports a sensor temperature and
-        # offers no setpoint to command.
+        # No cooling group: the camera reports a sensor temperature but has no setpoint.
 
-        # ── Filter wheel + site ────────────────────────────────────────────
         hw_box, hgrid = _group_grid("Filter wheel and site")
         row = 0
         self.le_port = QLineEdit(wheel.get("port") or _default_wheel_port())
@@ -1391,7 +1298,6 @@ class JapanConfigTab:
 
         root.addWidget(hw_box)
 
-        # ── Schedule ───────────────────────────────────────────────────────
         sched_box, sgrid = _group_grid("Schedule")
         row = 0
         self.cb_mode = QComboBox()
@@ -1469,11 +1375,8 @@ class JapanConfigTab:
 
         root.addWidget(sched_box)
 
-        # ── Intensity control ──────────────────────────────────────────────
-        # Both loops belong to sun_cycle on this camera. As on the asi tab, only
-        # the settings an operator changes between nights are on screen; the
-        # pedestal, the deadband and the step limits stay in the file and are
-        # carried through by get_config().
+        # Both loops belong to sun_cycle here. As on the asi tab, the rest stays in the
+        # file and is carried through by get_config().
         pre = c.get("preflight") or {}
         guard = c.get("overexposure") or {}
         int_box, igrid = _group_grid("Intensity control  (sun_cycle mode only)")
@@ -1560,7 +1463,6 @@ class JapanConfigTab:
 
         root.addWidget(int_box)
 
-        # ── Slot table ─────────────────────────────────────────────────────
         slot_box = QGroupBox("Schedule slots  (delta+binning: time/sun_cycle "
                              "mode · seconds: sun mode)")
         slot_root = QVBoxLayout(slot_box)
@@ -1585,7 +1487,6 @@ class JapanConfigTab:
         root.addWidget(slot_box)
         root.addStretch()
 
-    # ── Slot table helpers ─────────────────────────────────────────────────
     def _append_slot_row(self, slot=None):
         from PyQt5.QtWidgets import QTableWidgetItem
         row = self._slot_table.rowCount()
@@ -1634,13 +1535,8 @@ class JapanConfigTab:
         return slots
 
     def get_config(self) -> dict:
-        """The edited section, layered over whatever was already in the file.
-
-        The caller replaces ``japan`` wholesale with what comes back, so anything
-        this form does not put on screen — the filter wavelength table, and the
-        intensity-control settings a station tuned by hand (the pedestal, the
-        deadband, the step limits) — has to be carried through rather than
-        dropped on the first save.
+        """The caller replaces ``japan`` wholesale, so what this form does not show is carried
+        through rather than dropped on the first save.
         """
         merged = copy.deepcopy(self._orig)
         merged.update(self._edited())
@@ -1696,22 +1592,9 @@ class JapanConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# Alert mail config tab
-# ---------------------------------------------------------------------------
 class AlertsConfigTab:
-    """Builds and reads the alert-mail form.
-
-    Shaped around one claim: setting a station up means typing the addresses to
-    notify, and nothing else. The sender's mailbox arrives with the
-    installation, in ~/.every_camera/mail_account.json, so it is shown here as a
-    fact rather than asked for — and the box that edits it is switched off until
-    somebody deliberately switches it on.
-
-    The test button is the point of the tab. An alert system nobody has ever
-    seen deliver a letter is one nobody believes, and the first attempt is where
-    every mistake shows up — the wrong kind of password, a blocked port, a From
-    address the provider will not accept for that login.
+    """The sender's mailbox arrives with the installation, in ~/.every_camera/mail_account.json,
+    so setting a station up means typing only the addresses to notify.
     """
 
     def __init__(self, cfg: dict):
@@ -1737,7 +1620,6 @@ class AlertsConfigTab:
         blurb.setWordWrap(True)
         root.addWidget(blurb)
 
-        # ── Who hears about it ────────────────────────────────────────────
         box, grid = _group_grid("Оповещения")
         row = 0
 
@@ -1764,7 +1646,6 @@ class AlertsConfigTab:
 
         root.addWidget(box)
 
-        # ── The sender, normally left alone ───────────────────────────────
         acc_box, acc_grid = _group_grid("Учётная запись отправителя")
         acc_box.setCheckable(True)
         acc_box.setChecked(False)
@@ -1810,7 +1691,6 @@ class AlertsConfigTab:
         self._acc_box = acc_box
         root.addWidget(acc_box)
 
-        # ── Thresholds ────────────────────────────────────────────────────
         lim_box, lim_grid = _group_grid("Пороги и ограничения")
         row = 0
 
@@ -1861,9 +1741,7 @@ class AlertsConfigTab:
 
         self._refresh_sender()
 
-    # -- helpers -------------------------------------------------------------
     def _account_from_form(self):
-        """What the form describes, or None if it does not describe anything."""
         import mailer
         user = self.le_acc_user.text().strip()
         if not user:
@@ -1912,7 +1790,6 @@ class AlertsConfigTab:
         return [part.strip() for part in self.le_to.text().replace(";", ",").split(",")
                 if part.strip()]
 
-    # -- buttons -------------------------------------------------------------
     def _on_save_account(self):
         from PyQt5.QtWidgets import QMessageBox
         import json
@@ -1982,7 +1859,6 @@ class AlertsConfigTab:
             self.widget, "Тестовое письмо",
             "Отправлено на:\n  " + "\n  ".join(recipients))
 
-    # -- config --------------------------------------------------------------
     def get_config(self) -> dict:
         alerts = {
             "enabled": self.cb_enabled.isChecked(),
@@ -2001,12 +1877,7 @@ class AlertsConfigTab:
         return alerts
 
 
-# ---------------------------------------------------------------------------
-# LAN frame server config tab
-# ---------------------------------------------------------------------------
 class ServerConfigTab:
-    """Builds and reads the LAN frame-server configuration form."""
-
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import (
             QWidget, QVBoxLayout, QLineEdit, QSpinBox, QCheckBox, QLabel,
@@ -2106,12 +1977,7 @@ class ServerConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# General config tab
-# ---------------------------------------------------------------------------
 class GeneralConfigTab:
-    """Builds and reads the general (non-camera) configuration form."""
-
     def __init__(self, cfg: dict):
         from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLineEdit
         self.widget = QWidget()
@@ -2120,8 +1986,7 @@ class GeneralConfigTab:
 
         box, grid = _group_grid("General Settings")
 
-        # Shown by viewer_app / focus_app / monitor instead of a bare IP, so an
-        # observer scanning the network sees a place rather than an address.
+        # Shown by the observer tools instead of a bare IP: a place, not an address.
         self.le_node_name = QLineEdit(cfg.get("node_name", ""))
         self.le_node_name.setPlaceholderText("hostname  (default)")
         self.le_node_name.setToolTip(
@@ -2149,12 +2014,7 @@ class GeneralConfigTab:
         }
 
 
-# ---------------------------------------------------------------------------
-# Main config wizard window
-# ---------------------------------------------------------------------------
 class ConfigWizardWindow:
-    """PyQt5 configuration wizard window."""
-
     TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "japan", "alerts",
                "server", "general"]
 
@@ -2179,7 +2039,6 @@ class ConfigWizardWindow:
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ── Tabs ──────────────────────────────────────────────────────────
         self._tabs_widget = QTabWidget()
         self._camera_tabs = {}
 
@@ -2206,7 +2065,6 @@ class ConfigWizardWindow:
 
         root.addWidget(self._tabs_widget, 1)
 
-        # ── Button bar ────────────────────────────────────────────────────
         btn_bar = QHBoxLayout()
 
         btn_load = QPushButton("Load config…")
@@ -2232,16 +2090,13 @@ class ConfigWizardWindow:
         btn_bar.addWidget(btn_close)
         root.addLayout(btn_bar)
 
-        # ── Status bar ────────────────────────────────────────────────────
         self._status = QStatusBar()
         self.window.setStatusBar(self._status)
         self._status.showMessage(f"Config: {config_path}")
 
-    # ── Slots ──────────────────────────────────────────────────────────────
 
     def _collect_config(self) -> dict:
-        """Merge values from all visible tabs into a full config dict."""
-        cfg = {k: v for k, v in self._cfg.items()}  # start with full existing config
+        cfg = {k: v for k, v in self._cfg.items()}
 
         KEY_MAP = {
             "cannon":  "cannon",
@@ -2286,7 +2141,6 @@ class ConfigWizardWindow:
         except Exception as exc:
             QMessageBox.critical(self.window, "Load failed", str(exc))
             return
-        # Rebuild window with new config (simplest approach: close + reopen)
         QMessageBox.information(
             self.window, "Config loaded",
             f"Loaded:\n{path}\n\nRestart the wizard to see the new values."
@@ -2304,7 +2158,6 @@ class ConfigWizardWindow:
         )
         if reply != QMessageBox.Yes:
             return
-        # Rebuild the UI with default config
         new_win = ConfigWizardWindow(
             DEFAULT_CONFIG,
             config_path=self._config_path,
@@ -2316,11 +2169,7 @@ class ConfigWizardWindow:
         self.window.show()
 
 
-# ---------------------------------------------------------------------------
-# GUI entry point
-# ---------------------------------------------------------------------------
 def run_gui_wizard(config_path=None, camera_type=None):
-    """Launch the PyQt5 configuration wizard."""
     from PyQt5.QtWidgets import QApplication
 
     cfg = load_config(config_path)
@@ -2333,9 +2182,6 @@ def run_gui_wizard(config_path=None, camera_type=None):
     sys.exit(app.exec_())
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Every Camera — Configuration Wizard",

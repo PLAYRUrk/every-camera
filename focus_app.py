@@ -1,32 +1,12 @@
 #!/usr/bin/env python3
-"""
-Every Camera — Focus Assistant (local network only).
+"""Live view for focusing: streams frames, edits camera parameters, scores sharpness.
 
-A live view for adjusting a lens or telescope: it streams frames from a camera
-as fast as that camera can supply them, lets you change exposure/gain/ROI/ISO
-while watching, and scores sharpness in real time so you can tell which way to
-turn the focuser.
+Controls come from ``GET /api/params``; sentry, whose schedule belongs to imagerd_rt,
+is read-only. ``--via`` reaches a camera through another one (``gateway.py``).
 
-Works with all four cameras. The editable controls come from the camera itself
-(``GET /api/params``), so each camera offers exactly what it supports — and the
-sentry camera, whose schedule belongs to imagerd_rt, is shown read-only.
-
-A camera this machine cannot reach directly is reached through one that can:
-``--via`` names a camera to fetch on our behalf, and the live stream comes back
-through it (``gateway.py``). That is what the broker could never do — a
-continuous MJPEG stream through a public broker was out of the question, so
-remote focusing simply did not exist.
-
-Two safeguards keep this from disturbing measurements:
-  * The camera only free-runs while this program keeps asking it to. The
-    request carries a deadline, so closing the window — or losing the network,
-    or crashing — lets the camera fall back to schedule-only within a minute.
-  * Scheduled captures always win. The camera skips focus frames around its
-    capture seconds, so a measurement is never delayed.
-
-Usage:
-    python focus_app.py                     # discover cameras on the LAN
-    python focus_app.py --host 192.168.1.5  # connect straight away
+Measurements stay safe: free-running needs a renewed deadline, so losing this program
+returns the camera to schedule-only within a minute, and the camera skips focus frames
+around its capture seconds.
 """
 import io
 import os
@@ -50,12 +30,12 @@ from net_client import (
 )
 
 DEFAULT_HTTP_PORT = 8765
-HEARTBEAT_MS = 20_000        # keep the focus session alive
-PARAMS_POLL_MS = 4_000       # re-read what the camera is actually set to
+HEARTBEAT_MS = 20_000
+PARAMS_POLL_MS = 4_000
 FOCUS_TTL_SECONDS = 60       # camera stops free-running this long after the last ping
 SHARPNESS_HISTORY = 120
 ROI_MIN = 32                 # below this the sharpness metric has nothing to chew on
-ROI_STEP = 8                 # keep typed and wheeled sizes on a tidy grid
+ROI_STEP = 8
 ROI_WHEEL_STEP = 1.25        # one wheel notch, as a factor on the side length
 STRETCH_MODES = [
     ("minmax", "Auto (min–max)"),
@@ -68,7 +48,6 @@ TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
 
 
 def _display_text(field, value):
-    """A camera's value as the field words it — "2 — Medium", not "2"."""
     if value is None:
         return "nothing"
     if field.get("type") == "bool":
@@ -81,12 +60,7 @@ def _display_text(field, value):
 
 
 def as_bool(value):
-    """Read an on/off value a camera reported. Unknown words mean off.
-
-    The camera answers in JSON, so this is usually already a bool; a camera that
-    words it ("open") must not be read as off, and a state the camera does not
-    know is shown unticked rather than guessed at.
-    """
+    """JSON usually gives a bool; a worded state ("open") counts, unknown words mean off."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -94,16 +68,10 @@ def as_bool(value):
     return str(value).strip().lower() in TRUE_WORDS
 
 
-# ---------------------------------------------------------------------------
-# Live view with an optional measurement region
-# ---------------------------------------------------------------------------
 def crop_box(shape, size, center=None):
-    """``(x0, y0, side)`` of a square kept wholly inside a frame of ``shape``.
-
-    ``center`` is ``(fx, fy)`` as a *fraction* of the frame, so aiming survives a
-    change of stream resolution unchanged; None means the middle. A square asked
-    for near an edge is pushed back inside rather than clipped, so it keeps the
-    requested size.
+    """``center`` is ``(fx, fy)``, a fraction of the frame, so the aim survives a change of
+    stream resolution; None means the middle. Near an edge the square is pushed inside,
+    not clipped, so it keeps its size.
     """
     h, w = shape
     side = max(1, min(int(size), h, w))
@@ -114,11 +82,8 @@ def crop_box(shape, size, center=None):
 
 
 class LiveView(QLabel):
-    """Shows the stream with a movable, resizable square to measure sharpness in.
-
-    The square is stored as a centre *fraction* plus a side in frame pixels: the
-    fraction keeps the aim on the same patch of sky when the stream resolution
-    changes, while the side stays a number the operator typed and can recognise.
+    """The square is a centre fraction plus a side in frame pixels: the fraction keeps the
+    aim on the same patch of sky when the stream resolution changes.
     """
 
     region_changed = pyqtSignal(object)   # (x0, y0, x1, y1) in image coords, or None
@@ -136,9 +101,8 @@ class LiveView(QLabel):
         self.roi_center = (0.5, 0.5)
         self.roi_side = 0          # frame pixels; 0 means "measure the whole frame"
         self.zoom_to_roi = False
-        # What the widget currently shows: (ox, oy, target_w, target_h,
-        # x0, y0, w, h), the last four in frame pixels. This is what turns a
-        # click into a position in the frame, zoomed or not.
+        # (ox, oy, target_w, target_h, x0, y0, w, h), the last four in frame pixels:
+        # turns a click into a position in the frame, zoomed or not.
         self._view = None
 
     def set_frame(self, pixmap):
@@ -151,19 +115,15 @@ class LiveView(QLabel):
         self.setText(message)
         self.update()
 
-    # -- square ---------------------------------------------------------
     def frame_pixmap(self):
-        """The newest frame, for anything else that wants to draw it."""
         return self._pixmap
 
     def frame_shape(self):
-        """(h, w) of the frame currently displayed, or None."""
         if self._pixmap is None or not self._pixmap.width():
             return None
         return (self._pixmap.height(), self._pixmap.width())
 
     def roi_box(self):
-        """The square in frame pixels as ``(x0, y0, side)``, or None if unset."""
         shape = self.frame_shape()
         if shape is None or self.roi_side <= 0:
             return None
@@ -171,7 +131,6 @@ class LiveView(QLabel):
 
     @property
     def region(self):
-        """The square as a normalised box, the form :meth:`_update_metrics` wants."""
         box = self.roi_box()
         if box is None:
             return None
@@ -204,13 +163,10 @@ class LiveView(QLabel):
         self.update()
 
     def clear_region(self):
-        """Go back to measuring the whole frame."""
         self.set_roi_side(0)
         self.roi_changed.emit((self.roi_center, 0))
 
-    # -- painting ------------------------------------------------------
     def _target_rect(self, pw, ph):
-        """Where an image of ``pw`` x ``ph`` lands inside this widget (letterboxed)."""
         if not pw or not ph:
             return None
         scale = min(self.width() / pw, self.height() / ph)
@@ -255,9 +211,7 @@ class LiveView(QLabel):
                                  int(side / full_h * h))
         painter.end()
 
-    # -- aiming ---------------------------------------------------------
     def _aim_at(self, pos):
-        """Point the square at a widget position (works while dragging, too)."""
         if self._view is None or self._pixmap is None:
             return
         ox, oy, target_w, target_h, x0, y0, w, h = self._view
@@ -276,7 +230,6 @@ class LiveView(QLabel):
             self._aim_at(event.pos())
 
     def wheelEvent(self, event):
-        """Ctrl+wheel resizes the square; a plain wheel must not disturb the aim."""
         if not (event.modifiers() & Qt.ControlModifier) or self._pixmap is None:
             super().wheelEvent(event)
             return
@@ -284,7 +237,7 @@ class LiveView(QLabel):
         if not notches:
             return
         side = self.roi_side
-        if side <= 0:                       # from the full frame, start at its short side
+        if side <= 0:
             side = min(self.frame_shape())
         side = int(round(side * (ROI_WHEEL_STEP ** notches) / ROI_STEP)) * ROI_STEP
         self.set_roi_side(max(ROI_MIN, side))
@@ -293,13 +246,6 @@ class LiveView(QLabel):
 
 
 class RoiPreview(QLabel):
-    """Shows just what the measurement square covers, beside the whole frame.
-
-    Judging focus needs the pixels big; keeping an eye on framing needs the
-    whole frame. Showing both at once means neither has to be given up, and the
-    square can be dragged around the full view while its contents stay readable.
-    """
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
@@ -312,7 +258,6 @@ class RoiPreview(QLabel):
         self.smooth = False
 
     def set_source(self, pixmap, box):
-        """``box`` is ``(x0, y0, side)`` in frame pixels, or None for no square."""
         self._pixmap = pixmap
         self._box = box
         self.update()
@@ -341,12 +286,7 @@ class RoiPreview(QLabel):
         painter.end()
 
 
-# ---------------------------------------------------------------------------
-# Sharpness trend plot
-# ---------------------------------------------------------------------------
 class SharpnessPlot(QWidget):
-    """Rolling sharpness trace — turn the focuser until the line peaks."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(90)
@@ -400,18 +340,9 @@ class SharpnessPlot(QWidget):
         painter.end()
 
 
-# ---------------------------------------------------------------------------
-# Parameter form built from the camera's own schema
-# ---------------------------------------------------------------------------
 class ParamForm(QGroupBox):
-    """Editable camera parameters, described by the camera itself.
-
-    The values shown are a *reading*, refreshed while the window is open: a
-    camera changes its own settings between frames — a schedule moves the
-    exposure, the filter, the ASI shutter — and the form has to follow, or the
-    operator is looking at the state the camera had when they connected.
-    Following must not fight the operator, so a field that has been edited and
-    not yet applied keeps what was typed and is marked with a ``*``.
+    """Values are a *reading*, re-read while open: a schedule moves exposure, filter and
+    shutter between frames. An edited, unapplied field keeps what was typed and is marked ``*``.
     """
 
     apply_requested = pyqtSignal(dict)
@@ -421,11 +352,8 @@ class ParamForm(QGroupBox):
         self._widgets = {}
         self._labels = {}
         self._schema = []
-        # Fields the operator has changed and not yet sent. Taken from the
-        # widgets' own signals rather than inferred by comparing values: a
-        # camera that reports nothing for a field (a wheel whose position is
-        # unknown) would otherwise make the widget's default look like an
-        # intention, and Apply would send a filter change nobody asked for.
+        # Fed by widget signals, not by comparing values: with an unreported field the
+        # widget's default would look like an edit, and Apply would send it.
         self._touched = set()
         self._updating = False      # True while the form writes to its widgets
         self._layout = QVBoxLayout(self)
@@ -450,12 +378,7 @@ class ParamForm(QGroupBox):
         self._current = {}
 
     def matches_schema(self, schema):
-        """True if ``schema`` is the one already on screen.
-
-        The form is rebuilt only when the camera describes different controls;
-        rebuilding it on every refresh would throw away an edit in progress and
-        the keyboard focus with it.
-        """
+        """Rebuilding on every refresh would lose an edit in progress and the keyboard focus."""
         return list(schema or []) == self._schema
 
     def build(self, schema, current, editable=True):
@@ -508,10 +431,8 @@ class ParamForm(QGroupBox):
             for choice in field.get("choices", []):
                 combo.addItem(str(choice.get("label", choice.get("value"))),
                               choice.get("value"))
-            # States a camera can report but nobody can ask for — a filter
-            # wheel at home is where it parks itself, not somewhere to send it.
-            # Listed so the reading can be shown honestly, and greyed out so it
-            # cannot be picked.
+            # States a camera can report but nobody can ask for, like a wheel at home:
+            # listed to show the reading, greyed out so they cannot be picked.
             for state in field.get("states", []):
                 combo.addItem(str(state.get("label", state.get("value"))),
                               state.get("value"))
@@ -520,8 +441,7 @@ class ParamForm(QGroupBox):
                     item.setEnabled(False)
             return combo
         if kind == "bool":
-            # A shutter, a cooler — things that are simply on or off. The hint is
-            # the caption next to the box ("open"), the label says what it is.
+            # The hint is the caption next to the box ("open"); the label names the control.
             return QCheckBox(field.get("hint", ""))
         if kind == "int":
             spin = QSpinBox()
@@ -539,7 +459,6 @@ class ParamForm(QGroupBox):
         return line
 
     def _watch(self, name, widget):
-        """Notice when the operator changes this field, and only then."""
         for signal in ("currentIndexChanged", "toggled", "valueChanged",
                        "textEdited"):
             if hasattr(widget, signal):
@@ -553,13 +472,8 @@ class ParamForm(QGroupBox):
         self._mark_edited()
 
     def set_current(self, current, reset=False):
-        """Show a fresh reading from the camera.
-
-        Fields the operator has not touched follow the camera. One that is
-        being edited keeps the edit — the operator is mid-thought and an Apply
-        must still send what they typed — and is marked instead. ``reset``
-        takes the camera's word for everything, which is what an applied change
-        or the Reset button means.
+        """Untouched fields follow the camera; an edited one keeps the edit, so Apply still
+        sends what was typed. ``reset`` takes the camera's word for everything.
         """
         self._current = dict(current or {})
         for name in self._widgets:
@@ -567,23 +481,18 @@ class ParamForm(QGroupBox):
                 continue
             value = self._current[name]
             if value is None:
-                # The camera is not saying — a wheel whose move never confirmed
-                # knows no position. Leaving the last filter on screen would
-                # claim knowledge nobody has.
+                # A wheel whose move never confirmed has no position to keep showing.
                 if reset or not self.is_edited(name):
                     self._show_nothing(name)
                 continue
             if self._widget_shows(name, value):
-                # The camera has caught up with the edit — it *is* the reading
-                # now, so the field is no longer pending. Without this the star
-                # never went out after a successful Apply.
+                # The camera has caught up with the edit, so the field is no longer pending.
                 self._touched.discard(name)
             elif reset or not self.is_edited(name):
                 self._show_value(name, value)
         self._mark_edited()
 
     def is_edited(self, name):
-        """True if the operator has changed this field and not yet sent it."""
         return name in self._touched
 
     def edited_fields(self):
@@ -593,12 +502,7 @@ class ParamForm(QGroupBox):
         self.set_current(self._current, reset=True)
 
     def _widget_shows(self, name, value):
-        """True if the widget already holds ``value``, as it would hold it.
-
-        Compared against the *rendered* value, never the raw reading: a camera
-        reporting 2 and a spin box showing 2.000 are the same setting, and a
-        camera reporting a filter the wheel is between is no setting at all.
-        """
+        """Compared as rendered, not raw: 2 and a spin box's 2.000 are the same setting."""
         rendered = self._rendered(name, value)
         return rendered is not None and rendered == self._widget_value(name)
 
@@ -610,7 +514,7 @@ class ParamForm(QGroupBox):
             if index < 0:
                 index = widget.findText(str(value))
             if index < 0:
-                return None             # not one of the choices on offer
+                return None
             data = widget.itemData(index)
             return widget.itemText(index) if data is None else data
         if isinstance(widget, QCheckBox):
@@ -621,17 +525,14 @@ class ParamForm(QGroupBox):
                           else round(float(value), widget.decimals()))
             except (TypeError, ValueError):
                 return None
-            # setValue clamps and rounds; predicting it is what keeps a value
-            # outside the field's range from looking like an operator's edit.
+            # setValue clamps and rounds; predicting it keeps an out-of-range value from
+            # looking like an operator's edit.
             return max(widget.minimum(), min(widget.maximum(), number))
         return str(value).strip()
 
     def _show_nothing(self, name):
-        """Show that the camera reports no value here, where the widget can.
-
-        Only a combo box has a way to say it: no selection at all. A number
-        field has no blank state, so it keeps its last reading rather than
-        pretend to a zero the camera never mentioned.
+        """A combo box can show no selection; a number field keeps its last reading rather
+        than claim a zero the camera never reported.
         """
         _field, widget = self._widgets[name]
         if not isinstance(widget, QComboBox):
@@ -644,7 +545,6 @@ class ParamForm(QGroupBox):
         self._touched.discard(name)
 
     def _show_value(self, name, value):
-        """Put a value from the camera into its widget, without calling it an edit."""
         rendered = self._rendered(name, value)
         if rendered is None:
             return
@@ -666,7 +566,6 @@ class ParamForm(QGroupBox):
         self._touched.discard(name)
 
     def _widget_value(self, name):
-        """What the widget holds now, in the form it would be sent in."""
         _field, widget = self._widgets[name]
         if isinstance(widget, QComboBox):
             value = widget.currentData()
@@ -678,7 +577,6 @@ class ParamForm(QGroupBox):
         return widget.text().strip()
 
     def _mark_edited(self):
-        """Star the rows holding an unapplied edit, and say what the camera says."""
         for name, (field, widget) in self._widgets.items():
             label = self._labels.get(name)
             if label is None:
@@ -693,7 +591,7 @@ class ParamForm(QGroupBox):
                 label.setToolTip("")
 
     def values(self):
-        """Only what the operator changed — never a widget's own default."""
+        """Only what the operator changed, never a widget's own default."""
         out = {}
         for name in self._touched:
             _field, widget = self._widgets[name]
@@ -709,9 +607,6 @@ class ParamForm(QGroupBox):
             self.apply_requested.emit(values)
 
 
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
 class FocusWindow(QMainWindow):
     def __init__(self, settings):
         super().__init__()
@@ -722,9 +617,8 @@ class FocusWindow(QMainWindow):
         self._settings = settings
         self._tasks = TaskRunner(self)
         self._client = None
-        # host:port of a camera that will fetch on our behalf, or None when we
-        # talk to the camera directly. Set once, from --via, and used for every
-        # camera picked afterwards.
+        # host:port of a camera fetching on our behalf, or None. Set once, from --via,
+        # and used for every camera picked afterwards.
         self._via = None
         self._stream = None
         self._discovery = None
@@ -743,21 +637,17 @@ class FocusWindow(QMainWindow):
         self._metrics.setInterval(1000)
         self._metrics.timeout.connect(self._update_metrics)
 
-        # The camera changes its own settings between frames, so the form is
-        # re-read rather than filled in once at connect.
         self._params_poll = QTimer(self)
         self._params_poll.setInterval(PARAMS_POLL_MS)
         self._params_poll.timeout.connect(self._poll_params)
         self._params_inflight = False
 
-    # -- UI ------------------------------------------------------------
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 6)
 
-        # ---- connection bar
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Camera:"))
         self.cmb_cameras = QComboBox()
@@ -784,12 +674,9 @@ class FocusWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         root.addWidget(splitter, 1)
 
-        # ---- left: live view + sharpness
         left = QWidget()
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
-        # Whole frame on the left, the square's contents on the right, so the
-        # operator can aim and judge sharpness without switching between them.
         views = QSplitter(Qt.Horizontal)
         self.view = LiveView()
         self.view.region_changed.connect(self._on_region_changed)
@@ -837,10 +724,8 @@ class FocusWindow(QMainWindow):
         left_lay.addWidget(metrics)
         splitter.addWidget(left)
 
-        # ---- right: controls
-        # In a scroll area because the number of camera parameters is decided by
-        # the camera, not by us: an ASI with five fields on a short screen used
-        # to squash the form until the labels overlapped.
+        # In a scroll area: the camera decides how many parameters there are, and a short
+        # screen would squash the form until the labels overlap.
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QScrollArea.NoFrame)
@@ -857,8 +742,7 @@ class FocusWindow(QMainWindow):
         self.lbl_stream = QLabel("stream: idle")
         self.lbl_stream.setStyleSheet("color:#888; font-size:11px;")
         info_lay.addWidget(self.lbl_stream)
-        # Confirmation from the camera that it really did stand down, rather
-        # than an assumption that asking was enough.
+        # Confirmation from the camera that it really stood down, not an assumption.
         self.lbl_hold = QLabel("")
         self.lbl_hold.setWordWrap(True)
         self.lbl_hold.setStyleSheet("color:#c87000; font-size:11px;")
@@ -892,7 +776,6 @@ class FocusWindow(QMainWindow):
         view_grid.addWidget(self.cmb_size, 2, 1)
         right_lay.addWidget(view_box)
 
-        # ---- the measured square
         roi_box = QGroupBox("Measurement square")
         roi_grid = QGridLayout(roi_box)
         roi_grid.addWidget(QLabel("Side:"), 0, 0)
@@ -960,7 +843,6 @@ class FocusWindow(QMainWindow):
     def _status(self, message):
         self.statusBar().showMessage(message, 15000)
 
-    # -- camera selection ----------------------------------------------
     def discover(self):
         self.btn_discover.setEnabled(False)
         self._status("Searching the local network…")
@@ -997,7 +879,6 @@ class FocusWindow(QMainWindow):
         self.cmb_cameras.setCurrentIndex(0)
         self._on_start()
 
-    # -- streaming -----------------------------------------------------
     def _on_start(self):
         target = self.cmb_cameras.currentData()
         if not target:
@@ -1011,7 +892,6 @@ class FocusWindow(QMainWindow):
         self._tasks.run(self._client.info, self._on_info, self._on_error)
 
     def set_via(self, via):
-        """Route everything through ``via`` (``host:port``), or directly if None."""
         self._via = str(via) if via else None
         return self
 
@@ -1024,8 +904,6 @@ class FocusWindow(QMainWindow):
 
     def _on_info(self, info):
         self._info = info
-        # A camera with no schedule is up purely to be focused. Saying so here
-        # saves the operator wondering why nothing is being archived.
         setup = ('&nbsp;<span style="color:#c87000"><b>SETUP</b></span>'
                  if info.get("setup_mode") else "")
         self.lbl_camera.setText(
@@ -1048,13 +926,9 @@ class FocusWindow(QMainWindow):
         self._start_stream()
 
     def _agree_to_interrupt(self, info):
-        """Ask before taking a camera away from its measurements.
-
-        Focusing pauses the schedule for as long as this window is open, which
-        is what makes the tool usable — but on a camera that is measuring right
-        now it costs frames, and that is the operator's call, not ours. A camera
-        in setup mode or between its observing windows costs nothing, and asking
-        there would only teach the operator to click through the question.
+        """Focusing pauses the schedule, which costs frames on a measuring camera: the
+        operator's call. Setup mode or a gap between windows costs nothing, and asking there
+        would only teach clicking through the question.
         """
         if not info.get("hold_supported", True):
             self._status(
@@ -1074,8 +948,7 @@ class FocusWindow(QMainWindow):
             "Focusing pauses it until you stop the live view or close this "
             "window. The frames its schedule would have taken meanwhile are not "
             "made up afterwards.")
-        # Spelled out rather than Yes/No: "yes" to a question about interrupting
-        # is exactly the answer an operator misreads at three in the morning.
+        # Spelled out: "yes" to a question about interrupting is easy to misread at night.
         proceed = box.addButton("Pause and focus", QMessageBox.AcceptRole)
         box.addButton("Leave it measuring", QMessageBox.RejectRole)
         box.setDefaultButton(proceed)
@@ -1083,7 +956,7 @@ class FocusWindow(QMainWindow):
         return box.clickedButton() is proceed
 
     def _on_params(self, payload, reset=True):
-        """Show what the camera reports. ``reset`` overrides unapplied edits."""
+        """``reset`` overrides unapplied edits."""
         schema = payload.get("schema", [])
         current = payload.get("current", {})
         if self.params.matches_schema(schema):
@@ -1093,13 +966,7 @@ class FocusWindow(QMainWindow):
                               editable=payload.get("editable", False))
 
     def _poll_params(self):
-        """Re-read the camera's settings; it moves them without being asked.
-
-        Only fields the operator is not editing follow — see
-        :meth:`ParamForm.set_current`. A poll that fails is passed over in
-        silence: the stream label already says when the camera is unreachable,
-        and this runs every few seconds.
-        """
+        """Silent on failure: the stream label already says when the camera is unreachable."""
         if not self._client or self._params_inflight:
             return
         client = self._client
@@ -1119,9 +986,8 @@ class FocusWindow(QMainWindow):
         if not self._client:
             return
         self._reset_metrics()
-        # The hold goes out before the stream does. The stream renews the focus
-        # session on every frame it carries, so asking for the pause afterwards
-        # would race with a renewal that does not know about it.
+        # The hold goes first: the stream renews the focus session on every frame, so a
+        # later pause would race with a renewal that does not know about it.
         self._send_heartbeat(hold=True)
         max_side = self.cmb_size.currentData() or None
         self._stream = MjpegStream(self._client, max_side=max_side,
@@ -1153,10 +1019,8 @@ class FocusWindow(QMainWindow):
 
     def _on_stop(self):
         self._stop_stream()
-        # Tell the camera to leave focus mode now, rather than waiting out the
-        # deadline, so it goes back to schedule-only immediately. The repeat is
-        # not belt-and-braces: the server renews focus on every chunk it sends,
-        # so a stop that arrives before it notices our disconnect gets undone.
+        # Leave focus mode now rather than wait out the deadline. Repeated because the server
+        # renews focus on every chunk, undoing a stop that arrives before it sees the disconnect.
         self._request_focus_off()
         QTimer.singleShot(2500, self._request_focus_off)
         self.roi_preview.set_source(None, None)
@@ -1174,12 +1038,7 @@ class FocusWindow(QMainWindow):
         self._tasks.run(client.stop_focus, None, lambda msg: None)
 
     def _send_heartbeat(self, hold=True):
-        """Renew the focus session, restating the hold every time.
-
-        Restating it matters: if the camera process restarts under a running
-        live view, the next heartbeat puts the pause back rather than leaving
-        the tool streaming while the schedule quietly carries on.
-        """
+        """Restating the hold puts the pause back if the camera process restarted."""
         if not self._client:
             return
         client = self._client
@@ -1187,7 +1046,6 @@ class FocusWindow(QMainWindow):
                         self._on_focus_state, lambda msg: None)
 
     def _on_focus_state(self, state):
-        """Show whether the camera really did stand down for us."""
         if not isinstance(state, dict):
             return
         if state.get("hold") and not state.get("hold_supported", True):
@@ -1202,8 +1060,8 @@ class FocusWindow(QMainWindow):
         self._last_jpeg = jpeg
         self._frames += 1
         self.view.set_frame(QPixmap.fromImage(image))
-        # The stream resolution changes with the "Max size" setting; the square's
-        # centre is a fraction and rides it out, but the pixel boxes must follow.
+        # The stream resolution follows "Max size": the centre fraction rides it out,
+        # the pixel boxes must follow.
         shape = self.view.frame_shape()
         if shape != self._frame_shape:
             self._frame_shape = shape
@@ -1211,11 +1069,9 @@ class FocusWindow(QMainWindow):
         self._refresh_roi_preview()
         self.btn_save.setEnabled(True)
 
-    # -- the measured square -------------------------------------------
     def _on_region_changed(self, region):
-        # A different patch of sky, or a different amount of it, means a
-        # different sharpness scale — the old trace would be misleading, and so
-        # would the big "% of best" readout that was measured against it.
+        # A different patch of sky means a different sharpness scale: the old trace and
+        # the "% of best" readout would mislead.
         self._reset_metrics()
         box = self.view.roi_box()
         if box is None:
@@ -1226,12 +1082,10 @@ class FocusWindow(QMainWindow):
                          f"({x0 + side // 2}, {y0 + side // 2})")
 
     def _on_roi_changed(self, roi):
-        """The view moved or resized the square itself — mirror it in the boxes."""
         self._sync_roi_widgets()
         self._refresh_roi_preview()
 
     def _refresh_roi_preview(self):
-        """Repaint the side panel now, so it tracks the square while dragging."""
         box = self.view.roi_box()
         self.roi_preview.set_source(self.view.frame_pixmap(), box)
         if box is None:
@@ -1242,11 +1096,7 @@ class FocusWindow(QMainWindow):
                 f"Square — {side}×{side} px at ({x0 + side // 2}, {y0 + side // 2})")
 
     def _sync_roi_widgets(self):
-        """Show the square's size and centre in pixels of the current frame.
-
-        Signals are blocked so that reflecting the view's state does not look
-        like the operator typing, which would loop straight back into the view.
-        """
+        """Signals blocked: reflecting the view must not look like typing and loop back into it."""
         shape = self.view.frame_shape()
         fx, fy = self.view.roi_center
         limits = (None, None, None) if shape is None else (
@@ -1280,14 +1130,13 @@ class FocusWindow(QMainWindow):
         self._sync_roi_widgets()
         self._refresh_roi_preview()
 
-    # -- metrics -------------------------------------------------------
 
     def _reset_metrics(self):
         self.plot.reset()
         self.lbl_sharpness.setText("—")
 
     def _update_metrics(self):
-        """Score the newest frame. Done locally so the camera stays untouched."""
+        """Scored locally so the camera stays untouched."""
         if self._last_jpeg is None:
             return
         try:
@@ -1324,7 +1173,6 @@ class FocusWindow(QMainWindow):
             f"mean {stats.get('mean')}  ·  max {stats.get('max')}  ·  "
             f"saturated {saturated} %{warning}  ·  {self._frames} frames")
 
-    # -- parameters ----------------------------------------------------
     def _on_apply_params(self, params):
         if not self._client:
             return
@@ -1366,7 +1214,6 @@ class FocusWindow(QMainWindow):
         self._tasks.run(lambda: client.param_result(req_id), _done,
                         lambda msg: None)
 
-    # -- misc ----------------------------------------------------------
     def _on_save(self):
         if not self._last_jpeg:
             return
@@ -1391,9 +1238,8 @@ class FocusWindow(QMainWindow):
     def closeEvent(self, event):
         self._stop_stream()
         if self._client:
-            # Synchronous here: the window is going away, so there is no event
-            # loop left to run a retry on. If it fails, the camera's focus TTL
-            # still switches free-running off within a minute.
+            # Synchronous: no event loop is left to retry on. If it fails, the camera's focus
+            # TTL still ends free-running within a minute.
             try:
                 self._client.stop_focus()
             except CameraHttpError:

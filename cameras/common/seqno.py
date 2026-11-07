@@ -1,16 +1,7 @@
-"""The archive-wide frame counter behind the legacy ``SEQNO`` header.
+"""The archive-wide counter behind the ``SEQNO`` header, dark frames included.
 
-imagerd_rt kept one integer in ``aux/seqno.txt`` and bumped it before every
-frame, dark ones included (``file_io.c:624-660``, called from
-``lib_capture.c:136``). The processing program uses that number, so the counter
-has to survive restarts — it lives beside the archive rather than in memory.
-
-A station moving over from the old program can simply copy its ``seqno.txt``
-here and the numbering carries on.
-
-Used by the ASI imager and by the Hamamatsu (``japan``) imager in ``sun_cycle``
-mode, the two archives written in imagerd_rt's layout. ``cameras/asi/seqno.py``
-is a re-export of this module.
+The processing program uses the number, so it lives beside the archive to survive
+restarts. A station moving from imagerd_rt can copy its ``seqno.txt`` here.
 """
 from __future__ import annotations
 
@@ -36,7 +27,6 @@ def _read(path: Path) -> int:
 
 
 def next_seqno(output_dir) -> int:
-    """Increment the counter in ``<output_dir>/seqno.txt`` and return the new value."""
     path = Path(output_dir) / FILENAME
     value = _read(path) + 1
     tmp = path.with_suffix(".tmp")

@@ -1,14 +1,7 @@
 """Princeton Instruments PIXIS camera, driven through the PICAM SDK.
 
-The public surface mirrors the Hamamatsu class of the reference program
-(``sample/japan-camera/camera.py``) so that ``runner.py`` and ``fits_writer.py``
-are camera-agnostic: context manager, ``current_exposure`` / ``current_binning``
-/ ``current_readout_speed``, ``set_exposure``, ``set_binning``, ``temperature``,
-``capture``, ``info``, ``print_info``.
-
-The configuration order follows the legacy C implementation that has been
-running this instrument for years — ``imagerd_rt/src/imagerd_rt/src/pixis.c``,
-functions ``Configure_Static()`` and ``Configure_Dynamic()``.
+The configuration order follows imagerd_rt's ``pixis.c`` (``Configure_Static``,
+``Configure_Dynamic``), which has been running this instrument for years.
 """
 from __future__ import annotations
 
@@ -44,7 +37,6 @@ class PixisCamera:
         self.current_readout_speed: float = cfg.readout_speed
         self.current_gain: int = cfg.gain
 
-    # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> PixisCamera:
         picam.initialize_library()
         try:
@@ -81,8 +73,8 @@ class PixisCamera:
             self._handle = picam.open_camera(self._demo_id)
             console_ui.log(f"PICAM demo camera connected: {self._cfg.demo_model}")
         else:
-            # Unlike the legacy code, a missing camera is an error rather than a
-            # silent fall-back to a demo camera: set demo = true to ask for one.
+            # A missing camera is an error, never a silent demo camera: set demo =
+            # true to ask for one.
             self._handle = picam.open_first_camera()
         self._id = picam.get_camera_id(self._handle)
         self._sensor = picam.sensor_size(self._handle)
@@ -103,7 +95,6 @@ class PixisCamera:
                 self._demo_id = None
         picam.uninitialize_library()
 
-    # --- configuration ------------------------------------------------------
     def _commit(self) -> None:
         failed = picam.commit(self._handle)
         if failed:
@@ -113,18 +104,14 @@ class PixisCamera:
             raise RuntimeError(f"PICAM rejected these parameters: {names}")
 
     def _set_checked(self, parameter, value, label: str, *, clamp: bool = True):
-        """Write one parameter after asking the camera what it accepts.
+        """Write one parameter after asking the camera what it accepts; returns the value
+        written.
 
-        Every model has its own limits — a setpoint one PIXIS cools to is out of
-        range on the next — and PICAM answers a bad value with a bare "Invalid
-        Parameter Value" naming neither the parameter nor what would have
-        worked. So the constraint is read first. A measured quantity outside it
-        (setpoint, ADC speed) is nudged to the nearest value the camera allows,
-        with a warning: losing the night over one number in config.json is worse
-        than cooling three degrees less deeply. A mode is not nudged — the
-        numerically nearest shutter mode is a *different* mode, and quietly
-        swapping one for another would spoil the data far more thoroughly than
-        stopping does. Returns the value actually written.
+        PICAM answers a bad value with a bare "Invalid Parameter Value", so the
+        constraint is read first. A measured quantity is nudged to the nearest allowed
+        value with a warning: losing the night over one number is worse than cooling
+        less deeply. A mode is never nudged: the numerically nearest shutter mode is a
+        different mode, which would spoil the data.
         """
         limits = picam.constraint(self._handle, parameter)
         kind = picam.value_type(parameter)
@@ -154,7 +141,6 @@ class PixisCamera:
 
     @staticmethod
     def _rejected(parameter, label: str, value, limits, exc=None) -> str:
-        """Why a value did not go in, in terms of what to put in config.json."""
         name = picam.enum_string(picam.PicamEnumeratedType.Parameter, int(parameter))
         text = (f"{label}: this camera does not accept {float(value):g} — allowed: "
                 f"{picam.describe_constraint(limits)} ({name})")
@@ -182,7 +168,7 @@ class PixisCamera:
         self._set_full_frame_roi(cfg.binning)
         self._commit()
 
-        # Kept: the legacy ``BitDepth`` header records it on every frame.
+        # The legacy ``BitDepth`` header records it on every frame.
         self._bit_depth = bit_depth = picam.get_int(self._handle, P.PixelBitDepth)
         if bit_depth > 16:
             raise RuntimeError(
@@ -191,7 +177,6 @@ class PixisCamera:
             )
 
     def _set_full_frame_roi(self, binning: int) -> None:
-        """Full-sensor ROI with symmetric binning."""
         width, height = self._sensor
         rois = picam.get_rois(self._handle)
         try:
@@ -209,10 +194,8 @@ class PixisCamera:
         self.current_binning = binning
 
     def _frame_shape(self) -> tuple[int, int]:
-        """(height, width) of the readout as PICAM currently has it configured.
-
-        Read back rather than derived from sensor/binning: PICAM may clamp a
-        requested ROI or binning to what the hardware actually supports.
+        """Read back, not derived from sensor/binning: PICAM may clamp a requested ROI or
+        binning.
         """
         rois = picam.get_rois(self._handle)
         try:
@@ -222,9 +205,7 @@ class PixisCamera:
             picam.destroy_rois(rois)
 
     def set_exposure(self, sec: float) -> None:
-        # PICAM takes the exposure in milliseconds; the schedule speaks seconds.
-        # Never clamped: a silently shortened exposure would quietly corrupt the
-        # measurement, so an unsupported one has to be an error.
+        # Never clamped: a silently shortened exposure would corrupt the measurement.
         self._set_checked(
             P.ExposureTime, sec * 1000.0, "Exposure (ms)", clamp=False)
         self._commit()
@@ -238,7 +219,6 @@ class PixisCamera:
         self.current_gain = self._set_checked(P.AdcAnalogGain, gain, "Analog gain")
         self._commit()
 
-    # --- cooling ------------------------------------------------------------
     @property
     def target_temperature(self) -> float | None:
         if not (self._cooling and self._cooling.enabled):
@@ -246,11 +226,9 @@ class PixisCamera:
         return self._cooling.target_temp
 
     def temperature_limits(self) -> picam.FloatRange | list[float] | None:
-        """Setpoints this camera accepts, as read from it (None if unknown)."""
         return self._setpoint_limits
 
     def set_target_temperature(self, celsius: float) -> float:
-        """Move the cooling setpoint; returns the value the camera took."""
         effective = self._set_checked(
             P.SensorTemperatureSetPoint, celsius, "Sensor setpoint (°C)")
         self._commit()
@@ -259,7 +237,6 @@ class PixisCamera:
         return effective
 
     def temperature_locked(self) -> bool:
-        """True when the sensor reports its temperature is locked to the setpoint."""
         try:
             status = picam.get_int(self._handle, P.SensorTemperatureStatus)
         except picam.PicamError:
@@ -267,7 +244,6 @@ class PixisCamera:
         return status == int(picam.PicamSensorTemperatureStatus.Locked)
 
     def _wait_temperature(self, target: float, timeout: float, label: str) -> bool:
-        """Poll until the sensor locks on ``target`` (or lands within tolerance)."""
         tolerance = self._cooling.tolerance if self._cooling else 3.0
         deadline = monotonic() + timeout
         last_report = 0.0
@@ -291,7 +267,6 @@ class PixisCamera:
         return self._wait_temperature(self._cooling.target_temp, timeout, "Cooling")
 
     def warm_up(self) -> bool:
-        """Raise the setpoint to a safe value and wait before powering down."""
         if not (self._cooling and self._cooling.enabled):
             return True
         console_ui.log(f"Warming sensor to {self._cooling.warm_temp:.1f} C before shutdown...")
@@ -300,7 +275,6 @@ class PixisCamera:
             warm_temp, self._cooling.warm_timeout, "Warm-up"
         )
 
-    # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
         try:
             return picam.read_float(self._handle, P.SensorTemperatureReading)
@@ -337,14 +311,11 @@ class PixisCamera:
         # The PICAM buffer is reused by the next acquisition — copy it out now.
         buf = (ctypes.c_ubyte * expected).from_address(address)
         frame = np.frombuffer(bytes(buf), dtype="<u2").reshape(h, w).copy()
-        # A 16-bit readout is what this instrument reports and the shift is a
-        # no-op for it; a shallower one would otherwise reach the autoexposure
-        # loop on a scale where it can never see saturation.
+        # A no-op at 16 bits; a shallower readout would otherwise reach the
+        # autoexposure loop on a scale where it can never see saturation.
         return intensity.to_full_scale(frame, self._bit_depth)
 
-    # --- identification -----------------------------------------------------
     def info(self) -> dict:
-        """Same dictionary keys as the reference program, filled from PICAM."""
         cid = self._id
         model = picam.enum_string(picam.PicamEnumeratedType.Model, cid.model)
         bus = picam.enum_string(
@@ -368,7 +339,6 @@ class PixisCamera:
         }
 
     def info_rows(self) -> list:
-        """``(label, value)`` rows describing the camera, for the console block."""
         info = self.info()
         width, height = self._sensor
         rows = [

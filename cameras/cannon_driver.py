@@ -1,7 +1,3 @@
-"""
-Canon camera driver: connection, configuration, capture, workers.
-Uses gphoto2-cffi for camera control.
-"""
 import os
 import io
 import re
@@ -30,9 +26,6 @@ from worker_common import (
     install_stop_handler, stop_signal_name,
 )
 
-# ---------------------------------------------------------------------------
-# gphoto2-cffi import with monkey-patching
-# ---------------------------------------------------------------------------
 import gphoto2cffi as gp
 import gphoto2cffi.backend as _gp_backend
 import gphoto2cffi.util as _gp_util
@@ -48,7 +41,6 @@ _gp_util.get_string = _patched_get_string
 _gp_main.get_string = _patched_get_string
 
 
-# Suppress UnicodeDecodeError spam from gphoto2cffi
 class _GphotoLogFilter:
     def __init__(self, stream):
         self._stream = stream
@@ -73,25 +65,17 @@ class _GphotoLogFilter:
 def install_gphoto_log_filter():
     """Filter gphoto2cffi's UnicodeDecodeError spam out of stderr.
 
-    Called when a Canon camera is actually opened, not at import time: this
-    replaces the process-wide stderr, and merely importing the module (the GUI
-    does so lazily, as does the root-level compatibility shim) must not
-    silently reroute everyone else's error output.
+    Called on camera open, not at import: this replaces the process-wide stderr,
+    and merely importing the module must not reroute other code's error output.
     """
     if isinstance(sys.stderr, _GphotoLogFilter):
         return
     sys.stderr = _GphotoLogFilter(sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 SKIP_SECTIONS = {"status", "actions", ""}
 
 
-# ---------------------------------------------------------------------------
-# Camera USB release
-# ---------------------------------------------------------------------------
 def release_camera_usb():
     """Release camera from file manager (gvfs) so gphoto2 can claim it."""
     released = False
@@ -128,9 +112,6 @@ def release_camera_usb():
         sleep(2)
 
 
-# ---------------------------------------------------------------------------
-# Camera model detection
-# ---------------------------------------------------------------------------
 def get_model_from_autodetect():
     try:
         result = subprocess.run(['gphoto2', '--auto-detect'],
@@ -158,16 +139,9 @@ def detect_model(config):
     return model_name
 
 
-# ---------------------------------------------------------------------------
-# Camera config helpers
-# ---------------------------------------------------------------------------
 def camcfg_path(model_name, camcfg_file=None):
-    """Path of the camera settings .ini.
-
-    ``cannon.camcfg_file`` from config.json wins when it is set; a relative
-    path there is resolved next to the app, like the per-model default it
-    replaces. Without it the name is derived from the model, so two cameras
-    sharing one checkout keep their own settings.
+    """A relative camcfg_file resolves next to the app. Without one the name comes
+    from the model, so two cameras sharing one checkout keep their own settings.
     """
     if camcfg_file:
         path = os.path.expanduser(camcfg_file)
@@ -209,7 +183,6 @@ def generate_camcfg(config, model_name, camcfg_file=None):
 
 
 def apply_camcfg(config, model_name, camcfg_file=None):
-    """Apply camera config from .ini file. Generate if missing."""
     cfg_path = camcfg_path(model_name, camcfg_file)
     if not os.path.exists(cfg_path):
         console_ui.log(f"Generating {os.path.basename(cfg_path)}...")
@@ -227,11 +200,8 @@ def apply_camcfg(config, model_name, camcfg_file=None):
 
 
 def find_widget(config, key):
-    """The camera setting named `key`, whichever section holds it.
-
-    gphoto2 groups settings differently on every model — `shutterspeed` sits
-    under `capturesettings` on a 6D and under `settings` on a 300D — so callers
-    ask by name and let this find the section.
+    """gphoto2 groups settings differently per model: shutterspeed sits under
+    capturesettings on a 6D and under settings on a 300D.
     """
     for section in config:
         if section in SKIP_SECTIONS:
@@ -242,12 +212,11 @@ def find_widget(config, key):
 
 
 def apply_shutterspeed(config, shutterspeed):
-    """Set the exposure time from config.json, over whatever camcfg_*.ini left.
+    """Set the exposure from config.json over whatever camcfg_*.ini left.
 
-    Unlike :func:`apply_camcfg`, a value that does not fit is reported instead
-    of swallowed: the .ini is generated and gitignored, so a typo there used to
-    mean the camera silently kept shooting at its old exposure. An empty value
-    means "leave the exposure alone". Returns whether it was applied.
+    Unlike apply_camcfg, a bad value is reported: otherwise the camera silently keeps
+    its old exposure. An empty value leaves the exposure alone. Returns whether it
+    was applied.
     """
     value = str(shutterspeed or "").strip()
     if not value:
@@ -277,9 +246,8 @@ def apply_shutterspeed(config, shutterspeed):
 
     console_ui.log(f"Exposure from config.json: shutterspeed = {value}")
 
-    # In P/Av/Tv the camera picks the exposure itself and quietly ignores the
-    # value just written — the usual reason "I set the exposure and nothing
-    # changed". Only warned about: the shooting mode stays the operator's call.
+    # In P/Av/Tv the camera picks the exposure itself and ignores the value just
+    # written. Only warned about: the shooting mode stays the operator's call.
     for key in ("autoexposuremode", "shootingmode"):
         mode_widget = find_widget(config, key)
         if mode_widget is None:
@@ -318,7 +286,6 @@ def get_adjustable_params(config):
 
 
 def get_camera_settings_info(config):
-    """Extract current camera settings for monitoring payload."""
     info = {}
     for key in ("iso", "shutterspeed", "aperture", "imageformat",
                 "whitebalance", "autoexposuremode"):
@@ -332,11 +299,8 @@ def get_camera_settings_info(config):
     return info
 
 
-# ---------------------------------------------------------------------------
-# Capture
-# ---------------------------------------------------------------------------
 def capture_image(cam):
-    """Capture image bytes, with fallback for cameras without capturetarget."""
+    """The fallback serves cameras without capturetarget."""
     from gphoto2cffi.backend import lib as _gp_lib, ffi as _gp_ffi
     try:
         return cam.capture()
@@ -360,9 +324,6 @@ def capture_image(cam):
         return img_data
 
 
-# ---------------------------------------------------------------------------
-# Console worker
-# ---------------------------------------------------------------------------
 class CannonWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
@@ -387,8 +348,8 @@ class CannonWorkerConsole(threading.Thread):
         self._last_shot = None
         self._last_frame_data = None
         self._active_until = None
-        # Whether the last loop pass ran under a focus hold, so entering and
-        # leaving it is logged once instead of twice a second.
+        # Whether the last pass ran under a focus hold: entering and leaving it are
+        # logged once, not twice a second.
         self._held = False
 
     def request_stop(self):
@@ -407,9 +368,6 @@ class CannonWorkerConsole(threading.Thread):
                 failures.append((key, str(e)))
         return failures
 
-    # ------------------------------------------------------------------
-    # Live view for the LAN focus tool
-    # ------------------------------------------------------------------
     def _push_live_frame(self, jpeg_bytes, ts):
         if self._service is not None:
             try:
@@ -418,23 +376,18 @@ class CannonWorkerConsole(threading.Thread):
                 pass
 
     def _grab_focus_frame(self):
-        """One live-view frame for focus_app. Falls back to a full capture."""
         try:
             return self.cam.get_preview()
         except Exception:
             return capture_image(self.cam)
 
     def _focus_holding(self):
-        """True while a focus session has asked the schedule to stand down."""
         return self._service is not None and self._service.focus_hold()
 
     def _handle_focus(self, now):
-        """Serve the focus tool between scheduled shots.
+        """Scheduled capture beats an ordinary focus session, so capture seconds are skipped.
 
-        Scheduled captures win while the session is an ordinary one: this is
-        skipped on the capture seconds themselves. A *held* session is the
-        operator having agreed to interrupt the measurements, and then there is
-        no capture second left to keep clear.
+        A held session means the operator agreed to interrupt the measurements.
         """
         if self._service is None or not self._service.focus_active():
             return
@@ -471,11 +424,8 @@ class CannonWorkerConsole(threading.Thread):
             self._save_status("running", force=True)
 
         while not self._stop_event.is_set():
-            # Handle on-demand capture requests (outside schedule)
-
             now = dt.now()
 
-            # Find active schedule interval
             active_end = None
             for entry in self.schedule:
                 if entry.start <= now <= entry.end:
@@ -504,7 +454,6 @@ class CannonWorkerConsole(threading.Thread):
 
             self._active_until = active_end
 
-            # Fire at configured seconds, but only once per (minute, second)
             fire_key = (now.minute, now.second)
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
@@ -552,9 +501,7 @@ class CannonWorkerConsole(threading.Thread):
             cam_info = get_camera_settings_info(self.config)
         except Exception:
             pass
-        # The same values focus_app edits; publishing them here keeps it from
-        # showing settings the camera left behind hours ago — see
-        # worker_common.publish_current_params.
+        # Keeps focus_app from showing settings the camera left behind hours ago.
         publish_current_params(self._service, lambda: cam_info)
 
         payload = {
@@ -587,11 +534,7 @@ class CannonWorkerConsole(threading.Thread):
         self._bus.publish_status(payload, force=force)
 
 
-# ---------------------------------------------------------------------------
-# Console entry point
-# ---------------------------------------------------------------------------
 def run_preview_cannon(cam, instance_name):
-    """Continuously grab frames and overwrite preview_{instance_name}.png at max FPS."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.png")
     tmp_path = preview_path + ".tmp"
     console_ui.log(f"Preview mode: writing {preview_path} (Ctrl+C to stop)")
@@ -627,16 +570,14 @@ def run_preview_cannon(cam, instance_name):
 
 def run_console_cannon(config_path=None, preview=False, verbose=False,
                        setup_mode=False):
-    """Run Canon camera measurement in console mode."""
     from utils import load_config, get_node_name
 
     cfg = load_config(config_path)
     cannon_cfg = cfg.get("cannon", {})
 
     node_name = get_node_name(cfg)
-    # Reserved for the lifetime of the process, so a second copy started from
-    # this same config.json gets "Cannon_node-2" instead of silently sharing
-    # The log file and preview_{instance}.png go with the first.
+    # Held for the process lifetime: a second copy from this config.json gets
+    # "Cannon_node-2" instead of silently sharing the log and preview_{instance}.png.
     claim = claim_instance_name(cannon_cfg.get("instance_name")
                                 or get_instance_name("Cannon", cfg))
     instance_name = claim.name
@@ -646,10 +587,8 @@ def run_console_cannon(config_path=None, preview=False, verbose=False,
     capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
 
     dash = console_ui.start_dashboard("cannon", instance_name, verbose=verbose)
-    # Alert mail, started before the camera is opened so that a camera which
-    # will not open — and a filter controller that answers nothing — is already
-    # something somebody hears about. The crash handler goes first: it is the
-    # only thing that can speak for a process killed outright.
+    # Before the camera is opened, so a camera that will not open still raises an alert.
+    # The crash handler goes first: it alone can speak for a process killed outright.
     alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
     alerts.install_crash_handler(alert_status_path)
     alerts.start(cfg.get("alerts", {}), node_name, instance_name, "cannon",
@@ -671,8 +610,6 @@ def run_console_cannon(config_path=None, preview=False, verbose=False,
 def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
                         instance_name, node_name, output_dir, status_dir,
                         schedule_file, capture_seconds, setup_mode=False):
-    """Body of :func:`run_console_cannon`, with the dashboard already running."""
-
     if preview:
         console_ui.log("Releasing camera USB...")
         release_camera_usb()
@@ -691,18 +628,16 @@ def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
         console_ui.log("Done.")
         return
 
-    # Only a missing output_dir is worth an interactive prompt: a node without a
-    # schedule is a legitimate state (setup mode below), and a headless box must
-    # not stall on input() because of it.
+    # Only a missing output_dir is worth a prompt: a node without a schedule is a
+    # valid state (setup mode), and a headless box must not stall on input().
     if not output_dir:
         console_ui.log("Configuration incomplete. Starting setup wizard...")
         from utils import configure_console_cannon
         with dash.suspended():          # the wizard needs a plain terminal
             configure_console_cannon(cfg, config_path)
         cannon_cfg = cfg.get("cannon", {})
-        # instance_name is deliberately not re-read: it is already reserved, and
-        # the dashboard and log file are open under it. A name typed into the
-        # wizard takes effect on the next run.
+        # instance_name is not re-read: it is reserved, and the dashboard and log file are
+        # open under it. A name typed into the wizard takes effect on the next run.
         output_dir = cannon_cfg.get("output_dir", "")
         schedule_file = cannon_cfg.get("schedule_file", "")
         capture_seconds = cannon_cfg.get("capture_seconds", [0, 30])
@@ -727,7 +662,6 @@ def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
 
-    # Connect camera
     console_ui.log("Releasing camera USB...")
     release_camera_usb()
     install_gphoto_log_filter()
@@ -742,14 +676,13 @@ def _run_console_cannon(cfg, cannon_cfg, config_path, preview, dash,
     console_ui.log(f"Connected: {model_name}")
     dash.set_section("device", [("Model:", model_name)])
 
-    # Apply camera config — the .ini first, then the exposure from config.json
-    # on top of it, so the one setting the operator keeps in version control
-    # wins over the generated file.
+    # The .ini first, then config.json's exposure: the setting the operator keeps in
+    # version control wins over the generated file.
     apply_camcfg(config, model_name, cannon_cfg.get("camcfg_file", ""))
     apply_shutterspeed(config, cannon_cfg.get("shutterspeed", ""))
 
 
-    # LAN frame server (archive browsing + live view). Never fatal.
+    # A frame server failure is never fatal.
     from camera_service import CameraService
     from frame_server import start_frame_server
     service = CameraService("cannon", instance_name, output_dir,

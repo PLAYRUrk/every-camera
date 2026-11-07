@@ -1,12 +1,10 @@
-"""
-Reader for the vendor's Cypress ``.spt`` scripts (C2-429.spt, CSDU285.SPT).
+"""Reader for the vendor's Cypress ``.spt`` scripts (C2-429.spt, CSDU285.SPT).
 
-The Windows driver brings a camera up by replaying one of these against the
-bare FX2: each record is one vendor request. Reading the firmware out of the
-script, rather than out of a USB capture, is what lets every model the vendor
-ships a script for be loaded the same way.
+The Windows driver brings a camera up by replaying one against the bare FX2, each
+record one vendor request. Reading the firmware from the script lets every model the
+vendor ships a script for load the same way.
 
-Record layout (little-endian), as found in both scripts::
+Record layout (little-endian)::
 
     0   "CSPT"
     4   u32  record length, header included
@@ -17,8 +15,8 @@ Record layout (little-endian), as found in both scripts::
     20  u16  wIndex
     hdr ...  payload
 
-Checked against the blobs in ``firmware/``: extracting C2-429.spt gives
-``fx2_firmware.bin`` and ``fpga_bitstream.bin`` byte for byte.
+Extracting C2-429.spt gives ``fx2_firmware.bin`` and ``fpga_bitstream.bin`` byte for
+byte.
 """
 import struct
 from collections import namedtuple
@@ -35,7 +33,6 @@ Record = namedtuple("Record", "kind request value index data")
 
 
 def parse_spt(data):
-    """Every record of a script, in order."""
     records = []
     pos = 0
     while pos < len(data):
@@ -53,10 +50,8 @@ def parse_spt(data):
 
 
 def extract_firmware(data):
-    """The FX2 image and FPGA bitstream a script loads.
-
-    Returns ``(fx2_blocks, fpga)``: ``fx2_blocks`` is a list of
-    ``(address, bytes)`` in load order, ``fpga`` the bitstream as one block.
+    """Returns ``(fx2_blocks, fpga)``: ``(address, bytes)`` in load order, the bitstream
+    whole.
     """
     fx2_blocks = []
     fpga = []

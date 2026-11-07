@@ -1,17 +1,5 @@
-"""
-Shared frame archive helpers: listing, reading and encoding captured frames.
-
-This module is deliberately free of camera-driver imports (no gphoto2, pyusb or
-ctypes), so it can be installed on an observer machine together with
-``viewer_app.py`` / ``focus_app.py`` without any camera SDK.
-
-Provides:
-  - list_frames()        — enumerate captured files in an output directory
-  - resolve_frame_path() — path-traversal-safe lookup of one archived frame
-  - read_frame_file()    — decode FITS / TIFF / PNG / JPEG into a numpy array
-  - to_jpeg_bytes()      — 8/16/32-bit frame -> JPEG (replaces four copies of
-                           this code that used to live in the camera drivers)
-  - sharpness()          — focus metric used by focus_app.py
+"""Free of camera-driver imports (gphoto2, pyusb, ctypes), so an observer machine can
+run ``viewer_app.py`` and ``focus_app.py`` without any camera SDK.
 """
 import io
 import os
@@ -21,9 +9,6 @@ import numpy as np
 
 import intensity
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 FITS_EXTENSIONS = (".fits", ".fit", ".fts")
 IMAGE_EXTENSIONS = (".tiff", ".tif", ".png", ".jpg", ".jpeg")
 FRAME_EXTENSIONS = FITS_EXTENSIONS + IMAGE_EXTENSIONS
@@ -35,24 +20,16 @@ MIME_TYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 }
 
-# Every driver scales its captures onto one range on the way in, so a frame
-# reaching this module is on it unless it came from an archive written before
-# that was true — see ``read_frame_with_scale``.
+# Drivers scale captures onto this range; only frames from older archives are not
+# on it, see ``read_frame_with_scale``.
 FULL_SCALE = intensity.FULL_SCALE
 
 DEFAULT_JPEG_QUALITY = 85
 
 
-# ---------------------------------------------------------------------------
-# Listing
-# ---------------------------------------------------------------------------
 def _matches_day(name, mtime, day_prefix):
-    """True if a capture belongs to ``day_prefix`` (``YYYYMMDD``).
-
-    Captures are named ``%Y%m%dT%H%M%S``; for those the filename is the
-    authority. Only files that do not follow the convention fall back to their
-    modification time — otherwise a frame captured yesterday but copied today
-    would show up under both days.
+    """The filename stamp is the authority; mtime is only for names that lack one, or a
+    frame captured yesterday but copied today would show under both days.
     """
     if len(name) >= 8 and name[:8].isdigit():
         return name.startswith(day_prefix)
@@ -61,14 +38,8 @@ def _matches_day(name, mtime, day_prefix):
 
 
 def _scan_frame_files(output_dir):
-    """Yield ``{name, size, mtime, ext}`` for every captured file, at any depth.
-
-    Most cameras write straight into ``output_dir``; the ASI driver files each
-    frame under a ``YYYY/MM/DD`` tree beneath it instead (see
-    ``cameras/asi/paths.py``). Walking recursively covers both layouts, and
-    costs nothing extra for a flat one — ``os.walk`` on a directory with no
-    subdirectories visits it once, same as ``os.scandir`` did. Unreadable
-    subdirectories are skipped rather than failing the whole scan.
+    """Recursive: the ASI driver files frames under a ``YYYY/MM/DD`` tree, the others
+    write flat.
     """
     for dirpath, _dirnames, filenames in os.walk(output_dir):
         for fname in filenames:
@@ -84,20 +55,8 @@ def _scan_frame_files(output_dir):
 
 
 def list_frames(output_dir, date=None, limit=500, offset=0, newest_first=True):
-    """List captured frames in ``output_dir``, however deep the camera files them.
-
-    Args:
-        output_dir: directory holding the captured files.
-        date: optional ``YYYY-MM-DD`` filter. Matched against the filename
-            prefix first (files are named ``%Y%m%dT%H%M%S``), then mtime.
-        limit / offset: pagination over the sorted result.
-        newest_first: sort by modification time, newest first.
-
-    Returns:
-        dict with ``total``, ``offset``, ``limit`` and ``frames`` (list of
-        ``{name, size, mtime, ext}``). Never raises — an unreadable directory
-        yields an empty listing, so a broken archive can never take down a
-        caller such as the HTTP frame server.
+    """``date`` is ``YYYY-MM-DD``. Never raises: a broken archive must not take down a
+    caller such as the HTTP frame server.
     """
     result = {"total": 0, "offset": offset, "limit": limit, "frames": []}
     if not output_dir or not os.path.isdir(output_dir):
@@ -123,7 +82,6 @@ def list_frames(output_dir, date=None, limit=500, offset=0, newest_first=True):
 
 
 def list_dates(output_dir, max_days=400):
-    """Return the sorted list of ``YYYY-MM-DD`` days present in the archive."""
     import time as _time
     days = set()
     if not output_dir or not os.path.isdir(output_dir):
@@ -142,13 +100,8 @@ def list_dates(output_dir, max_days=400):
 
 
 def _dated_subpath(output_dir, name):
-    """The ``YYYY/MM/DD/name`` path a dated name would sit at, if it looks dated.
-
-    Mirrors ``cameras.asi.paths.day_dir``, without importing it: every frame
-    name here starts with its capture date (the convention every driver
-    uses), which is enough to find the file without listing directories —
-    this is the fallback ``resolve_frame_path`` needs because the ASI archive
-    is a date tree, not a flat directory.
+    """Mirrors ``cameras.asi.paths.day_dir`` without importing it: frame names start
+    with their capture date, so the file is found without listing directories.
     """
     if len(name) < 8 or not name[:8].isdigit():
         return None
@@ -157,19 +110,13 @@ def _dated_subpath(output_dir, name):
 
 
 def resolve_frame_path(output_dir, name):
-    """Resolve ``name`` inside ``output_dir``, refusing any path traversal.
+    """Refuses any path traversal. Returns None if ``name`` is not a frame file inside.
 
-    ``name`` is always a bare file name, never a path — the client never sends
-    the ASI archive's ``YYYY/MM/DD`` layout, only the name a listing gave it —
-    so a dated name that is not directly in ``output_dir`` is looked for at the
-    date subpath its own timestamp implies.
-
-    Returns the absolute path, or None if the name escapes the directory,
-    does not exist or is not a frame file.
+    Clients only send the bare name a listing gave them, so a dated name that is not
+    directly in ``output_dir`` is looked for at the date subpath it implies.
     """
     if not output_dir or not name:
         return None
-    # Reject anything that looks like a path rather than a plain file name.
     if os.path.basename(name) != name:
         return None
     base = os.path.realpath(output_dir)
@@ -198,15 +145,7 @@ def mime_for(path):
                           "application/octet-stream")
 
 
-# ---------------------------------------------------------------------------
-# Reading
-# ---------------------------------------------------------------------------
 def read_frame_file(path):
-    """Decode a captured file into a numpy array.
-
-    Supports FITS (astropy, with a dependency-free fallback), TIFF, PNG and
-    JPEG. Raises on unreadable / unsupported files.
-    """
     ext = os.path.splitext(path)[1].lower()
     if ext in FITS_EXTENSIONS:
         return read_fits(path)
@@ -218,22 +157,18 @@ def read_frame_file(path):
 
 
 def read_frame_with_scale(path):
-    """Decode a captured file and say what intensity scale it is on.
+    """Returns ``(array, full_scale)``.
 
-    Returns ``(array, full_scale)``. Frames this program writes now record their
-    scale in the header (``ADCFULL``); older archives were written straight off
-    a 12-bit sensor and say nothing, so they are recognised by that absence and
-    lifted to the current range. Without this an archive captured last year
-    would look sixteen times darker than one captured today.
+    Frames without ``ADCFULL`` came straight off a 12-bit sensor and are lifted to the
+    current range, or an old archive would look sixteen times darker.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext in FITS_EXTENSIONS:
         arr = read_fits(path)
         recorded = intensity.full_scale_from_header(read_fits_header(path))
     else:
-        # TIFF and PNG carry no scale of their own, so the guess is all there
-        # is: Canon's JPEGs are 8-bit, an infra TIFF written before the change
-        # is 12-bit, one written after fills the full range.
+        # Only FITS records a scale, so it is guessed: Canon JPEGs are 8-bit, old infra
+        # TIFFs 12-bit, current ones fill the full range.
         arr = read_frame_file(path)
         recorded = intensity.legacy_full_scale(arr)
     if recorded is None:
@@ -244,13 +179,8 @@ def read_frame_with_scale(path):
 
 
 def read_fits(path):
-    """Read the primary HDU of a FITS file as a numpy array.
-
-    A colour FITS (the SPTT CSDU-285C with ``sptt.debayer``) is an R, G, B
-    cube, which numpy sees plane-first as (3, H, W). Everything that displays
-    or measures a frame here takes colour as (H, W, 3) — the way Canon's and
-    the infra camera's images already arrive — so the planes are moved last.
-    Handing the cube on as it was made the archive refuse it outright.
+    """A colour cube (SPTT CSDU-285C with ``sptt.debayer``) arrives as (3, H, W); planes
+    are moved last because everything here takes colour as (H, W, 3).
     """
     try:
         from astropy.io import fits
@@ -270,7 +200,7 @@ def _planes_last(arr):
 
 
 def read_fits_minimal(path):
-    """Minimal FITS reader (no astropy). Reads only the primary HDU data."""
+    """Fallback without astropy; reads only the primary HDU."""
     with open(path, "rb") as f:
         header = {}
         done = False
@@ -300,10 +230,8 @@ def read_fits_minimal(path):
         if len(data) < nbytes:
             raise ValueError(f"Truncated FITS data: {path}")
         if bitpix == 16:
-            # FITS stores 16-bit data signed; unsigned frames carry BZERO=32768
-            # to shift it back. Ignoring that used to be invisible because no
-            # sensor here filled more than 12 bits — on a full 16-bit frame it
-            # moves every pixel by 32768.
+            # FITS stores 16-bit data signed; unsigned frames carry BZERO=32768.
+            # Ignoring it moves every pixel of a full 16-bit frame by 32768.
             arr = np.frombuffer(data, dtype=">i2").astype(np.int32)
             arr = _apply_bscale(arr, header)
         elif bitpix == 8:
@@ -322,11 +250,8 @@ def read_fits_minimal(path):
 
 
 def _apply_bscale(arr, header):
-    """Apply ``BZERO``/``BSCALE`` to integer FITS data.
-
-    The common case by far is ``BZERO=32768, BSCALE=1`` on 16-bit data, which
-    means "these signed shorts are really unsigned"; that path returns uint16.
-    Anything else is left in a type wide enough to hold the result.
+    """``BZERO=32768, BSCALE=1`` means signed shorts that are really unsigned: returns
+    uint16.
     """
     try:
         bzero = float(header.get("BZERO", 0) or 0)
@@ -334,8 +259,8 @@ def _apply_bscale(arr, header):
     except (TypeError, ValueError):
         return arr.astype(np.uint16)
     if bscale == 1.0 and bzero == 0.0:
-        # No offset recorded. Written before BZERO was, so signed values are
-        # really unsigned ones that wrapped: read them back the same way.
+        # Files without BZERO hold unsigned values that wrapped: read them back that
+        # way.
         return arr.astype(np.uint16)
     values = arr * bscale + bzero
     if bscale == 1.0 and bzero == 32768.0:
@@ -344,7 +269,6 @@ def _apply_bscale(arr, header):
 
 
 def read_fits_header(path):
-    """Return the primary FITS header as a plain ``{str: str}`` dict."""
     try:
         from astropy.io import fits
         with fits.open(path, memmap=False) as hdul:
@@ -353,21 +277,10 @@ def read_fits_header(path):
         return {}
 
 
-# ---------------------------------------------------------------------------
-# Display conversion
-# ---------------------------------------------------------------------------
 def to_uint8(frame, stretch="minmax", low_pct=0.5, high_pct=99.5,
              full_scale=None):
-    """Scale any frame to 8-bit for display.
-
-    stretch:
-      ``"minmax"``     — map [min, max] to [0, 255] (default; matches what the
-                         drivers used to do inline).
-      ``"percentile"`` — map [low_pct, high_pct] percentiles, which keeps faint
-                         detail visible next to hot pixels.
-      ``"raw"``        — divide by ``full_scale`` (the program's 0..65535 scale
-                         unless a caller knows the frame is on an older one)
-                         without looking at the data.
+    """``stretch``: ``minmax``; ``percentile`` keeps faint detail next to hot pixels;
+    ``raw`` divides by ``full_scale`` without looking at the data.
     """
     arr = np.asarray(frame)
     if arr.dtype == np.uint8:
@@ -398,7 +311,6 @@ def to_uint8(frame, stretch="minmax", low_pct=0.5, high_pct=99.5,
 
 
 def _downscale(img8, max_side):
-    """Downscale a uint8 array so its longest side is <= max_side."""
     if not max_side:
         return img8
     h, w = img8.shape[:2]
@@ -415,7 +327,6 @@ def _downscale(img8, max_side):
 
 def to_jpeg_bytes(frame, max_side=None, quality=DEFAULT_JPEG_QUALITY,
                   stretch="minmax", full_scale=None):
-    """Convert any frame (8/16/32-bit, grayscale or RGB) to JPEG bytes."""
     img8 = to_uint8(frame, stretch=stretch, full_scale=full_scale)
     img8 = _downscale(img8, max_side)
     from PIL import Image
@@ -432,22 +343,14 @@ def to_jpeg_bytes(frame, max_side=None, quality=DEFAULT_JPEG_QUALITY,
     return buf.getvalue()
 
 
-
-
 def jpeg_bytes_passthrough(data):
-    """Return already-encoded JPEG bytes unchanged (Canon delivers JPEG)."""
+    """Canon delivers JPEG already."""
     return data
 
 
-# ---------------------------------------------------------------------------
-# Focus / quality metrics
-# ---------------------------------------------------------------------------
 def sharpness(frame):
-    """Focus metric: variance of the Laplacian. Higher means sharper.
-
-    Computed on a float32 copy so it is independent of bit depth, but *not*
-    of exposure — compare values only within one live session, which is
-    exactly how focus_app.py uses it.
+    """Variance of the Laplacian. Independent of bit depth but not of exposure: compare
+    values only within one live session.
     """
     arr = np.asarray(frame)
     if arr.ndim == 3:
@@ -463,12 +366,8 @@ def sharpness(frame):
 
 
 def frame_stats(frame, full_scale=None):
-    """Basic statistics used by the viewer/focus UIs.
-
-    ``full_scale`` is the range the values are on; it defaults to the program's
-    own. Passing it matters for saturation: a pixel is only clipped relative to
-    the scale its frame was digitised on, and this used to be guessed from the
-    brightest pixel — which read a dark 16-bit exposure as a 12-bit one.
+    """``full_scale`` matters for saturation: a pixel is clipped only relative to the
+    scale its frame was digitised on.
     """
     arr = np.asarray(frame)
     if arr.size == 0:
@@ -492,11 +391,8 @@ def frame_stats(frame, full_scale=None):
 
 
 def histogram(frame, bins=256, full_scale=None):
-    """Return ``(counts, edges)`` as plain lists, ready for JSON.
-
-    Binned over the full intensity range rather than over the data, so two
-    frames of the same camera produce histograms that can be compared: a range
-    taken from min/max silently rescales the axis under the reader.
+    """Binned over the full intensity range, not the data, so frames of one camera
+    compare.
     """
     arr = np.asarray(frame)
     if arr.ndim == 3:
@@ -508,11 +404,7 @@ def histogram(frame, bins=256, full_scale=None):
     return counts.tolist(), edges.tolist()
 
 
-# ---------------------------------------------------------------------------
-# Metadata sidecars
-# ---------------------------------------------------------------------------
 def frame_metadata(path):
-    """Best-effort metadata for one archived frame (FITS header, file stat)."""
     meta = {}
     try:
         st = os.stat(path)
@@ -528,7 +420,6 @@ def frame_metadata(path):
 
 
 def dumps(obj):
-    """JSON dump helper that never chokes on numpy scalars."""
     def _default(o):
         if isinstance(o, (np.integer,)):
             return int(o)

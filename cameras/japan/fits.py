@@ -1,29 +1,11 @@
-"""FITS output for the Hamamatsu imager: the shared core, and nothing else.
+"""FITS output for the Hamamatsu imager.
 
-Every card this writer produces is one of the eighteen in
-``cameras/common/fits.py`` — this header set is where those eighteen came from.
-Four comments differ from the PIXIS wording, because they describe a different
-instrument, and they are the whole of the difference.
+:func:`write_fits` (``sun``, ``time``) writes only the shared cards: ``GAIN`` and
+``SETTEMP`` have no value here, no loop drives the intensity cards, and the imagerd_rt
+records belong to the ASI archive.
 
-What is deliberately absent: ``GAIN`` and ``SETTEMP`` (no analog gain, no cooling
-setpoint — the sensor temperature is a reading only), the intensity-control cards
-``SKYMEAN``/``SPLITNUM``/``SPLITIDX`` (neither of the two modes below drives a
-loop that chooses an exposure), and the sixteen imagerd_rt legacy records, which
-belong to the ASI station's archive and would be noise in a Hamamatsu frame.
-
-That is :func:`write_fits`, used by the ``sun`` and ``time`` modes. The
-``sun_cycle`` mode files its frames into the ASI archive instead, and
-:func:`write_sun_cycle_fits` writes the ASI header set for it — the shared cards,
-the intensity-control cards, and the imagerd_rt records — minus every card that
-says which camera or which software took the frame (``INSTRUME``, ``VENDOR``,
-``CAMSN``, ``CAMVER``, ``DRVVER``, ``DCAMVER``, ``BitDepth``, ``CCDGain``,
-``DeviceID``, ``Version``; ``GAIN`` and ``SETTEMP`` have no Hamamatsu value
-anyway). In their place is one ``NAME`` card, the instrument name set as
-``japan.name`` in config.json.
-
-The intensity cards appear only in that mode because only that mode runs the
-loops: ``SKYMEAN`` on every frame, ``SPLITNUM``/``SPLITIDX`` on a slot that was
-actually divided, and ``OBSMODE = sun_cycle_auto`` on a preflight frame.
+:func:`write_sun_cycle_fits` files into that archive: the ASI header set minus every
+card naming the camera or software, plus ``NAME``.
 """
 from __future__ import annotations
 
@@ -38,9 +20,8 @@ from ..common.fits import (  # noqa: F401
     UNKNOWN_TEMP, write_core_header, write_image, write_legacy_keys,
 )
 
-# The Hamamatsu spellings. READSPD carries DCAM's READOUTSPEED setting — an
-# enumeration value, 1 or 2 — not the megahertz figure the PIXIS reports, so the
-# shared "[MHz]" comment would be actively wrong here.
+# READSPD carries DCAM's READOUTSPEED setting, an enumeration of 1 or 2, so the shared
+# "[MHz]" comment would be wrong.
 JAPAN_COMMENTS = {
     "READSPD": "readout speed setting",
     "OBSMODE": "observation mode: sun, time, or dark",
@@ -48,8 +29,7 @@ JAPAN_COMMENTS = {
     "DCAMVER": "DCAM API version",
 }
 
-# The sun_cycle header speaks for its own mode only; the sun/time header above
-# keeps its wording, which the archive already has.
+# The sun/time header above keeps its wording, which the archive already has.
 SUN_CYCLE_COMMENTS = dict(JAPAN_COMMENTS,
                           OBSMODE="observation mode: sun_cycle or dark")
 
@@ -96,9 +76,7 @@ def write_fits(
         lat=lat,
         lon=lon,
         elevation=elevation,
-        # The old program's DATE-OBS held local time under a comment claiming
-        # UTC. DATE-OBS is now genuinely UTC, and this card is what keeps the
-        # station's own wall-clock time recoverable from the frame.
+        # Keeps the station's wall-clock time recoverable: DATE-OBS is UTC.
         date_loc=True,
         comments=JAPAN_COMMENTS,
     )
@@ -133,13 +111,8 @@ def write_sun_cycle_fits(
 ) -> None:
     """The ASI header set without the instrument cards, plus ``NAME``.
 
-    ``readout_speed_text`` is the legacy ``ReadoutSpeed`` record, worded the way
-    this camera's setting reads (``2 (fast)``): imagerd_rt's ``2 MHz`` would put
-    a PIXIS figure into a Hamamatsu frame.
-
-    ``sky_mean`` and the ``split_*`` pair are what this mode's intensity-control
-    loops measured and decided, spelled exactly as ``cameras/asi/fits.py`` spells
-    them — the two archives are read by the same processing program.
+    ``readout_speed_text`` is worded for this camera (``2 (fast)``): ``2 MHz`` would
+    put a PIXIS figure into a Hamamatsu frame.
     """
     hdu = fits.PrimaryHDU(data)
     h = hdu.header
@@ -167,10 +140,8 @@ def write_sun_cycle_fits(
         instrument=False,
     )
     h["NAME"] = (name, "instrument name")
-    # What the intensity-control loops measured and decided. SKYMEAN is written
-    # for every frame because it costs one pass over the array and answers the
-    # first question anyone asks of an archived frame; the SPLIT* pair appears
-    # only when a slot was actually divided.
+    # SKYMEAN goes on every frame: it costs one pass over the array and answers the
+    # first question asked of an archived frame.
     if sky_mean is not None:
         h["SKYMEAN"] = (round(float(sky_mean), 2), "[ADU] mean frame intensity")
     if split_count and split_count > 1:

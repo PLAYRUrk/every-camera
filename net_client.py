@@ -1,8 +1,5 @@
-"""
-HTTP client and Qt helpers shared by viewer_app.py and focus_app.py.
-
-Uses only the standard library for networking, so the observer's machine needs
-nothing beyond PyQt5 — no camera SDKs, no ``requests``.
+"""Standard library only for networking, so an observer's machine needs nothing beyond
+PyQt5: no camera SDKs, no ``requests``.
 """
 import json
 import os
@@ -23,15 +20,7 @@ class CameraHttpError(Exception):
     """Any failure talking to a camera's frame server."""
 
 
-# ---------------------------------------------------------------------------
-# Naming
-# ---------------------------------------------------------------------------
 def node_name_of(info):
-    """Friendly machine name from a discovery reply or ``/api/info``.
-
-    Falls back through hostname to the bare address, so there is always
-    something to show even for a node that was never given a name.
-    """
     info = info or {}
     for key in ("node_name", "hostname"):
         value = str(info.get(key) or "").strip()
@@ -41,7 +30,6 @@ def node_name_of(info):
 
 
 def node_label(node, default_port=8765):
-    """One-line label for a discovered node: name, camera, address."""
     node = node or {}
     host = node.get("host", "?")
     port = node.get("http_port", default_port)
@@ -52,17 +40,8 @@ def node_label(node, default_port=8765):
 
 
 class CameraClient:
-    """Thin client for one camera's frame server.
-
-    ``via`` makes the same client talk to a camera it cannot reach directly, by
-    asking one that can: every camera forwards ``/api/node/<host:port>/...`` to
-    a neighbour it has seen (``gateway.py``). Nothing else changes — the calls
-    below, the archive, the live stream and the parameter editing all work the
-    same way through it, which is the difference between this and the broker it
-    replaced.
-
-        CameraClient("192.168.2.36", 8765)                    # straight there
-        CameraClient("10.0.0.5", 8765, via="192.168.2.40:8765")   # forwarded
+    """``via`` reaches a camera through another one: every camera forwards
+    ``/api/node/<host:port>/...`` to a neighbour it has seen (``gateway.py``).
     """
 
     def __init__(self, host, port=8765, timeout=DEFAULT_TIMEOUT, via=None):
@@ -84,10 +63,8 @@ class CameraClient:
         return f"{self.host}:{self.port}"
 
     def nodes(self):
-        """Every camera this node knows about — see ``gateway.Gateway.nodes``."""
         return self.get_json("/api/nodes").get("nodes", [])
 
-    # ------------------------------------------------------------------
     def url_for(self, path, **params):
         query = urlencode({k: v for k, v in params.items() if v is not None})
         return f"{self.base_url}{path}" + (f"?{query}" if query else "")
@@ -133,7 +110,6 @@ class CameraClient:
         except (URLError, socket.timeout, OSError, ValueError) as exc:
             raise CameraHttpError(f"{self} unreachable: {exc}") from exc
 
-    # -- convenience ---------------------------------------------------
     def info(self):
         return self.get_json("/api/info")
 
@@ -161,12 +137,9 @@ class CameraClient:
 
     def composite(self, first, previous, last, window, stretch="minmax",
                   max_side=None, timeout=60.0):
-        """The difference frame built from three named frames: ``(jpeg, headers)``.
-
-        The caller picks the frames, because the caller holds the grouping they
-        came out of; the camera reads them and does the arithmetic, and what
-        comes back is one JPEG plus the weights it was built with, in
-        ``X-Composite-*`` headers.
+        """``(jpeg, headers)``. The caller holds the grouping, so it picks the frames;
+        the camera does the arithmetic and returns the weights in ``X-Composite-*``
+        headers.
         """
         data, headers = self.get_bytes(
             "/api/composite", timeout=timeout, first=first, previous=previous,
@@ -188,12 +161,8 @@ class CameraClient:
         return self.get_json(f"/api/params/{req_id}")
 
     def keep_focus(self, ttl=60, hold=None):
-        """Start or extend a focus session.
-
-        ``hold`` asks the camera to pause its schedule for the session. Left as
-        ``None`` it is not sent at all, which tells the camera to keep whatever
-        hold state it already has — the MJPEG stream renews the session on
-        every frame and must not cancel a hold by doing so.
+        """``hold`` asks the camera to pause its schedule for the session. None is not
+        sent, which keeps whatever hold state the camera already has.
         """
         body = {"ttl": ttl}
         if hold is not None:
@@ -204,12 +173,7 @@ class CameraClient:
         return self.post_json("/api/focus", {"enabled": False})
 
 
-# ---------------------------------------------------------------------------
-# Qt threading helpers — keep every network call off the GUI thread
-# ---------------------------------------------------------------------------
 class Task(QThread):
-    """Run one callable in a worker thread and report the outcome."""
-
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
 
@@ -258,8 +222,6 @@ class TaskRunner:
 
 
 class DiscoveryTask(QThread):
-    """Broadcast for cameras on the LAN without blocking the UI."""
-
     found = pyqtSignal(list)
 
     def __init__(self, timeout=2.0, port=None, parent=None):
@@ -279,11 +241,7 @@ class DiscoveryTask(QThread):
 
 
 class MjpegStream(QThread):
-    """Read an MJPEG stream and emit each JPEG frame.
-
-    Reconnects on its own, so a camera restart or a brief network glitch does
-    not require the user to do anything.
-    """
+    """Reconnects on its own after a camera restart or a brief network glitch."""
 
     frame = pyqtSignal(bytes, str)
     state = pyqtSignal(str)
@@ -322,7 +280,6 @@ class MjpegStream(QThread):
                 if not chunk:
                     raise CameraHttpError("stream ended")
                 buf += chunk
-                # Parse as many complete parts as the buffer holds.
                 while True:
                     header_end = buf.find(b"\r\n\r\n")
                     if header_end < 0:
@@ -350,9 +307,6 @@ class MjpegStream(QThread):
                     buf = b""
 
 
-# ---------------------------------------------------------------------------
-# Small persistent settings for the observer tools
-# ---------------------------------------------------------------------------
 def settings_path():
     from pathlib import Path
     return Path.home() / ".every_camera" / SETTINGS_FILE_NAME
@@ -368,11 +322,8 @@ def load_settings():
 
 
 def save_settings(data):
-    """Merge ``data`` into the settings file and replace it atomically.
-
-    viewer_app and focus_app share one file, so a blind overwrite let whichever
-    quit last erase the other's recent hosts. Re-reading first keeps keys this
-    program does not know about.
+    """Merges, then replaces atomically: viewer_app and focus_app share one file, and a
+    blind overwrite would erase the other's recent hosts.
     """
     path = settings_path()
     merged = load_settings()

@@ -1,35 +1,12 @@
-"""Hamamatsu's own DCAM-API Python wrappers, vendored, loaded on demand.
+"""Hamamatsu's DCAM-API Python wrappers, vendored and loaded on demand.
 
-Provenance
-----------
-``vendor/dcamapi4.py`` (dated Apr 16 2025) and ``vendor/dcam.py`` (dated
-2025-04-16) come from ``samples/python/`` inside
-``Hamamatsu_DCAMSDK4_v25056964.zip``, which is kept in the ``japan-camera``
-submodule. They are the vendor's files, not ours:
+``vendor/dcam.py`` is verbatim. ``vendor/dcamapi4.py`` differs in one marked hunk,
+replacing the hard-coded library path with a candidate list honouring ``DCAM_LIB``. To
+update the SDK, copy both files in and re-apply that hunk.
 
-* ``dcam.py`` is **verbatim** — including ``from dcamapi4 import *``, so the
-  vendor's own sample scripts still run out of ``vendor/`` and stay usable as the
-  reference when the SDK is next updated.
-* ``dcamapi4.py`` differs in **one marked hunk**, which replaces the hard-coded
-  ``/usr/local/lib/libdcamapi.so`` with a candidate list honouring ``DCAM_LIB``.
-
-Updating the SDK is therefore: copy both files in, re-apply that one hunk.
-``tests/test_japan_sdk.py`` fails loudly if the hunk is ever lost.
-
-Why loading is deferred
------------------------
-``dcamapi4`` loads ``libdcamapi.so`` and binds fifty-odd ctypes prototypes *at
-import time*, so importing it on a machine without the SDK raises. every-camera
-must import ``cameras.japan_driver`` on any machine — ``main.py`` dispatches
-through it, the tests exercise the whole driver against simulators, and a station
-running only the simulator has no SDK at all. Nothing here is therefore imported
-at module scope: ``cameras/japan/camera.py`` calls :func:`load` inside
-``__enter__``, and ``cameras/japan/devices.py`` imports that module only on the
-real-hardware branch.
-
-This mirrors how ``cameras/asi/picam.py`` defers ``libpicam.so`` behind ``_load()``
-— the difference being that here the deferral has to wrap a whole module, because
-the vendor file does its work on import.
+``dcamapi4`` loads ``libdcamapi.so`` at import time and raises without the SDK, while
+``cameras.japan_driver`` must import on any machine, so nothing here imports it at
+module scope.
 """
 from __future__ import annotations
 
@@ -45,19 +22,16 @@ _sdk: SimpleNamespace | None = None
 
 
 def load() -> SimpleNamespace:
-    """Import the vendor wrappers and return the handful of names we use.
-
-    Raises ``OSError`` with every path it tried when the runtime is missing. The
-    result is cached, so a second camera open costs nothing.
+    """Import the vendor wrappers, cached. ``OSError`` lists every path tried if the
+    runtime is missing.
     """
     global _sdk
     if _sdk is not None:
         return _sdk
 
-    # The vendor's modules import each other by bare name (``from dcamapi4 import
-    # *``), so they have to be importable as top-level modules. The path entry is
-    # removed again immediately: leaving it would put ``dcam`` and the vendor's
-    # sample scripts on every later import in the process.
+    # The vendor's modules import each other by bare name, so they must be top-level.
+    # The path entry goes straight back out to keep the vendor's samples off later
+    # imports.
     added = str(VENDOR_DIR)
     sys.path.insert(0, added)
     try:

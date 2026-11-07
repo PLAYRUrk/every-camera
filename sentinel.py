@@ -1,41 +1,17 @@
 #!/usr/bin/env python3
 """The watchdog that outlives the camera process.
 
-Everything else in the alert system runs inside the program that is measuring,
-which means none of it can report the one failure that matters most: the
-program not being there any more. A segfault in a ctypes driver, an OOM kill, a
-machine that wedged — in every one of those the worker has no chance to say
-anything, and the night ends silently. So this runs beside it, as its own
-service, doing four things and nothing else:
+The rest of the alert system runs inside the measuring program, so it cannot report
+that program being gone. This runs beside it as its own service and:
 
-1. **Sends the spool.** It is the only thing in the program that opens a socket
-   to an SMTP server. A worker queues a letter by writing a file — microseconds,
-   no network, cannot fail in a way that stalls a frame — and this picks it up.
-   That is what makes the promise: a letter queued a second before the process
-   died still goes out, because a crash cannot un-write a file.
+- sends the spool, as the only SMTP client in the program;
+- notices a worker that died: a status file with a dead PID and no clean-exit marker;
+- notices a worker that hung: alive, but its status has stopped moving;
+- warns about the disk, from the free space workers last reported;
+- mails a status summary if ``alerts.status_mail_minutes`` asks, so somebody who cannot
+  reach in still hears from the station.
 
-2. **Notices a worker that died.** A status file whose PID is gone, with no
-   clean-exit marker beside it, is a process that did not get to shut down.
-
-3. **Notices a worker that stopped working.** Alive, but its status has not
-   moved in longer than it should have.
-
-4. **Watches the disk**, independently of any worker, because a full disk is
-   exactly the condition in which a worker stops being able to say so.
-
-5. **Sends a status summary**, if ``alerts.status_mail_minutes`` asks for one.
-   This is the part that replaces what a broker's retained status topic did for
-   somebody outside the network: they cannot reach in, so the station reports
-   out. One letter, every camera on the machine, in a table — readable in any
-   mail client, no broker and no inbound port involved.
-
-It is deliberately small and stdlib-only: no numpy, no PyQt, no camera driver.
-It has to be the thing that is still running when everything else is not.
-
-Usage:
-    python sentinel.py                  # run until stopped
-    python sentinel.py --once           # one pass, for testing
-    python sentinel.py --interval 30
+No numpy, PyQt or camera driver: it must be what is still running when nothing else is.
 """
 import argparse
 import json
@@ -61,33 +37,24 @@ STATE_FILE = str(Path.home() / ".every_camera" / "sentinel.json")
 
 
 def _service_config_dir():
-    """Where the services keep their configs (``systemd/install.sh``).
+    """One sentinel per machine, one config per camera, so it reads theirs: the
+    addresses to notify are a fact about the station.
 
-    The sentinel is one per machine while the cameras are one per type, so it
-    has no config of its own to be pointed at — it reads theirs. That is
-    deliberate: the addresses to notify are a fact about the station, and asking
-    for them twice is asking for two answers.
-
-    Windows has no systemd and therefore no installer writing this directory;
-    the machine-wide place a station *would* put it is under ``%PROGRAMDATA%``,
-    so that is where it looks. Finding nothing there is normal and not an error
-    — :func:`find_config` then falls back to the checkout's own config.json,
-    which is how a Windows station is set up anyway.
+    Windows has no installer writing this directory. It looks under ``%PROGRAMDATA%``,
+    and finding nothing is normal: :func:`find_config` falls back to the checkout's
+    config.json.
     """
     if os.name == "nt":
         base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
-        # os.path.join, not pathlib: on the machine this runs on it joins with
-        # that machine's separator, which is the whole point, and pathlib would
-        # have to be told which flavour of path it is being handed.
         return os.path.join(base, "every-camera")
     return "/etc/every-camera"
 
 
 SERVICE_CONFIG_DIR = _service_config_dir()
 DEFAULT_INTERVAL = 15.0
-# A worker publishes its status at least every STATUS_MIN_INTERVAL (5 s) and
-# the monitor calls it stale at 30. This is deliberately far looser than
-# either: a tile going orange is a glance, a letter is somebody's evening.
+# Workers publish at least every STATUS_MIN_INTERVAL (5 s) and the monitor calls one
+# stale at 30. Far looser here: a tile going orange is a glance, a letter is somebody's
+# evening.
 HANG_SECONDS = 600.0
 
 
@@ -101,19 +68,12 @@ def _read_json(path):
 
 
 def _boot_id():
-    """Something that changes when the machine reboots, or None if it cannot tell.
+    """Changes when the machine reboots; None if it cannot tell.
 
-    Without this, the first pass after a reboot would find every PID it knew
-    about gone and report each one as a crash. A reboot is one event, not six
-    dead cameras, and the letters about it would be six lies.
-
-    Linux states it outright. Everywhere else — Windows included — the fallback
-    is the wall-clock moment the machine booted, derived from the difference
-    between the two clocks. It drifts by a second or two as NTP corrects the
-    wall clock, which is why it is the fallback: it is compared for equality, so
-    a drifting value can claim a reboot that never happened. That costs a
-    spurious letter, where the alternative — no boot id at all — costs one
-    letter per camera after every real reboot.
+    Without it a reboot reads as every known PID crashing: one event, six letters. Off
+    Linux it is the wall-clock boot moment, which NTP drifts by a second or two.
+    Compared for equality, that can claim a reboot that never happened: one spurious
+    letter, against one letter per camera after every real reboot.
     """
     try:
         with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as handle:
@@ -127,13 +87,11 @@ def _boot_id():
 
 
 def find_config(explicit=None):
-    """The configuration this machine's alerts are described by.
+    """The first config naming somebody to notify wins: the explicit path, the
+    checkout's config.json, then each service config.
 
-    Tried in order: what was asked for, the checkout's own config.json (the
-    normal case when the program is run by hand), then each service config
-    in /etc/every-camera. The first one that names somebody to notify wins;
-    if none does, the last one read is still returned, so that the sentinel
-    starts and says what is missing rather than refusing to run.
+    If none does, the last one read is returned, so the sentinel starts and says what is
+    missing rather than refusing to run.
     """
     candidates = []
     if explicit:
@@ -158,15 +116,9 @@ def find_config(explicit=None):
     return last
 
 
-# ---------------------------------------------------------------------------
-# Status files
-# ---------------------------------------------------------------------------
 def scan_status_dir(status_dir):
-    """Every live status file, keyed by PID string.
-
-    Console workers write ``{pid}.json``; the GUI, which can run several cameras
-    in one process, writes ``{pid}_{camera}.json``. Both are keyed here by the
-    file's stem, so two cameras in one process stay two entries.
+    """Keyed by file stem: console workers write ``{pid}.json``, the GUI, which can run
+    several cameras in one process, ``{pid}_{camera}.json``.
     """
     found = {}
     try:
@@ -188,7 +140,6 @@ def scan_status_dir(status_dir):
 
 
 def _age_of(record):
-    """Seconds since the worker last published, or None if it never said."""
     stamp = record.get("last_update")
     if not stamp:
         return None
@@ -198,9 +149,6 @@ def _age_of(record):
         return None
 
 
-# ---------------------------------------------------------------------------
-# The watchdog
-# ---------------------------------------------------------------------------
 class Sentinel:
     def __init__(self, cfg=None, status_dir=None, state_file=STATE_FILE,
                  spool=None, hang_seconds=HANG_SECONDS):
@@ -219,19 +167,18 @@ class Sentinel:
         self._disk_warned = False
         self.status_mail_seconds = (
             float(self.alerts_cfg.get("status_mail_minutes", 0) or 0) * 60.0)
-        # First one goes out a full interval from start, not at start: a
-        # station rebooting in a loop would otherwise mail on every boot.
+        # A full interval from start, not at start: a station rebooting in a loop would
+        # otherwise mail on every boot.
         self._next_status_mail = time.monotonic() + self.status_mail_seconds
         self._state = _read_json(self.state_file) or {}
         self._known = dict(self._state.get("known") or {})
         self._reconcile_boot()
 
-    # -- state ---------------------------------------------------------------
     def _reconcile_boot(self):
         boot = _boot_id()
         if boot and self._state.get("boot_id") not in (None, boot):
-            # The machine restarted. Everything it knew about is gone for that
-            # reason and no other, so forget it rather than mourn it.
+            # The machine restarted: everything it knew about is gone for that reason
+            # alone.
             self._known = {}
         self._state["boot_id"] = boot
 
@@ -242,7 +189,6 @@ class Sentinel:
         except OSError:
             pass
 
-    # -- letters -------------------------------------------------------------
     def queue(self, subject, body, kind=""):
         return self.spool.put(f"[every-camera] {subject}", body,
                               to=self.recipients, kind=kind) is not None
@@ -275,7 +221,6 @@ class Sentinel:
                   alerts._log_tail(log_path, self.log_tail_lines)]
         return "\n".join(parts)
 
-    # -- the four jobs -------------------------------------------------------
     def send_spool(self):
         account = mailer.resolve_account(self.alerts_cfg)
         if account is None or not self.recipients:
@@ -289,27 +234,22 @@ class Sentinel:
         return self.spool.send_all(account, self.recipients, quota=self.quota)
 
     def watch_workers(self):
-        """Compare what is running now with what was running last time."""
         current = scan_status_dir(self.status_dir)
 
         for key, entry in list(self._known.items()):
             if key in current and pid_alive(current[key]["pid"]):
                 continue
             if key in current and not pid_alive(current[key]["pid"]):
-                # The file is still there and the process is not: it never
-                # reached its own shutdown. This is the case the log shows as
-                # "Removed 1 stale status file(s)" at the next start, hours
-                # later, with nobody told in between.
+                # The file is there and the process is not: it never reached its own
+                # shutdown.
                 entry["status"] = current[key]["status"]
             self._report_gone(key, entry)
             self._known.pop(key, None)
 
         for key, found in current.items():
             if not pid_alive(found["pid"]):
-                # Its file outlives it — nothing removes a status file except
-                # the worker itself, and this one did not get to. Registering it
-                # again would mean reporting the same death on every pass until
-                # somebody restarted the camera.
+                # Only the worker removes its status file, and this one did not get to.
+                # Registering it again would report the same death on every pass.
                 continue
             status = found["status"]
             entry = self._known.setdefault(key, {})
@@ -326,7 +266,6 @@ class Sentinel:
     def _report_gone(self, key, entry):
         marker = alerts.take_marker(alerts.EXIT_DIR, key)
         if marker is not None:
-            # It said goodbye. Nothing to report.
             return
         instance = entry.get("instance") or key
         detail = alerts.take_crash(key)
@@ -386,7 +325,6 @@ class Sentinel:
             kind="disk-low")
 
     def status_summary(self):
-        """Every camera on this machine, as one table for a letter."""
         lines = []
         for key in sorted(self._known):
             entry = self._known[key]
@@ -405,7 +343,6 @@ class Sentinel:
         return "\n".join(lines)
 
     def send_status_mail(self, force=False):
-        """Queue the periodic summary when it is due. Returns True if it did."""
         if self.status_mail_seconds <= 0 and not force:
             return False
         if not force and time.monotonic() < self._next_status_mail:
@@ -441,7 +378,6 @@ class Sentinel:
             time.sleep(interval)
 
 
-# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Watch the camera workers on this machine and send alert mail")

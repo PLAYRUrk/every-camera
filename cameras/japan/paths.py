@@ -1,21 +1,9 @@
-"""Where a Hamamatsu frame is filed: flat, under the name japan-camera gave it.
+"""Flat frame names of the ``sun`` and ``time`` modes, as the processing program matches
+them.
 
-The standalone program wrote straight into its ``output_dir`` as
-``YYYYmmddTHHMMSS_<filter>.fits``, with ``_bg`` appended for a dark, and the
-directory was a night at a time (``C:/ccddata/20250826/`` in its own config.ini).
-That is kept: the station's processing program matches these names, and the
-per-night directory is what makes a flat layout workable at all.
-
-This is deliberately **not** the ASI archive: no ``YYYY/MM/DD`` tree, no site or
-device fields, no exposure in the name — see ``cameras/common/archive_paths.py``
-for that one. The ``sun`` and ``time`` modes file here; ``sun_cycle`` files into
-the ASI archive, named with ``japan.location.name`` and ``japan.name``.
-
-The timestamp is UTC, where japan-camera used local time. The old program's
-``DATE-OBS`` claimed UTC while holding local time, so one of the two had to move;
-having the name agree with a corrected ``DATE-OBS`` is worth more than matching a
-name whose time base was never written down. On a station at UTC+8 the names shift
-by eight hours relative to the old archive — say so in the night log once.
+Not the archive of ``cameras/common/archive_paths.py``, which ``sun_cycle`` files
+into. The per-night output directory is what makes a flat layout workable. The stamp
+is UTC, to agree with ``DATE-OBS``.
 """
 from __future__ import annotations
 
@@ -23,9 +11,7 @@ from pathlib import Path
 
 from ..common.timeutil import to_utc
 
-# Stands in for the wheel position when it is unknown: at startup the wheel is
-# parked at home (0), and a move that never confirmed reports nothing at all.
-# Both must still produce a filename, and 0 is what the old program wrote.
+# Wheel position written when it is unknown: every frame still needs a filename.
 NO_FILTER = 0
 
 
@@ -38,5 +24,4 @@ def frame_name(timestamp, filter_num, dark=False) -> str:
 
 
 def frame_path(root, timestamp, filter_num, dark=False) -> Path:
-    """Full path of one frame; the directory is not created here."""
     return Path(root) / frame_name(timestamp, filter_num, dark=dark)

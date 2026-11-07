@@ -1,34 +1,17 @@
-"""Outgoing mail for the alert system — stdlib only, and never on a hot path.
+"""Outgoing mail: the sender account and the spool. Standard library only.
 
-Two things live here: the account (where the credentials come from and what a
-provider's SMTP looks like) and the spool (a queue of letters on disk).
+A measurement thread must never open a socket: a slow SMTP server would hold up a
+frame, a hung one the night. Workers only write a JSON file into
+``~/.every_camera/outbox``; ``sentinel.py``, a separate process, sends it, so a letter
+queued a second before the program dies still goes out.
 
-The spool is the whole design, not a convenience. A measurement thread must
-never open a socket: an SMTP server that has gone slow would hold up a frame,
-and one that hangs would hold up the night. So a worker only ever writes a JSON
-file into ``~/.every_camera/outbox`` — microseconds, no network — and something
-else sends it. That something else is ``sentinel.py``, which is a separate
-process, which is what makes the promise this module exists for: **a letter
-queued a second before the program dies still goes out.** A crash cannot
-un-write a file.
+The account stays out of ``config.json``, so setting a station up means typing the
+addresses to notify and nothing else. Looked for in this order:
 
-The account lives outside ``config.json`` on purpose. The point of the whole
-arrangement is that setting a station up means typing the addresses to notify
-and nothing else, so the sender's credentials arrive with the installation the
-way ``env.sh`` already does — one file, once, per machine. It is looked for in
-three places, in this order:
-
-    ~/.every_camera/mail_account.json   the normal place. Outside the checkout,
-                                        so neither a commit nor ``update.py
-                                        --force`` can touch it.
-    <checkout>/mail_account.json        beside the program, like ``env.sh``.
-    config.json ``alerts.smtp``         for a station that needs its own mailbox.
-
-A preset supplies host, port and encryption, so the file holds a provider name,
-a login and a password and nothing else:
-
-    {"preset": "yandex", "user": "obs-alerts@yandex.ru",
-     "password": "...", "from": "obs-alerts@yandex.ru"}
+    ~/.every_camera/mail_account.json   outside the checkout, so neither a commit nor
+                                        ``update.py --force`` can touch it
+    <checkout>/mail_account.json        beside the program, like ``env.sh``
+    config.json ``alerts.smtp``         for a station that needs its own mailbox
 """
 import json
 import os
@@ -52,9 +35,7 @@ ACCOUNT_FILES = (
     os.path.join(APP_DIR, "mail_account.json"),
 )
 
-# What each provider's SMTP looks like, so that the account file does not have
-# to. "ssl" connects encrypted; "starttls" connects in the clear and upgrades;
-# "none" is for a relay on localhost that wants neither.
+# "starttls" connects in the clear and upgrades; "none" is for a relay on localhost.
 SMTP_PRESETS = {
     "yandex": {"host": "smtp.yandex.ru", "port": 465, "security": "ssl"},
     "mailru": {"host": "smtp.mail.ru", "port": 465, "security": "ssl"},
@@ -65,8 +46,6 @@ SMTP_PRESETS = {
     "custom": {},
 }
 
-# Yandex and Mail.ru want an application password rather than the account's own,
-# and say so in a way worth repeating verbatim to whoever is setting this up.
 PRESET_HINTS = {
     "yandex": "Yandex needs an application password (id.yandex.ru → Security → "
               "App passwords → Mail), not the account password.",
@@ -81,13 +60,11 @@ PRESET_HINTS = {
 }
 
 SEND_TIMEOUT = 30.0
-# A letter nobody could deliver in a day is describing a fault that is either
-# fixed or long since reported by other means; keeping it forever only means
-# a week-old backlog lands at once when the mail server comes back.
+# A letter undelivered for a day is stale; keeping it would land a week-old backlog
+# at once when the mail server comes back.
 MAX_AGE_SECONDS = 24 * 3600
-# Retry spacing: 30 s, 1 min, 2 min, 4 min … capped. Deliberately not tighter —
-# nothing here is urgent to the minute, and a mail server that is refusing
-# connections should not be hammered by every station at once.
+# 30 s, 1 min, 2 min, 4 min ... capped. Not tighter: a mail server refusing
+# connections must not be hammered by every station at once.
 RETRY_BASE_SECONDS = 30.0
 RETRY_MAX_SECONDS = 600.0
 
@@ -96,9 +73,6 @@ class MailError(Exception):
     """Anything that stopped a letter from being handed to the server."""
 
 
-# ---------------------------------------------------------------------------
-# Account
-# ---------------------------------------------------------------------------
 def _read_json(path):
     try:
         with open(path, encoding="utf-8") as handle:
@@ -109,12 +83,8 @@ def _read_json(path):
 
 
 def resolve_account(alerts_cfg=None):
-    """The sender's credentials, or None if this machine has none.
-
-    Returns a dict with ``host``, ``port``, ``security``, ``user``, ``password``,
-    ``from`` and ``source`` — the last being where it was found, so the setup
-    wizard and the log can say which of the three places is in play instead of
-    leaving someone editing a file that is being overridden by another.
+    """``source`` says where the account was found, so nobody edits a file that another
+    one overrides.
     """
     candidates = [(path, _read_json(path)) for path in ACCOUNT_FILES]
     candidates.append(("config.json alerts.smtp",
@@ -124,8 +94,7 @@ def resolve_account(alerts_cfg=None):
             continue
         preset = str(raw.get("preset") or "custom").lower()
         base = dict(SMTP_PRESETS.get(preset, {}))
-        # Anything spelled out in the file wins over the preset: a provider that
-        # moves a port should not need a new release to keep working.
+        # The file wins over the preset: a provider moving a port needs no new release.
         account = {
             "preset": preset,
             "host": raw.get("host") or base.get("host", ""),
@@ -143,7 +112,6 @@ def resolve_account(alerts_cfg=None):
 
 
 def account_summary(account):
-    """One line for the wizard and the log: who sends, and from where."""
     if not account:
         return ("no sender configured — put mail_account.json in "
                 f"{HOME_DIR} (see mail_account.json.example)")
@@ -151,9 +119,6 @@ def account_summary(account):
            f"(from {account['source']})"
 
 
-# ---------------------------------------------------------------------------
-# Sending
-# ---------------------------------------------------------------------------
 def _connect(account, timeout):
     host, port = account["host"], int(account["port"])
     security = account.get("security", "ssl")
@@ -167,11 +132,6 @@ def _connect(account, timeout):
 
 
 def _explain(exc, account):
-    """Turn an smtplib failure into something a person can act on.
-
-    "Failed to send" is the least useful thing a test button can say. Almost
-    every failure here is one of four things, and each has a different fix.
-    """
     if isinstance(exc, smtplib.SMTPAuthenticationError):
         hint = PRESET_HINTS.get(account.get("preset", ""), "")
         return f"the server rejected the login for {account['user']}. {hint}".strip()
@@ -189,10 +149,7 @@ def _explain(exc, account):
 
 
 def send_now(account, to, subject, body, timeout=SEND_TIMEOUT):
-    """Hand one letter to the server. Raises :class:`MailError` if it will not take it.
-
-    Synchronous and blocking, which is why nothing on a measurement path calls
-    it: the spool exists so that workers do not have to.
+    """Blocking, so nothing on a measurement path calls it. Raises :class:`MailError`.
     """
     if not account:
         raise MailError("no sender account configured")
@@ -224,18 +181,12 @@ def send_now(account, to, subject, body, timeout=SEND_TIMEOUT):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Daily quota
-# ---------------------------------------------------------------------------
 class Quota:
-    """A cap on letters per day, per machine.
+    """A daily cap per machine.
 
-    One mailbox serves the whole fleet, so the provider's daily limit is shared.
-    Without a cap here, a single station stuck in a failure that repeats every
-    frame would spend the allowance for every other station before dawn — which
-    is the one way an alert system can fail that leaves everyone believing it
-    still works. When the cap is hit the station says so once and goes quiet;
-    the log keeps everything either way.
+    One mailbox serves the whole fleet, so a station stuck in a repeating failure would
+    otherwise spend everyone's allowance before dawn, while everyone believes alerts
+    work.
     """
 
     def __init__(self, path=QUOTA_FILE, limit=50):
@@ -274,14 +225,9 @@ class Quota:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Spool
-# ---------------------------------------------------------------------------
 def _write_json_atomic(path, data):
-    """Write via a temporary file, as ``utils.save_config`` does.
-
-    A half-written letter that a reader picks up mid-write is a letter lost, and
-    the reader here is another process entirely.
+    """The reader is another process: a half-written letter it picks up is a letter
+    lost.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp"
@@ -291,18 +237,16 @@ def _write_json_atomic(path, data):
 
 
 class Spool:
-    """Letters waiting on disk. Writers only append; the sentinel drains."""
+    """Writers only add; the sentinel drains."""
 
     def __init__(self, directory=SPOOL_DIR):
         self.dir = directory
 
-    # -- the writing side (workers) -----------------------------------------
     def put(self, subject, body, to=None, kind=""):
-        """Queue one letter. Never raises: a failure to warn must not become a crash.
+        """Never raises: a failure to warn must not become a crash.
 
-        Returns the file path, or None if even this could not be done — in which
-        case the caller has already written the real message to the log, which
-        is the point of that log.
+        Returns None if the letter could not be queued; the message is in the log
+        anyway.
         """
         letter = {
             "id": uuid.uuid4().hex[:12],
@@ -324,9 +268,7 @@ class Spool:
             return None
         return path
 
-    # -- the sending side (sentinel) ----------------------------------------
     def pending(self):
-        """Queued letters, oldest first. Unreadable files are dropped, not retried."""
         try:
             names = sorted(os.listdir(self.dir))
         except OSError:
@@ -338,8 +280,8 @@ class Spool:
             path = os.path.join(self.dir, name)
             data = _read_json(path)
             if data is None:
-                # Not JSON and never will be. Left in place it would be reported
-                # as a failure on every pass, for ever.
+                # Not JSON and never will be: left in place it would fail on every pass,
+                # for ever.
                 _discard(path)
                 continue
             data["_path"] = path
@@ -347,11 +289,7 @@ class Spool:
         return letters
 
     def send_all(self, account, default_to, quota=None, now=None):
-        """Try to deliver everything due. Returns ``(sent, failed, dropped)``.
-
-        Nothing in here raises: it runs in the sentinel's loop, and a mail server
-        having a bad night must not take the watchdog down with it.
-        """
+        """Never raises: a mail server's bad night must not take the sentinel down."""
         now = time.time() if now is None else now
         sent = failed = dropped = 0
         for letter in self.pending():

@@ -1,7 +1,4 @@
-"""
-Every Camera — GUI application.
-Combines Canon camera control, SPTT camera control, and Monitor in tabs.
-"""
+"""Tabbed camera control. Closing the window rewrites config.json, or the --config file."""
 import os
 import sys
 import time
@@ -40,12 +37,7 @@ from worker_common import (
 )
 
 
-# ===========================================================================
-# Shared tab helpers
-# ===========================================================================
-
 def _release_claim(tab):
-    """Give a tab's reserved instance name back when its worker stops."""
     claim = getattr(tab, "_claim", None)
     if claim is not None:
         claim.release()
@@ -54,13 +46,9 @@ def _release_claim(tab):
 
 def _start_tab_server(cfg, camera_type, instance_name, output_dir,
                       setup_mode=False):
-    """Create the CameraService and start the LAN frame server for a tab.
-
-    Returns ``(service, server)``; ``server`` is None when the server is
-    disabled or could not bind — the measurement always goes ahead either way.
-    Tabs share one ``cfg["server"]``, so the port search in
-    :func:`frame_server.start_frame_server` is what lets more than one of them
-    have a server at all.
+    """Returns ``(service, server)``; ``server`` is None when disabled or unbound, and the
+    measurement goes ahead either way. Tabs share one ``cfg["server"]``, so several servers
+    rely on the port search in :func:`frame_server.start_frame_server`.
     """
     from camera_service import CameraService
     from frame_server import start_frame_server
@@ -69,10 +57,6 @@ def _start_tab_server(cfg, camera_type, instance_name, output_dir,
                             node_name=get_node_name(cfg), setup_mode=setup_mode)
     return service, start_frame_server(cfg.get("server", {}), service)
 
-
-# ===========================================================================
-# Canon GUI components
-# ===========================================================================
 
 class CannonConnectThread(QThread):
     connected = pyqtSignal(object, object, str)  # cam, config, model_name
@@ -133,7 +117,6 @@ class CannonWorkerQt(QThread):
         self._stop = True
 
     def _apply_cannon_params(self, params):
-        """Apply Cannon config values from params dict. Returns list of (key, err)."""
         failures = []
         for key, value in params.items():
             applied = False
@@ -163,8 +146,6 @@ class CannonWorkerQt(QThread):
         self._save_status("running", force=True)
 
         while not self._stop:
-            # Handle on-demand capture requests (outside schedule)
-
             now = dt.now()
 
             active_end = None
@@ -183,7 +164,6 @@ class CannonWorkerQt(QThread):
 
             self._active_until = active_end
 
-            # Countdown
             sec = now.second + now.microsecond / 1_000_000
             next_secs = [s for s in self.capture_seconds if s > sec]
             if next_secs:
@@ -233,11 +213,8 @@ class CannonWorkerQt(QThread):
 
 
     def _handle_focus(self, now):
-        """Serve the LAN focus tool between scheduled shots.
-
-        Scheduled captures always take priority: this is skipped on the
-        capture seconds themselves, and a focus session expires by itself if
-        the observer's program goes away, so it can never hold up a run.
+        """Scheduled captures win: skipped on capture seconds, and a focus session
+        expires on its own if the observer's program goes away.
         """
         if self._service is None or not self._service.focus_active():
             return
@@ -266,7 +243,6 @@ class CannonWorkerQt(QThread):
             return capture_image(self.cam)
 
     def _push_live(self, frame, ts=None):
-        """Hand the newest frame to the LAN service (viewer / focus tool)."""
         if self._service is not None:
             try:
                 self._service.publish_frame(frame, ts or dt.now())
@@ -280,8 +256,6 @@ class CannonWorkerQt(QThread):
             cam_info = get_camera_settings_info(self.config)
         except Exception:
             pass
-        # Keep focus_app's view of the camera current — see
-        # worker_common.publish_current_params.
         publish_current_params(self._service, lambda: cam_info)
         payload = {
             "instance_name": self.instance_name,
@@ -304,8 +278,6 @@ class CannonWorkerQt(QThread):
 
 
 class CannonTab(QWidget):
-    """Canon camera measurement control tab."""
-
     def __init__(self, cfg, log_fn):
         super().__init__()
         self._cfg = cfg
@@ -335,7 +307,6 @@ class CannonTab(QWidget):
         panel = QWidget()
         lay = QVBoxLayout(panel)
 
-        # Camera connection
         cam_box = QGroupBox("Canon Camera")
         cam_lay = QHBoxLayout(cam_box)
         self.btn_connect = QPushButton("Connect")
@@ -350,7 +321,6 @@ class CannonTab(QWidget):
         cam_lay.addWidget(self.lbl_model, 1)
         lay.addWidget(cam_box)
 
-        # Session settings
         sess_box = QGroupBox("Session")
         sess_grid = QGridLayout(sess_box)
         sess_grid.setColumnStretch(1, 1)
@@ -373,7 +343,6 @@ class CannonTab(QWidget):
 
         lay.addWidget(sess_box)
 
-        # Schedule
         sched_box = QGroupBox("Measurement Schedule")
         sched_lay = QVBoxLayout(sched_box)
         self.sched_table = QTableWidget(0, 2)
@@ -400,7 +369,6 @@ class CannonTab(QWidget):
         sched_lay.addLayout(sched_btns)
         lay.addWidget(sched_box, 1)
 
-        # Control
         ctrl_box = QGroupBox("Control")
         ctrl_lay = QHBoxLayout(ctrl_box)
         self.btn_start = QPushButton("START")
@@ -452,7 +420,6 @@ class CannonTab(QWidget):
         except ValueError:
             return [0, 30]
 
-    # Camera connection
     def _on_connect(self):
         self.btn_connect.setEnabled(False)
         self.lbl_model.setText("Connecting...")
@@ -489,7 +456,6 @@ class CannonTab(QWidget):
         self.btn_disconnect.setEnabled(False)
         self.btn_start.setEnabled(False)
 
-    # Schedule
     def _add_schedule_row(self):
         row = self.sched_table.rowCount()
         self.sched_table.insertRow(row)
@@ -538,7 +504,6 @@ class CannonTab(QWidget):
                 lines.append(f"{s.text().strip()} - {e.text().strip()}")
         return "\n".join(lines)
 
-    # Measurement control
     def _on_start(self):
         if not self.cam:
             QMessageBox.warning(self, "No camera", "Connect camera first.")
@@ -565,7 +530,6 @@ class CannonTab(QWidget):
             self._log("Schedule is empty — starting in setup mode: live frames "
                       "for focus_app.py, nothing archived.")
         capture_seconds = self._parse_capture_seconds()
-        # LAN frame server: archive browsing + live view for viewer/focus apps
         self._service, self._server = _start_tab_server(
             self._cfg, "cannon", instance_name, output_dir, setup_mode)
 
@@ -628,10 +592,6 @@ class CannonTab(QWidget):
     def cleanup(self):
         self._on_stop()
 
-
-# ===========================================================================
-# SPTT GUI components
-# ===========================================================================
 
 # Binning codes offered in the SPTT tab, in combo-box order.
 SPTT_BINNINGS = [0, 1, 3]
@@ -702,7 +662,6 @@ class SpttCaptureThread(QThread):
 
 
 class SpttScheduledWorkerQt(QThread):
-    """SPTT scheduled capture worker: captures at :00 and :30, saves as FITS."""
     log_msg = pyqtSignal(str, str)
     shot_taken = pyqtSignal(int)
     status_msg = pyqtSignal(str)
@@ -717,13 +676,10 @@ class SpttScheduledWorkerQt(QThread):
         super().__init__()
         from sptt_driver import SPTT_CAPTURE_SECONDS
         self.cam = cam
-        # sptt.debayer, as the console worker reads it.
         self.debayer = bool(debayer)
         self.output_dir = output_dir
         self.instance_name = instance_name
         self.status_dir = status_dir
-        # sptt.capture_seconds, as the console worker reads it; this copy used
-        # to hard-wire :00 and :30 whatever the config said.
         self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self._service = service
         self._stop = False
@@ -738,7 +694,6 @@ class SpttScheduledWorkerQt(QThread):
         self._stop = True
 
     def _apply_sptt_params(self, params):
-        """Apply exposure/gain/binning to SPTT camera. Returns (applied, errors)."""
         applied = {}
         errors = []
         from sptt_driver import ENCODING_12BPP, ENCODING_8BPP
@@ -798,8 +753,6 @@ class SpttScheduledWorkerQt(QThread):
             return
 
         while not self._stop:
-            # Handle on-demand capture requests (outside schedule)
-
             now = dt.now()
 
             remaining = seconds_to_next_capture(now, self.capture_seconds)
@@ -850,16 +803,12 @@ class SpttScheduledWorkerQt(QThread):
         self.finished.emit()
 
     def _current_params(self):
-        """What focus_app should show for this camera, right now."""
         return {"exposure": self.cam.exposure, "gain": self.cam.gain,
                 "binning": self.cam.binning}
 
     def _handle_focus(self, now):
-        """Serve the LAN focus tool between scheduled shots.
-
-        Scheduled captures always take priority: this is skipped on the
-        capture seconds themselves, and a focus session expires by itself if
-        the observer's program goes away, so it can never hold up a run.
+        """Scheduled captures win: skipped on capture seconds, and a focus session
+        expires on its own if the observer's program goes away.
         """
         from sptt_driver import focus_frame_fits
         if self._service is None or not self._service.focus_active():
@@ -883,7 +832,6 @@ class SpttScheduledWorkerQt(QThread):
                 + (" — focus mode disabled" if stopped else ""), "warn"))
 
     def _push_live(self, frame, ts=None):
-        """Hand the newest frame to the LAN service (viewer / focus tool)."""
         if self._service is not None:
             try:
                 self._service.publish_frame(self.cam.for_display(frame), ts or dt.now())
@@ -892,8 +840,6 @@ class SpttScheduledWorkerQt(QThread):
 
     def _save_status(self, status, force=False):
         from sptt_driver import ENCODING_12BPP
-        # Keep focus_app's view of the camera current — see
-        # worker_common.publish_current_params.
         publish_current_params(self._service, self._current_params)
         cam_status = {}
         try:
@@ -924,8 +870,6 @@ class SpttScheduledWorkerQt(QThread):
 
 
 class SpttTab(QWidget):
-    """SPTT camera control tab — live preview + scheduled measurement."""
-
     def __init__(self, cfg, log_fn):
         super().__init__()
         self._cfg = cfg
@@ -946,7 +890,6 @@ class SpttTab(QWidget):
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(2, 2, 2, 2)
 
-        # Left: image display
         self.image_label = QLabel("No image")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(200, 150)
@@ -954,7 +897,6 @@ class SpttTab(QWidget):
         self.image_label.setStyleSheet("background-color: #1a1a1a; color: #888;")
         main_layout.addWidget(self.image_label, stretch=3)
 
-        # Right: controls
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -963,7 +905,6 @@ class SpttTab(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # Connection
         grp_conn = QGroupBox("Connection")
         gl = QVBoxLayout(grp_conn)
         self.btn_connect = QPushButton("Connect")
@@ -981,7 +922,6 @@ class SpttTab(QWidget):
         gl.addLayout(h)
         layout.addWidget(grp_conn)
 
-        # Exposure / Gain
         grp_live = QGroupBox("Exposure / Gain")
         g = QGridLayout(grp_live)
         g.addWidget(QLabel("Exposure (s):"), 0, 0)
@@ -998,13 +938,11 @@ class SpttTab(QWidget):
         g.addWidget(self.spin_gain, 1, 1)
         layout.addWidget(grp_live)
 
-        # Capture params
         grp_cap = QGroupBox("Capture Settings (Apply)")
         g2 = QGridLayout(grp_cap)
         g2.addWidget(QLabel("Binning:"), 0, 0)
         self.combo_binning = QComboBox()
-        # The binnings setup_app and the console wizard offer; the camera has
-        # no 3x3, and the index here is no longer the binning code itself.
+        # The binnings setup_app and the console wizard offer; the camera has no 3x3.
         self.combo_binning.addItems(["0 - 1x1", "1 - 2x2", "3 - 4x4"])
         g2.addWidget(self.combo_binning, 0, 1)
         g2.addWidget(QLabel("Encoding:"), 1, 0)
@@ -1012,8 +950,7 @@ class SpttTab(QWidget):
         self.combo_encoding.addItems(["0 - 8 bit", "1 - 12 bit"])
         self.combo_encoding.setCurrentIndex(1)
         g2.addWidget(self.combo_encoding, 1, 1)
-        # A checkbox rather than "0 means off", which made 0 °C impossible
-        # to ask for.
+        # A checkbox, not "0 means off": 0 °C must stay possible.
         self.chk_temp = QCheckBox("Target Temp:")
         g2.addWidget(self.chk_temp, 2, 0)
         self.spin_temp = QSpinBox()
@@ -1027,7 +964,6 @@ class SpttTab(QWidget):
         g2.addWidget(self.btn_apply, 3, 0, 1, 2)
         layout.addWidget(grp_cap)
 
-        # Scheduled measurement
         grp_meas = QGroupBox("Scheduled Measurement (FITS at :00 and :30)")
         meas_lay = QVBoxLayout(grp_meas)
         m_grid = QGridLayout()
@@ -1071,10 +1007,8 @@ class SpttTab(QWidget):
         scroll.setWidget(panel)
         main_layout.addWidget(scroll, stretch=1)
 
-        # Status bar
         self.lbl_statusbar = QLabel("")
 
-        # Connect signals
         self.btn_connect.clicked.connect(self._on_connect)
         self.btn_reconnect.clicked.connect(self._on_reconnect)
         self.btn_preview_start.clicked.connect(self._on_preview_start)
@@ -1096,8 +1030,7 @@ class SpttTab(QWidget):
         self._period_us = c.get("period_us")
         self._trigmode = c.get("trigmode")
         self._firmware_dir = c.get("firmware_dir", "")
-        # Colour settings (bayer_pattern, debayer, r/g offsets) are not on this
-        # tab either; they come from config.json via the setup form.
+        # Colour settings are not on this tab either; they come from config.json.
         self._sptt_cfg = c
         self.spin_gain.setValue(c.get("gain", 100))
         binning = c.get("binning", 0)
@@ -1206,8 +1139,7 @@ class SpttTab(QWidget):
             self.frame_count = 0
             self.fps_time = now
 
-        # The driver hands every encoding over on the program's 0..65535 scale,
-        # so the preview no longer has to know which one produced the frame.
+        # The driver hands every encoding over on the 0..65535 scale.
         if self.cam is not None:
             # A colour camera's mosaic comes out as (H, W, 3) RGB, the byte
             # order Format_RGB888 reads.
@@ -1256,8 +1188,7 @@ class SpttTab(QWidget):
             try:
                 self.cam.set_exposure(self.spin_exp.value())
             except Exception as e:
-                # An exposure the camera refuses used to vanish here, leaving
-                # the GUI the one place where a truncated exposure was silent.
+                # A refused exposure would otherwise truncate the frame silently.
                 self._log(f"Exposure not applied: {e}", "warn")
 
     def _on_gain_changed(self):
@@ -1267,7 +1198,6 @@ class SpttTab(QWidget):
             except Exception:
                 pass
 
-    # Scheduled measurement
     def _on_meas_start(self):
         if not self.cam:
             QMessageBox.warning(self, "No camera", "Connect SPTT camera first.")
@@ -1277,7 +1207,6 @@ class SpttTab(QWidget):
             QMessageBox.warning(self, "No output", "Select output directory.")
             return
 
-        # Stop preview if running
         if self.capture_thread:
             self._on_preview_stop()
 
@@ -1348,12 +1277,7 @@ class SpttTab(QWidget):
             self.cam.close()
 
 
-# ===========================================================================
-# Infra (SW1300 SWIR) GUI components
-# ===========================================================================
-
 class InfraCaptureThread(QThread):
-    """Continuous frame capture thread for Infra camera live preview."""
     frame_ready = pyqtSignal(np.ndarray)
     fps_updated = pyqtSignal(float)
     error_occurred = pyqtSignal(str)
@@ -1431,7 +1355,6 @@ class InfraCaptureThread(QThread):
 
 
 class InfraWorkerQt(QThread):
-    """Schedule-based capture worker for Infra camera (GUI mode)."""
     log_msg = pyqtSignal(str, str)
     shot_taken = pyqtSignal(int)
     status_msg = pyqtSignal(str)
@@ -1473,7 +1396,6 @@ class InfraWorkerQt(QThread):
                 self.cam.set_exposure(float(params["exposure_us"]))
                 applied["exposure_us"] = float(params["exposure_us"])
             elif "exposure" in params:
-                # Accept seconds for convenience
                 exp_us = float(params["exposure"]) * 1_000_000
                 self.cam.set_exposure(exp_us)
                 applied["exposure_us"] = exp_us
@@ -1502,8 +1424,6 @@ class InfraWorkerQt(QThread):
         self._save_status("running", force=True)
 
         while not self._stop:
-            # Handle on-demand capture requests (outside schedule)
-
             now = dt.now()
 
             active_end = None
@@ -1580,16 +1500,12 @@ class InfraWorkerQt(QThread):
         self.finished.emit()
 
     def _current_params(self):
-        """What focus_app should show for this camera, right now."""
         return {"exposure_us": self.cam.exposure_us, "gain": self.cam.gain,
                 "roi": f"{self.cam.roi_width}x{self.cam.roi_height}"}
 
     def _handle_focus(self, now):
-        """Serve the LAN focus tool between scheduled shots.
-
-        Scheduled captures always take priority: this is skipped on the
-        capture seconds themselves, and a focus session expires by itself if
-        the observer's program goes away, so it can never hold up a run.
+        """Scheduled captures win: skipped on capture seconds, and a focus session
+        expires on its own if the observer's program goes away.
         """
         if self._service is None or not self._service.focus_active():
             return
@@ -1607,7 +1523,6 @@ class InfraWorkerQt(QThread):
                 + (" — focus mode disabled" if stopped else ""), "warn"))
 
     def _push_live(self, frame, ts=None):
-        """Hand the newest frame to the LAN service (viewer / focus tool)."""
         if self._service is not None:
             try:
                 self._service.publish_frame(frame, ts or dt.now())
@@ -1615,8 +1530,6 @@ class InfraWorkerQt(QThread):
                 pass
 
     def _save_status(self, status, force=False):
-        # Keep focus_app's view of the camera current — see
-        # worker_common.publish_current_params.
         publish_current_params(self._service, self._current_params)
         payload = {
             "instance_name": self.instance_name,
@@ -1641,8 +1554,6 @@ class InfraWorkerQt(QThread):
 
 
 class InfraTab(QWidget):
-    """Infra camera (SW1300 SWIR) control tab: live preview + scheduled measurement."""
-
     def __init__(self, cfg, log_fn):
         super().__init__()
         self._cfg = cfg
@@ -1668,7 +1579,6 @@ class InfraTab(QWidget):
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(2, 2, 2, 2)
 
-        # Left: image display
         self.image_label = QLabel("Camera not connected")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(200, 150)
@@ -1676,7 +1586,6 @@ class InfraTab(QWidget):
         self.image_label.setStyleSheet("background-color: #1a1a2e; color: #888; font-size: 14px;")
         main_layout.addWidget(self.image_label, stretch=3)
 
-        # Right: controls
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -1685,7 +1594,6 @@ class InfraTab(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # Connection
         grp_conn = QGroupBox("Infra Camera (SW1300)")
         gl = QVBoxLayout(grp_conn)
         self.btn_connect = QPushButton("Connect")
@@ -1711,7 +1619,6 @@ class InfraTab(QWidget):
         gl.addWidget(self.lbl_fps)
         layout.addWidget(grp_conn)
 
-        # Exposure / Gain
         grp_exp = QGroupBox("Exposure / Gain")
         g = QGridLayout(grp_exp)
 
@@ -1753,7 +1660,6 @@ class InfraTab(QWidget):
 
         layout.addWidget(grp_exp)
 
-        # ROI
         grp_roi = QGroupBox("ROI")
         roi_lay = QHBoxLayout(grp_roi)
         self.roi_combo = QComboBox()
@@ -1764,7 +1670,6 @@ class InfraTab(QWidget):
         roi_lay.addWidget(self.btn_set_roi)
         layout.addWidget(grp_roi)
 
-        # Save format
         grp_fmt = QGroupBox("Save Format")
         fmt_lay = QHBoxLayout(grp_fmt)
         self.combo_format = QComboBox()
@@ -1773,7 +1678,6 @@ class InfraTab(QWidget):
         fmt_lay.addWidget(self.combo_format)
         layout.addWidget(grp_fmt)
 
-        # Scheduled measurement
         grp_meas = QGroupBox("Scheduled Measurement")
         meas_lay = QVBoxLayout(grp_meas)
 
@@ -1794,7 +1698,6 @@ class InfraTab(QWidget):
         m_grid.addWidget(self.le_cap_seconds, 2, 1, 1, 2)
         meas_lay.addLayout(m_grid)
 
-        # Schedule table
         self.sched_table = QTableWidget(0, 2)
         self.sched_table.setHorizontalHeaderLabels(["Start", "End"])
         self.sched_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1886,7 +1789,6 @@ class InfraTab(QWidget):
         except ValueError:
             return [0, 30]
 
-    # --- Camera connection ---
     def _on_connect(self):
         self._log("Connecting to Infra camera...", "info")
         self.btn_connect.setEnabled(False)
@@ -1916,7 +1818,6 @@ class InfraTab(QWidget):
             QMessageBox.critical(self, "Connection Error", str(e))
             self._log(f"Infra connection failed: {e}", "error")
 
-    # --- Live preview ---
     def _on_preview_start(self):
         if not self.cam:
             return
@@ -1957,7 +1858,6 @@ class InfraTab(QWidget):
     def _on_roi_changed(self, w, h):
         self.lbl_cam_status.setText(f"Connected: {w}x{h}")
 
-    # --- Camera controls ---
     def _on_set_exposure(self):
         value = self.exp_spinbox.value()
         if self.capture_thread:
@@ -1983,7 +1883,6 @@ class InfraTab(QWidget):
             self.cam.set_roi(w, h)
         self._log(f"ROI set: {w}x{h}", "info")
 
-    # --- Schedule helpers ---
     def _add_schedule_row(self):
         row = self.sched_table.rowCount()
         self.sched_table.insertRow(row)
@@ -2032,7 +1931,6 @@ class InfraTab(QWidget):
                 lines.append(f"{s.text().strip()} - {e.text().strip()}")
         return "\n".join(lines)
 
-    # --- Scheduled measurement ---
     def _on_meas_start(self):
         if not self.cam:
             QMessageBox.warning(self, "No camera", "Connect Infra camera first.")
@@ -2047,7 +1945,6 @@ class InfraTab(QWidget):
             QMessageBox.warning(self, "Schedule errors", "\n".join(errors))
             return
 
-        # Stop preview if running
         if self.capture_thread:
             self._on_preview_stop()
 
@@ -2136,10 +2033,6 @@ class InfraTab(QWidget):
             self.cam.disconnect()
 
 
-# ===========================================================================
-# Sentry GUI components
-# ===========================================================================
-
 class SentryWorkerQt(QThread):
     log_msg = pyqtSignal(str, str)
     status_msg = pyqtSignal(str)
@@ -2166,12 +2059,6 @@ class SentryWorkerQt(QThread):
         self._stop = True
 
     def _save_status(self, status, force=False):
-        """Publish the status snapshot.
-
-        This used to be missing entirely: the worker computed a status path and
-        then never wrote it, so a sentry camera driven from the GUI was
-        invisible to the monitor and to every observer tool.
-        """
         meta = self.cam.get_metadata()
         payload = {
             "instance_name": self.instance_name,
@@ -2252,7 +2139,6 @@ class SentryWorkerQt(QThread):
         self.finished.emit()
 
     def _archive_and_publish(self, now):
-        """Archive the daemon's latest FITS and hand the frame to the LAN."""
         if self.output_dir:
             path = self.cam.archive_latest_image(self.output_dir, now)
             if path:
@@ -2266,8 +2152,6 @@ class SentryWorkerQt(QThread):
 
 
 class SentryTab(QWidget):
-    """GUI tab for the Sentry (imagerd_rt) camera."""
-
     def __init__(self, cfg: dict, log_fn):
         super().__init__()
         self._cfg = cfg
@@ -2282,7 +2166,6 @@ class SentryTab(QWidget):
         sentry_cfg = self._cfg.get("sentry", {})
         layout = QVBoxLayout(self)
 
-        # Configuration group
         cfg_box = QGroupBox("Sentry Camera (imagerd_rt)")
         cfg_grid = QGridLayout(cfg_box)
         cfg_grid.setColumnStretch(1, 1)
@@ -2309,7 +2192,6 @@ class SentryTab(QWidget):
 
         layout.addWidget(cfg_box)
 
-        # Control buttons
         ctrl_lay = QHBoxLayout()
         self.btn_start = QPushButton("Start Monitoring")
         self.btn_start.clicked.connect(self._on_start)
@@ -2321,7 +2203,6 @@ class SentryTab(QWidget):
         ctrl_lay.addStretch()
         layout.addLayout(ctrl_lay)
 
-        # Status
         status_box = QGroupBox("Status")
         status_lay = QGridLayout(status_box)
         status_lay.addWidget(QLabel("Status:"), 0, 0)
@@ -2344,13 +2225,11 @@ class SentryTab(QWidget):
         status_lay.addWidget(self.lbl_filter, 2, 3)
         layout.addWidget(status_box)
 
-        # Log
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Monospace", 9))
         layout.addWidget(self.log_text, 1)
 
-        # Poll timer for status refresh
         self._poll_timer = QTimer()
         self._poll_timer.setInterval(2000)
         self._poll_timer.timeout.connect(self._refresh_status)
@@ -2391,8 +2270,6 @@ class SentryTab(QWidget):
         sentry_cfg = self._cfg.get("sentry", {})
         capture_seconds = sentry_cfg.get("capture_seconds", [0, 30])
 
-        # The LAN frame server, same as the console entry point — it used
-        # not to be wired up here at all.
         from camera_service import CameraService
         from frame_server import start_frame_server
         from utils import get_node_name
@@ -2460,13 +2337,9 @@ class SentryTab(QWidget):
 
 
 class AsiTab(QWidget):
-    """GUI tab for the ASI all-sky imager (Princeton PIXIS via PICAM).
-
-    The measurement programme is the console worker, unchanged — running a
-    second implementation of the schedule, dark frames and cooling logic in the
-    GUI is exactly the kind of duplication that lets the two drift apart. This
-    tab starts that worker, mirrors its status through the CameraService and
-    shows its log lines, which it receives through a ``console_ui`` sink.
+    """Runs the console worker, unchanged: a second implementation of the schedule, darks
+    and cooling here would drift apart. Status is mirrored through the CameraService;
+    log lines arrive through a ``console_ui`` sink.
     """
 
     log_line = pyqtSignal(str, str)
@@ -2574,7 +2447,6 @@ class AsiTab(QWidget):
         self._poll_timer.timeout.connect(self._refresh_status)
         self._describe_schedule()
 
-    # ------------------------------------------------------------------
     def _describe_schedule(self):
         from cameras.asi import config as asi_config
         try:
@@ -2620,7 +2492,6 @@ class AsiTab(QWidget):
         # Called from the worker thread — hop to the GUI thread via the signal.
         self.log_line.emit(str(msg), str(level).lower())
 
-    # ------------------------------------------------------------------
     def _on_start(self):
         import console_ui
         from cameras.asi import config as asi_config
@@ -2754,16 +2625,7 @@ class AsiTab(QWidget):
 
 
 class JapanTab(QWidget):
-    """GUI tab for the Japan all-sky imager (Hamamatsu via DCAM-API).
-
-    Same arrangement as :class:`AsiTab`, and for the same reason: the measurement
-    programme is the console worker, unchanged. This tab starts that worker,
-    mirrors its status through the CameraService and shows its log lines.
-
-    The status block has no setpoint reading — this camera reports a sensor
-    temperature and has nothing to set it to. The schedule summary knows the same
-    three modes as the ASI tab's.
-    """
+    """Same arrangement as :class:`AsiTab`: runs the console worker, unchanged."""
 
     log_line = pyqtSignal(str, str)
 
@@ -2872,7 +2734,6 @@ class JapanTab(QWidget):
         self._poll_timer.timeout.connect(self._refresh_status)
         self._describe_schedule()
 
-    # ------------------------------------------------------------------
     def _describe_schedule(self):
         from cameras.japan import config as japan_config
         try:
@@ -2918,7 +2779,6 @@ class JapanTab(QWidget):
         # Called from the worker thread — hop to the GUI thread via the signal.
         self.log_line.emit(str(msg), str(level).lower())
 
-    # ------------------------------------------------------------------
     def _on_start(self):
         import console_ui
         from cameras.japan import config as japan_config
@@ -2967,8 +2827,8 @@ class JapanTab(QWidget):
             return
 
 
-        # No setpoint-limit publishing counterpart: every field in this camera's
-        # focus_app schema has a range that is known without asking the hardware.
+        # No setpoint limits to publish: every field in this camera's focus_app schema has
+        # a range known without asking the hardware.
         self._service = CameraService("japan", instance, conf.output_dir,
                                       node_name=node_name,
                                       setup_mode=setup_mode)
@@ -3047,10 +2907,6 @@ class JapanTab(QWidget):
             self._on_finished()
 
 
-# ===========================================================================
-# Main Window
-# ===========================================================================
-
 class MainWindow(QMainWindow):
     def __init__(self, cfg, camera_type=None, config_path=None):
         super().__init__()
@@ -3058,9 +2914,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(700, 450)
         self.resize(1100, 750)
         self._cfg = cfg
-        # Remember where the config came from: closeEvent used to save to the
-        # default config.json regardless of --config, writing settings into
-        # the wrong file.
+        # closeEvent rewrites this file, so it must honour --config.
         self._config_path = config_path
         self._tabs = {}
         self._build_ui(camera_type)
@@ -3073,7 +2927,6 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
 
 
-        # Tabs
         self.tab_widget = QTabWidget()
 
         if camera_type is None or camera_type == "cannon":
@@ -3106,13 +2959,11 @@ class MainWindow(QMainWindow):
             self.tab_widget.addTab(self._japan_tab, "Japan Camera")
             self._tabs["japan"] = self._japan_tab
 
-        # Monitor tab
         self._monitor = MonitorWidget()
         self.tab_widget.addTab(self._monitor, "Monitor")
 
         root.addWidget(self.tab_widget, 1)
 
-        # Log
         log_box = QGroupBox("Log")
         log_lay = QVBoxLayout(log_box)
         log_lay.setContentsMargins(4, 4, 4, 4)
@@ -3138,12 +2989,8 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-# ===========================================================================
-# Entry point
-# ===========================================================================
 def run_gui(args):
-    """Launch the GUI application."""
-    # Fix Qt platform plugin conflict with OpenCV
+    # Qt platform plugin conflict with OpenCV.
     try:
         import PyQt5 as _pyqt5
         _qt_plugins = os.path.join(os.path.dirname(_pyqt5.__file__), "Qt5", "plugins")

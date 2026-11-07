@@ -1,74 +1,23 @@
-"""
-Japan all-sky imager driver: Hamamatsu camera (DCAM-API) + filter wheel.
+"""Japan all-sky imager: Hamamatsu camera (DCAM-API) + filter wheel.
 
-This is the every-camera front for the hardware in ``cameras/japan/``. It keeps the
-measurement programme of the standalone japan-camera application intact — pre-darks
-timed to the window, its two schedule modes, post-darks on Ctrl+C — adds the
-ASI imager's ``sun_cycle`` mode, and adds what every other camera in this program
-already has: status files for the monitor, the LAN frame server with UDP discovery, live view and remote
-parameter editing for ``focus_app.py``, preview mode, and the shared console
-dashboard.
+Every DCAM and serial call happens on the worker thread: two threads must never
+issue DCAM calls at once. HTTP handlers reach the camera only through CameraService.
 
-japan-camera is the ancestor of the ``asi`` driver, so the two are deliberately
-close: the sun-mode, time-mode and sun_cycle loops here are the same loops, and the shared
-schedule arithmetic, filter wheel, intensity control and FITS core live in
-``cameras/common/``. What this driver does *not* have is what the Hamamatsu
-itself does not offer — no analog gain, and no managed setpoint: cooling is a
-switch (``japan.cooling``), thrown ``lead_minutes`` before the pre-darks and
-again once a night is over, and only on a model that lets DCAM throw it. In the
-sun modes a night ends by returning to ``run()``, which shuts the shutter
-(``_end_night``) before planning the next one.
+Every wait runs through JapanWorkerConsole._service_tick: the gaps between exposures
+are where parameters, focus frames and status are served. A focus frame is taken
+only when it fits before the next slot, so live view can never delay a measurement.
 
-Two rules govern the threading, both inherited from the original program because
-both are load-bearing:
+The Hamamatsu has no analog gain and no managed setpoint: cooling is a switch
+(japan.cooling), thrown lead_minutes before the pre-darks and again once a night is
+over, and only on a model that lets DCAM throw it.
 
-* **Every DCAM and serial call happens on the worker thread.** HTTP handlers reach
-  the camera only through :class:`camera_service.CameraService`; the console
-  renderer only reads a state dict. The original avoided two threads issuing DCAM
-  calls at once by joining its prep thread before each capture, and this driver
-  avoids it by never starting one.
-* **Nothing waits without servicing the rest.** The gaps between exposures are
-  where parameter changes are applied, focus frames are served and status is
-  published — see :meth:`JapanWorkerConsole._service_tick`, which every wait in
-  this driver runs through, including the one that waits for the operator's
-  Enter. A focus frame is only taken when it comfortably fits before the next
-  scheduled slot, so live view can never delay a measurement; when it does not
-  fit, the reason is published rather than swallowed. A focus session opens the
-  shutter for itself and shuts it again afterwards, except during a dark run,
-  which owns the shutter outright.
-
-Schedule modes (``japan.mode`` in config.json):
-
-    sun    Entries fire on given seconds of every minute while the solar altitude
-           stays at or below ``sun_max_angle``. Pre-darks are timed to finish just
-           as that window opens, and the closing darks are synced the same way.
-    time   One general cycle repeats, phase-locked to ``t_start``; each entry has
-           its offset (``delta``), filter, exposure and binning. Started on time,
-           the opening darks are shot first; started late, they are skipped and
-           only the closing ones are taken.
-    sun_cycle
-           The same general cycle, started by the sun: nothing is exposed until
-           the altitude reaches ``sun_max_angle``, the pre-darks finish as that
-           happens, and the cycle runs until sunrise, night after night. Its
-           phase is locked to ``t_start`` read as **UTC**, so the run joins the
-           cycle at whichever slot is due and stations at different sites run
-           in step — with each other and with the ASI imager's ``sun_cycle``.
-           This mode also carries that imager's two intensity-control loops
-           (``cameras/common/exposure.py``): the ``preflight`` stage, which
-           opens the session one solar setpoint earlier and holds a mean frame
-           intensity instead of reading the exposure from the schedule, and the
-           ``overexposure`` guard, which divides an over-bright slot into
-           shorter sub-frames on its next visit. Both are off by default, and
-           both belong to this mode alone — the ``time`` mode is still the plain
-           programme the standalone application ran.
-
-In ``sun`` and ``time`` mode frames are filed flat into ``<output_dir>`` under
-the original's own name — see ``cameras/japan/paths.py``, which also explains why
-the stamp is UTC. In ``sun_cycle`` mode they go into the ASI archive layout
-instead (``cameras/common/archive_paths.py``), named with the site's name
-(``japan.location.name``) and the instrument's (``japan.name``), with the ASI
-header set minus every card that describes the camera and its software, plus
-``NAME`` — see ``cameras/japan/fits.py``.
+Schedule modes (japan.mode):
+  sun        entries on given seconds of every minute while the sun is at or below
+             sun_max_angle; frames filed flat
+  time       one cycle phase-locked to t_start; frames filed flat
+  sun_cycle  that cycle started by the sun, with t_start read as UTC so stations
+             at different sites run in step; the only mode with the preflight and
+             overexposure loops, filed in the ASI archive layout
 """
 import os
 import sys
@@ -97,15 +46,15 @@ from cameras.japan import config as japan_config
 from cameras.japan import devices, paths as japan_paths
 from cameras.japan.fits import write_fits, write_sun_cycle_fits
 from cameras.common import archive_paths
-# Imported as a module for the same reason as the schedule below: tests reach the
-# controllers through ``japan_driver.japan_exposure``.
+# A module, not names: tests reach the controllers through
+# ``japan_driver.japan_exposure``.
 from cameras.common import exposure as japan_exposure
 from cameras.common.seqno import next_seqno
-# Imported as a module rather than by name so a test can patch the timing helpers
-# through ``japan_driver.japan_schedule``.
+# A module, not names: tests patch the timing helpers through
+# ``japan_driver.japan_schedule``.
 from cameras.common import schedule as japan_schedule
-# Safe to import here: the wheel module pulls in pyserial only when it opens a
-# port, so a machine with no hardware still imports this driver.
+# Safe here: the wheel module imports pyserial only when it opens a port, so a
+# machine with no hardware still imports this driver.
 from cameras.common.filterwheel import HOME as FILTER_HOME
 
 # How much slack a focus frame needs before the next scheduled capture: the
@@ -117,15 +66,13 @@ FOCUS_SLACK_SECONDS = 3.0
 # focus session starts being served promptly.
 TICK = 0.2
 
-# Words that may stand for a shutter state. A remote parameter arrives as JSON
-# from focus_app (a real bool) or hand-typed in a config, and "closed" must never
-# be read as truthy just because it is a non-empty string.
+# A remote value arrives as JSON from focus_app or hand-typed in a config, and
+# "closed" must never be truthy just because it is a non-empty string.
 _TRUE_WORDS = {"1", "true", "yes", "on", "open", "opened"}
 _FALSE_WORDS = {"0", "false", "no", "off", "closed", "close", "shut"}
 
 
 def _as_bool(value):
-    """Interpret a remote on/off value, refusing anything ambiguous."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -143,21 +90,15 @@ def _shutter_text(state):
 
 
 def _filter_text(position):
-    """Word a wheel position. Home is a place; unknown is a failed move."""
+    """Home is a place; unknown is a failed move."""
     if position is None:
         return "unknown"
     return "home" if position == FILTER_HOME else str(position)
 
 
-# ---------------------------------------------------------------------------
-# Hardware facade
-# ---------------------------------------------------------------------------
 class JapanCamera:
-    """Camera + filter wheel as one object, with a single open/close lifecycle.
-
-    The two devices are always used together (an exposure is meaningless without
-    a known filter and shutter state), and both are context managers, so this
-    holds their contexts and exposes the handful of operations the worker needs.
+    """Camera and filter wheel with one lifecycle: an exposure is meaningless without a
+    known filter and shutter state.
     """
 
     def __init__(self, cfg: japan_config.JapanConfig):
@@ -166,16 +107,14 @@ class JapanCamera:
         self.wheel = None
         self._info = {}
         self._opened = False
-        # True once ``japan.cooling`` asked for the cooler to be driven *and* the
-        # camera turned out to allow it. Everything cooling-related is a no-op
-        # otherwise, and the camera keeps cooling itself as it always has.
+        # True once ``japan.cooling`` asked for the cooler and the camera allows it.
+        # Otherwise everything cooling-related is a no-op and the camera cools itself.
         self.cooling_controlled = False
         # Whether "off" is among the modes the camera accepts. Some models (a
         # C11090-22B: SENSORCOOLER 2..4) only go between on and max, and every
         # attempt to switch them off is refused.
         self.cooler_off_allowed = False
 
-    # -- lifecycle -----------------------------------------------------------
     def open(self):
         self.cam = devices.make_camera(self.cfg)
         self.wheel = devices.make_wheel(self.cfg)
@@ -187,9 +126,8 @@ class JapanCamera:
             self.cam.__exit__(None, None, None)
             self._opened = False
             raise
-        # The controller never volunteers the shutter's state, so command it
-        # shut: after this the state reported to focus_app is a fact rather than
-        # an assumption, and closed is where every run starts anyway.
+        # The controller never volunteers the shutter's state, so command it shut: what
+        # focus_app is told is then a fact, not an assumption.
         try:
             self.set_shutter(False)
         except Exception as exc:
@@ -240,7 +178,6 @@ class JapanCamera:
             console_ui.warn(f"Camera close: {exc}")
         self._opened = False
 
-    # -- state ---------------------------------------------------------------
     @property
     def info(self):
         return dict(self._info)
@@ -264,13 +201,10 @@ class JapanCamera:
 
     @property
     def filter_number(self):
-        """The position as a number for file names and FITS headers.
+        """An unconfirmed move is recorded as 0.
 
-        An unconfirmed move leaves the position unknown, and a frame still has to
-        be saved; the archive records that as 0, which is what the original wrote
-        for a wheel it had not moved yet. Nothing outside this property may read
-        ``wheel.current_filter`` for a name or a header — ``None`` would file the
-        frame as ``..._None.fits`` and leave ``FILTER`` blank.
+        Nothing else may read ``wheel.current_filter`` for a name or a header: None would
+        file the frame as ``..._None.fits`` and leave FILTER blank.
         """
         position = self.wheel.current_filter
         return FILTER_HOME if position is None else position
@@ -298,7 +232,6 @@ class JapanCamera:
     def info_rows(self):
         return self.cam.info_rows()
 
-    # -- control -------------------------------------------------------------
     def set_exposure(self, seconds):
         self.cam.set_exposure(float(seconds))
 
@@ -328,20 +261,11 @@ class JapanCamera:
         return self.cam.capture()
 
     def prepare(self, entry, exposure=None, binning=None):
-        """Apply one schedule entry's exposure, binning and filter.
+        """Apply one schedule entry; True when everything asked for is set.
 
-        Returns True when everything asked for is set. A filter that did not
-        arrive gives False, having already said so: the result used to be
-        dropped here, and a wheel that never got where it was sent left no trace
-        anywhere except a frame filed with position 0.
-
-        ``exposure`` overrides the entry's own. The ``sun_cycle`` preflight stage
-        and its overexposure guard both choose the exposure themselves, and the
-        camera has to hold exactly what the file name and ``EXPTIME`` will claim
-        — so there is one value, applied here, rather than two that could drift
-        apart. ``binning`` likewise overrides the entry's own, for the preflight
-        stage, which holds one binning from config across every slot. No gain:
-        this camera has none.
+        A filter that did not arrive gives False, having already said so. ``exposure`` and
+        ``binning`` override the entry's own: the camera has to hold exactly what the file
+        name and EXPTIME will claim.
         """
         wanted = entry.exposure if exposure is None else float(exposure)
         if wanted is not None and self.current_exposure != wanted:
@@ -354,7 +278,7 @@ class JapanCamera:
         return True
 
     def temperature_fields(self):
-        """The sensor readings for the console, taken on the worker thread only."""
+        """Worker thread only."""
         fields = {"ccd_temp": self.temperature()}
         if self.cooling_controlled:
             fields["cooler"] = self.cooler_status()
@@ -362,17 +286,11 @@ class JapanCamera:
         return fields
 
 
-# ---------------------------------------------------------------------------
-# Console worker
-# ---------------------------------------------------------------------------
 class JapanWorkerConsole(threading.Thread):
-    """Runs the Japan measurement programme and publishes it to the rest of the app."""
-
     MAX_CONSECUTIVE_ERRORS = 5
 
-    # How many seconds forward the frame name may be nudged to find a free one.
-    # Enough for a full run of back-to-back darks (``dark_frames`` up to 9), which
-    # is the case that actually collides — see :meth:`_unique_frame_path`.
+    # Seconds the frame name may be nudged forward: enough for a run of back-to-back
+    # darks (``dark_frames`` up to 9), the case that actually collides.
     NAME_ATTEMPTS = 10
 
     def __init__(self, cam: JapanCamera, cfg: japan_config.JapanConfig, output_dir,
@@ -393,20 +311,14 @@ class JapanWorkerConsole(threading.Thread):
         self._stop_event = threading.Event()
         self._force_quit = False
         self._shots = 0
-        # Lights taken in the session running right now, as opposed to the run
-        # total above. Closing darks bracket a session, and in sun mode one run
-        # spans many nights: without this, a stop at noon — the moment an
-        # operator picks to update the machine — would shoot a set of darks for
-        # a night that ended hours earlier.
+        # Lights of the current session, not the run: in sun mode one run spans many nights,
+        # and a stop at noon must not shoot darks for a night that ended hours earlier.
         self._session_shots = 0
         self._darks = 0
         self._errors = 0
         self._last_shot = None
         self._last_file = None
         self._last_frame = None
-        # Intensity control: what the last frame measured, which stage the
-        # sun_cycle is in, and what the two loops currently ask of a slot. In
-        # every other mode these keep their initial values and cost nothing.
         self._last_mean = None
         self._last_saturation = 0.0
         self._stage = "main"
@@ -433,9 +345,6 @@ class JapanWorkerConsole(threading.Thread):
         # anything, so the first command always goes out.
         self._cooler_commanded = None
 
-    # ------------------------------------------------------------------
-    # Stop handling
-    # ------------------------------------------------------------------
     def request_stop(self, force=False):
         """Ask the run to end. The first call still shoots the closing darks."""
         if force or self._stop_event.is_set():
@@ -447,9 +356,6 @@ class JapanWorkerConsole(threading.Thread):
     def stopping(self):
         return self._stop_event.is_set()
 
-    # ------------------------------------------------------------------
-    # Dashboard / status
-    # ------------------------------------------------------------------
     def _dash_update(self, **fields):
         if self._dash is not None:
             self._dash.update(**fields)
@@ -482,11 +388,7 @@ class JapanWorkerConsole(threading.Thread):
         return rows
 
     def _intensity_row(self):
-        """The dashboard's intensity line; empty when neither loop is driving.
-
-        Word for word the ASI driver's, so an operator watching the two consoles
-        side by side reads one thing, not two.
-        """
+        """Same wording as the ASI driver: an operator may watch both consoles side by side."""
         mean = ("" if self._last_mean is None
                 else f"  ·  last mean {self._last_mean:.0f} ADU")
         if self._stage == "preflight":
@@ -533,10 +435,7 @@ class JapanWorkerConsole(threading.Thread):
             "shutter": self.cam.shutter_open,
             "next_slot": self._next_slot.isoformat() if self._next_slot else None,
             "setup_mode": self.setup_mode,
-            # Intensity control, for the monitor: which sun_cycle stage is
-            # running, what the automatic exposure settled on, how far the
-            # current slot is divided, and what the last frame measured. Same
-            # keys as the ASI imager publishes, so one monitor reads both.
+            # Same keys as the ASI imager, so one monitor reads both.
             "stage": self._stage,
             "auto_exposure": self._auto_exposure,
             "split_frames": self._split_frames,
@@ -564,9 +463,6 @@ class JapanWorkerConsole(threading.Thread):
                           last_file=self._last_file)
         self._bus.publish_status(payload, force=force)
 
-    # ------------------------------------------------------------------
-    # Live view + remote parameters
-    # ------------------------------------------------------------------
     def _current_params(self):
         return {
             "exposure": self.cam.current_exposure,
@@ -577,7 +473,7 @@ class JapanWorkerConsole(threading.Thread):
         }
 
     def _apply_params(self, params):
-        """Apply a parameter change from focus_app. Worker thread only."""
+        """Worker thread only."""
         applied, errors = {}, []
         for name, value in (params or {}).items():
             try:
@@ -616,14 +512,11 @@ class JapanWorkerConsole(threading.Thread):
                     is_open = _as_bool(value)
                     self.cam.set_shutter(is_open)
                     applied[name] = is_open
-                    # From here the operator owns the shutter for the rest of the
-                    # session: a focus session opens it by itself, and that must
-                    # never undo somebody deliberately closing it from focus_app.
+                    # The operator owns the shutter for the rest of the session: focus opening it by
+                    # itself must never undo somebody deliberately closing it.
                     self._focus_shutter_manual = True
                     self._focus_opened_shutter = False
-                    # Only the darks are supposed to shoot shut. Closing it from
-                    # focus_app during a run would quietly turn every scheduled
-                    # frame into a dark, so say so where the operator will see it.
+                    # Closing it during a run turns every scheduled frame into a dark.
                     if not is_open and not self.setup_mode:
                         console_ui.warn(
                             "Shutter closed remotely — scheduled frames stay "
@@ -639,7 +532,7 @@ class JapanWorkerConsole(threading.Thread):
         return applied, errors
 
     def _serve_params(self):
-        """Apply any pending remote parameter request. Safe only between exposures."""
+        """Safe only between exposures."""
         if self._service is None or not self._service.has_param_request():
             return
         req_id, params = self._service.take_param_request()
@@ -657,11 +550,8 @@ class JapanWorkerConsole(threading.Thread):
     def _shutter_for_focus(self):
         """Open the shutter for a focus session; put it back when one ends.
 
-        Without this, focusing before the programme has opened the shutter —
-        which is every moment between opening the camera and the post-dark
-        ``set_shutter(True)`` — returns black frames, and the operator has no way
-        to tell a shut shutter from a broken camera. A dark run keeps the
-        shutter: opening it there would silently turn darks into light frames.
+        A shut shutter gives black frames, which look like a broken camera. A dark run keeps
+        the shutter: opening it there would turn darks into light frames.
         """
         if self._darks_running:
             return False
@@ -670,8 +560,7 @@ class JapanWorkerConsole(threading.Thread):
             self._focus_close_shutter()
             self._focus_shutter_manual = False
             return False
-        # The operator set the shutter by hand from focus_app; that outranks any
-        # guess made here, for as long as the session lasts.
+        # Set by hand from focus_app: that outranks any guess made here.
         if self._focus_shutter_manual:
             return True
         if not self.cam.shutter_open:
@@ -686,7 +575,6 @@ class JapanWorkerConsole(threading.Thread):
         return True
 
     def _focus_close_shutter(self):
-        """Shut the shutter again, but only if a focus session is what opened it."""
         if not self._focus_opened_shutter:
             return
         self._focus_opened_shutter = False
@@ -699,7 +587,6 @@ class JapanWorkerConsole(threading.Thread):
         self._refresh_camera_section()
 
     def _serve_focus(self, slack):
-        """Grab one live frame for focus_app, if it fits in ``slack`` seconds."""
         if self._service is None or not self._service.focus_active():
             return
         if self._darks_running:
@@ -710,8 +597,8 @@ class JapanWorkerConsole(threading.Thread):
         # In setup mode there is no scheduled capture to be late for, so a long
         # exposure must not be refused just because the idle tick is shorter.
         if not self.setup_mode and slack is not None and slack < needed:
-            # A live frame must never push a scheduled one late. Silent refusal
-            # is what made this look like a broken camera, so say it instead.
+            # A live frame must never push a scheduled one late. Say so: a silent refusal
+            # looks like a broken camera.
             self._focus_note(f"next scheduled frame in {slack:.0f} s — a live "
                              f"frame needs about {needed:.0f} s")
             return
@@ -724,21 +611,14 @@ class JapanWorkerConsole(threading.Thread):
         self._focus_note("")
         self._dash_update(focus="active")
 
-    # ------------------------------------------------------------------
-    # Waiting
-    # ------------------------------------------------------------------
     def _service_tick(self, slack, status="running", last_status=0.0, readings=None,
                       allow_focus=True):
         """Everything that has to keep happening while the worker is not exposing.
 
-        Parameter changes, on-demand captures, status publication and focus
-        frames. Every wait in this driver runs through here, which is what makes
-        an observer's focus session work whatever the worker is doing —
-        including while it waits for the operator's Enter, where a hand-rolled
-        copy of this loop used to serve parameters but not focus.
+        Every wait in this driver runs through here, so a focus session works whatever the
+        worker is doing; a hand-rolled copy of this loop falls out of step.
 
-        Returns the (possibly refreshed) ``(last_status, readings)`` pair so a
-        caller can keep throttling its status publication across ticks.
+        Returns ``(last_status, readings)`` so a caller can throttle status across ticks.
         """
         if time.monotonic() - last_status >= 2.0:
             last_status = time.monotonic()
@@ -752,24 +632,17 @@ class JapanWorkerConsole(threading.Thread):
         return last_status, readings
 
     def _wait_until(self, target, phase=None, allow_focus=True):
-        """Idle until ``target``, serving focus, parameters and status meanwhile.
-
-        Returns True if the moment was reached, False if a stop was requested.
-        This is the only place the driver sleeps during a run: everything that
-        has to keep happening between exposures happens in :meth:`_service_tick`.
-        """
+        """Idle until ``target`` through _service_tick; False if a stop was requested."""
         if phase:
             self._set_phase(phase)
-        # In setup mode this is an idle tick, not a scheduled capture;
-        # publishing it as "next slot" would tell the monitor a measurement was due.
+        # In setup mode this is an idle tick, not a capture the monitor should expect.
         self._next_slot = (target if isinstance(target, dt) and not self.setup_mode
                            else None)
         self._dash_update(next_at=self._next_slot)
         last_status = 0.0
         readings = None
-        # Before the wait, not only inside it: a slot whose moment has already
-        # passed leaves the loop below immediately, and on a tight schedule that
-        # is every slot — a hold checked only in the loop would never be seen.
+        # Before the wait too: a slot already past leaves the loop at once, and on a tight
+        # schedule that is every slot, so a hold checked only in the loop is never seen.
         if allow_focus and self._hold_for_focus():
             self._next_slot = None
             self._dash_update(next_at=None)
@@ -778,12 +651,10 @@ class JapanWorkerConsole(threading.Thread):
             remaining = (target - dt.now()).total_seconds()
             if remaining <= 0:
                 break
-            # Checked before the tick, not after: a hold serves its own frames
-            # with no slack limit, so letting the tick go first would take one
-            # slack-limited frame — or refuse one — for no reason.
+            # Before the tick: a hold serves its own frames with no slack limit, so the tick
+            # would take or refuse one slack-limited frame for no reason.
             if allow_focus and self._hold_for_focus():
-                # The operator took the camera. The slot we were waiting for
-                # is gone; the caller re-reads the schedule.
+                # The slot is gone; the caller re-reads the schedule.
                 break
             last_status, readings = self._service_tick(
                 remaining, last_status=last_status, readings=readings,
@@ -799,12 +670,9 @@ class JapanWorkerConsole(threading.Thread):
     def _hold_for_focus(self):
         """Stand down while somebody is focusing. True if a hold happened.
 
-        The same contract as the PIXIS driver's: connecting the focus tool stops
-        the schedule outright rather than squeezing live frames into whatever
-        gap a slot leaves, and the operator agrees to that in focus_app before
-        it happens. A capture already under way is never interrupted — this is
-        only reached between them — and an abandoned session releases the camera
-        when its deadline passes.
+        The operator agrees to this in focus_app. A capture under way is never interrupted:
+        this is only reached between them. An abandoned session releases the camera at its
+        deadline.
         """
         if (self.setup_mode or self._service is None
                 or not self._service.focus_hold()):
@@ -820,9 +688,8 @@ class JapanWorkerConsole(threading.Thread):
         last_status = 0.0
         readings = None
         while not self._stop_event.is_set() and self._service.focus_hold():
-            # ``slack=None``: the schedule is standing down, so there is no slot
-            # for a live frame to be late for. Same servicing step as every
-            # other wait, which is what also opens the shutter for the session.
+            # ``slack=None``: no slot for a live frame to be late for. This step is also what
+            # opens the shutter for the session.
             last_status, readings = self._service_tick(
                 None, status=SETUP_STATUS, last_status=last_status,
                 readings=readings)
@@ -838,13 +705,9 @@ class JapanWorkerConsole(threading.Thread):
         return True
 
     def _closing_darks_due(self):
-        """Whether there is a session for closing darks to bracket.
+        """Darks bracket a session that had lights in it.
 
-        Darks bracket a measurement session. There is nothing to bracket when
-        none has run — stopped while still waiting for the start signal or the
-        sun — nor between nights, once the session that had lights in it is over
-        and the next one has not begun. The ASI driver says the same thing in
-        the same words; the reasoning is the wheel-independent half of a run.
+        A stop before the first light or between nights must not cost a full set of darks.
         """
         if self._force_quit or self.setup_mode:
             return False
@@ -853,11 +716,8 @@ class JapanWorkerConsole(threading.Thread):
     def _prepare_entry(self, entry, **kwargs):
         """Apply one schedule entry; False if the preparation itself broke.
 
-        A filter that simply did not arrive is not that: the frame is still
-        worth taking, and it is filed with whatever the wheel reports, so the
-        failure is counted, published and logged rather than costing the slot.
-        The ASI driver says the same thing in the same words — one wheel, one
-        way of failing.
+        A filter that did not arrive is not that: the frame is still worth taking and is
+        filed with what the wheel reports, so the failure is counted and published instead.
         """
         try:
             arrived = self.cam.prepare(entry, **kwargs)
@@ -880,9 +740,8 @@ class JapanWorkerConsole(threading.Thread):
     def _take_schedule_dirty(self):
         """True once after a focus hold, so a mode loop plans its next slot again.
 
-        Reading it clears it: the slot the loop waited for passed while the
-        camera was held, and shooting it now would file a frame under a time
-        that has gone by. Missed slots are not made up.
+        The awaited slot passed during the hold and is not made up: shooting it now would
+        file a frame under a time gone by.
         """
         dirty = self._schedule_dirty
         self._schedule_dirty = False
@@ -893,10 +752,11 @@ class JapanWorkerConsole(threading.Thread):
                                 allow_focus)
 
     def _measuring_now(self):
-        """Is the observing programme running at this moment?
+        """What focus_app asks before it connects.
 
-        What focus_app asks before it connects; see the PIXIS driver for why
-        the waiting phases deliberately do not count.
+        The gap between two slots counts: taking the camera there costs the next frame.
+        Waiting for the window to open does not, so a camera idling through the day can be
+        focused with no confirmation.
         """
         if self.setup_mode:
             return False
@@ -912,16 +772,10 @@ class JapanWorkerConsole(threading.Thread):
         if detail is not None:
             self._dash_update(detail=detail)
 
-    # ------------------------------------------------------------------
-    # Capture
-    # ------------------------------------------------------------------
     @property
     def _archive_layout(self):
-        """True when frames go into the ASI archive layout (``sun_cycle`` mode).
-
-        A property of the whole run, darks included: a session's darks are
-        filed beside its lights, under the same naming, or the processing
-        program would never pair them.
+        """True in ``sun_cycle`` mode, darks included: a session's darks are filed beside its
+        lights, or the processing program would never pair them.
         """
         return self.cfg.schedule.mode == "sun_cycle"
 
@@ -955,8 +809,7 @@ class JapanWorkerConsole(threading.Thread):
                 split_index=split_index,
             )
             return
-        # The flat layout is the standalone program's, and nothing in ``sun`` or
-        # ``time`` mode drives the intensity — so the measurement is not written.
+        # Nothing in ``sun`` or ``time`` mode drives the intensity, so no measurement is written.
         write_fits(
             Path(path), image,
             timestamp=timestamp,
@@ -979,23 +832,15 @@ class JapanWorkerConsole(threading.Thread):
         )
 
     def _unique_frame_path(self, now, dark=False, exposure=None, preflight=False):
-        """A free path for this frame, or None when the second is hopelessly full.
+        """A free path for this frame, or None when the seconds are hopelessly full.
 
-        The name resolves to one second and ``write_fits`` refuses to overwrite, so
-        two frames taken inside the same second at the same filter collide. That is
-        not a corner case here: the ``time``-mode dark run is back-to-back with no
-        second-sync, so any exposure under a second used to raise partway through
-        and abandon the rest of the darks.
+        Names resolve to one second and write_fits refuses to overwrite, and ``time``-mode
+        darks run back-to-back with no second-sync, so sub-second exposures do collide. The
+        name's second is nudged forward, so name and header may differ: believe DATE-OBS.
 
-        The name's second is nudged forward until it is free. ``DATE-OBS`` keeps the
-        true start of the exposure, so a name and a header can then disagree by a
-        second or two; the header is the one to believe.
-
-        In ``sun_cycle`` mode the name is the ASI archive's instead —
-        ``YYYY/MM/DD/YYYYMMDD_hhmmss_SITE_NAME_WAVE_EEEEEEms[_DARK][_pf].fits`` —
-        with the site name and the instrument name from config.json. ``_pf``
-        marks a frame shot by the preflight stage, so the automatic twilight can
-        be told from the main programme without opening the file.
+        In ``sun_cycle`` mode the name is the ASI archive's,
+        ``YYYY/MM/DD/YYYYMMDD_hhmmss_SITE_NAME_WAVE_EEEEEEms[_DARK][_pf].fits``, where
+        ``_pf`` marks a preflight frame.
         """
         for offset in range(self.NAME_ATTEMPTS):
             when = now + timedelta(seconds=offset)
@@ -1017,7 +862,6 @@ class JapanWorkerConsole(threading.Thread):
 
     def _capture_one(self, now, exposure, image_type="LIGHT", obs_mode=None,
                      label=None, split_count=1, split_index=1):
-        """Take, save and publish one frame. Returns True on success."""
         obs_mode = obs_mode or self.cfg.schedule.mode
         readings = self._refresh_camera_section()
         label = label or f"{image_type} filter={_filter_text(self.cam.current_filter)}"
@@ -1052,8 +896,7 @@ class JapanWorkerConsole(threading.Thread):
             self._bus.publish_error("error", "frame name collision",
                                     ts_iso=now.isoformat())
             return False
-        # Shown on the dashboard and in the log. In the dated archive layout
-        # the date tree is part of what identifies the frame; flat, it is not.
+        # In the dated layout the date tree identifies the frame; flat, it does not.
         name = (str(path.relative_to(self.output_dir)) if self._archive_layout
                 else path.name)
         try:
@@ -1082,10 +925,8 @@ class JapanWorkerConsole(threading.Thread):
             self._shots += 1
             self._session_shots += 1
         if self._service is not None:
-            # ``path`` so the frame server can read this frame's own FITS header
-            # back off the disk it was just written to: the observer's info panel
-            # is otherwise empty for a live frame, there being no header here to
-            # publish and no cheap way to build one.
+            # ``path`` lets the frame server read this frame's FITS header back off the disk
+            # for the observer's info panel: a live frame has no header to publish.
             self._service.publish_frame(image, now, {"image_type": image_type,
                                                      "filter": self.cam.current_filter,
                                                      "exposure": exposure,
@@ -1101,17 +942,11 @@ class JapanWorkerConsole(threading.Thread):
         return True
 
     def _capture_slot(self, entry, exposure, frames, obs_mode):
-        """Shoot one cycle slot: ``frames`` back-to-back sub-frames.
-
-        Returns ``(ok, mean)``. ``ok`` is False only when *every* sub-frame
-        failed, so one bad read inside a split does not cost the whole slot and
-        does not push the run towards its consecutive-failure limit.
-
-        The ASI driver's method, word for word, minus its gain.
+        """Returns ``(ok, mean)``. ``ok`` is False only when *every* sub-frame failed, so one
+        bad read in a split neither costs the slot nor nears the failure limit.
         """
-        # The camera is the authority on what was actually applied: if
-        # ``prepare`` threw halfway through, filing the frame under the exposure
-        # we merely intended would put a lie in the name and in EXPTIME.
+        # If ``prepare`` threw halfway, filing the frame under the intended exposure would
+        # put a lie in the name and in EXPTIME.
         applied = self.cam.current_exposure
         if applied and abs(float(applied) - float(exposure)) > 1e-6:
             console_ui.warn(f"Camera holds {applied:g} s but {exposure:g} s was "
@@ -1132,16 +967,11 @@ class JapanWorkerConsole(threading.Thread):
                 means.append(self._last_mean)
         return ok_any, japan_exposure.combine_means(means)
 
-    # ------------------------------------------------------------------
-    # Intensity control
-    # ------------------------------------------------------------------
     def _bias_for(self, exposure, fallback=0.0):
         """The pedestal to extrapolate an intensity against, in ADU.
 
-        Taken from the pre-darks, which are already shot per unique exposure, so
-        this costs nothing extra: the nearest exposure's darks are what a frame
-        of this length would sit on. Falls back to the configured value when the
-        run has no darks — a late start, or ``dark_frames`` set to zero.
+        The nearest exposure's pre-darks are what a frame of this length would sit on. The
+        fallback covers a run with no darks: a late start, or ``dark_frames`` set to zero.
         """
         if not self._dark_means:
             return float(fallback)
@@ -1151,7 +981,6 @@ class JapanWorkerConsole(threading.Thread):
         return sum(means) / len(means) if means else float(fallback)
 
     def _enter_main_stage(self, auto, sched):
-        """Hand over from the automatic twilight stage to the programme proper."""
         self._stage = "main"
         self._auto_exposure = None
         auto.reset()
@@ -1159,32 +988,18 @@ class JapanWorkerConsole(threading.Thread):
                        f"scheduled exposures.")
 
     def _slot_binning(self):
-        """The binning to force on this slot, or ``None`` to keep the entry's own.
-
-        Every preflight slot holds one binning from config, whatever filter or
-        exposure the schedule entry itself carries, right up to the handover
-        to the main programme.
-        """
+        """The binning to force on this slot, or None to keep the entry's own."""
         if self._stage == "preflight" and self.cfg.preflight.binning:
             return self.cfg.preflight.binning
         return None
 
     def _split_guard_runs(self):
-        """True where this camera drives the overexposure guard.
-
-        ``sun_cycle`` only — see ``japan_config.SPLIT_MODES``. The ASI imager
-        runs the same guard in ``time`` as well; here that mode is the standalone
-        program's plain cycle, one frame per slot, and stays that way.
-        """
+        """``sun_cycle`` only: unlike on the ASI imager, ``time`` mode stays one frame per slot."""
         return (self.cfg.overexposure.enabled
                 and self.cfg.schedule.mode in japan_config.SPLIT_MODES)
 
     def _plan_slot(self, entry, auto, guard):
-        """``(exposure, frames)`` for this visit to ``entry``.
-
-        With both features off this is ``(entry.exposure, 1)``, so the camera
-        gets exactly the calls it always got.
-        """
+        """``(exposure, frames)``; with both features off, ``(entry.exposure, 1)``."""
         sched = self.cfg.schedule
         if self._stage == "preflight":
             budget = japan_schedule.slot_budget(sched.entries, sched.period, entry,
@@ -1201,7 +1016,6 @@ class JapanWorkerConsole(threading.Thread):
         return exposure, frames
 
     def _feed_controllers(self, entry, exposure, mean, auto, guard):
-        """Give the slot's measured intensity to whichever loop is driving it."""
         if mean is None:
             return
         if self._stage == "preflight":
@@ -1221,9 +1035,8 @@ class JapanWorkerConsole(threading.Thread):
         bias = self._bias_for(exposure, self.cfg.overexposure.bias)
         old, new = guard.update(entry, dead, mean, bias=bias)
         if new == old:
-            # A slot whose dead time swallows the whole budget cannot be divided
-            # at all. Saying so once matters: otherwise it over-exposes all night
-            # with nothing in the log to explain why the guard did nothing.
+            # A slot whose dead time swallows the budget cannot be divided. Say so once, or it
+            # over-exposes all night with nothing in the log to explain why.
             if guard.impossible(entry) and mean >= self.cfg.overexposure.threshold:
                 key = japan_exposure.slot_key(entry)
                 if key not in self._warned_slots:
@@ -1257,7 +1070,6 @@ class JapanWorkerConsole(threading.Thread):
         return float(self.cfg.schedule.dead_time)
 
     def _intensity_text(self, exposure, frames):
-        """The bit of the dashboard detail line the two loops own."""
         if self._stage == "preflight":
             return (f"  ·  auto {exposure:g} s "
                     f"(target {self.cfg.preflight.target_mean:.0f} ADU)")
@@ -1265,9 +1077,6 @@ class JapanWorkerConsole(threading.Thread):
             return f"  ·  split ×{frames} of {exposure:g} s"
         return ""
 
-    # ------------------------------------------------------------------
-    # Cooling and the day between nights
-    # ------------------------------------------------------------------
     def _cooler_on(self):
         if self._cooler_commanded is True:
             return
@@ -1302,10 +1111,8 @@ class JapanWorkerConsole(threading.Thread):
     def _wait_for_pre_darks(self, dark_start, activation):
         """Wait for the pre-darks, switching the cooler on ``lead_minutes`` ahead.
 
-        The darks still start on time when the sensor has not got there: they
-        are timed to finish as the window opens, and a missed window costs more
-        than darks a few degrees warm — which is said, so they can be judged.
-        Returns False on a stop.
+        The darks start on time even on a warm sensor: they finish as the window opens, and
+        a missed window costs more than darks a few degrees warm. False on a stop.
         """
         if dark_start > dt.now():
             console_ui.log(f"Pre-darks start at {dark_start.strftime('%H:%M:%S')}, "
@@ -1331,7 +1138,6 @@ class JapanWorkerConsole(threading.Thread):
         return True
 
     def _check_cooled(self):
-        """Warn when the pre-darks are about to start on a sensor still cooling."""
         if not self.cam.cooling_controlled:
             return
         try:
@@ -1354,11 +1160,10 @@ class JapanWorkerConsole(threading.Thread):
                   f"consider a longer japan.cooling.lead_minutes")
 
     def _end_night(self):
-        """Put the camera to rest between nights: shutter shut, cooler off.
+        """Shutter shut, cooler off.
 
-        The sun modes end a night by returning to :meth:`run`, which plans the
-        next one straight away. The shutter used to be shut only when the whole
-        run ended, so it stood open all day waiting for the next pre-darks.
+        The sun modes plan the next night straight away, and the shutter must not stand
+        open all day waiting for the next pre-darks.
         """
         self._focus_opened_shutter = False
         try:
@@ -1371,16 +1176,11 @@ class JapanWorkerConsole(threading.Thread):
         self._set_phase("waiting for the next night")
         self._refresh_camera_section()
 
-    # ------------------------------------------------------------------
-    # Dark frames
-    # ------------------------------------------------------------------
     def _capture_darks(self, phase, sync_to_seconds=False, abort_on_stop=False):
         """Shoot ``dark_frames`` frames per unique exposure with the shutter shut.
 
-        ``abort_on_stop`` makes a stop request end the series, which is what the
-        opening darks want and the closing darks must not have: the closing ones
-        exist to be taken *after* a stop, while the opening ones lead into
-        measurements that a stop has just cancelled.
+        ``abort_on_stop`` is for the opening darks, whose measurements a stop has cancelled.
+        The closing darks exist to be taken *after* a stop.
         """
         entries = self.cfg.schedule.entries
         combos = japan_schedule.unique_exposures(entries)
@@ -1398,9 +1198,8 @@ class JapanWorkerConsole(threading.Thread):
         self._set_phase(f"dark frames ({phase})", detail=f"0/{total}")
         console_ui.log(f"Dark frames ({phase}): {self.cfg.schedule.dark_frames} × "
                        f"{len(combos)} exposure(s)")
-        # A focus session may have opened the shutter; from here until the run is
-        # over the shutter belongs to the darks, and ``_darks_running`` is what
-        # stops :meth:`_shutter_for_focus` from reopening it behind their back.
+        # From here until the run is over the shutter belongs to the darks:
+        # ``_darks_running`` stops _shutter_for_focus from reopening it.
         self._darks_running = True
         self._focus_opened_shutter = False
         self._focus_note("shooting dark frames — the shutter must stay shut")
@@ -1428,9 +1227,8 @@ class JapanWorkerConsole(threading.Thread):
                         seconds = sorted({s for entry in entries
                                           for s in (entry.seconds or [0])})
                         target = japan_schedule.next_second_slot(seconds)
-                        # Closing darks must still be taken after a stop request,
-                        # so this wait ignores the stop flag unless the caller
-                        # asked for the opposite.
+                        # Closing darks must still be taken after a stop request, so this wait ignores
+                        # the stop flag unless the caller asked for the opposite.
                         self._sleep_until(target, abort_on_stop=abort_on_stop)
                     done += 1
                     self._set_phase(f"dark frames ({phase})", detail=f"{done}/{total}")
@@ -1447,12 +1245,10 @@ class JapanWorkerConsole(threading.Thread):
             console_ui.log(f"Dark frames ({phase}) complete: {self._darks} total")
 
     def _sleep_until(self, target, abort_on_stop=False):
-        """Plain wait that only a forced quit interrupts (used inside dark runs).
+        """Wait inside a dark run, outside _service_tick on purpose.
 
-        Status keeps being published — a dark run is minutes long, and without
-        this the monitor and focus_app see a camera that has stopped answering.
-        Parameter requests are deliberately *not* served: a changed exposure
-        halfway through would leave the run with darks that match nothing.
+        Status keeps going out, or the monitor sees a dead camera for minutes. Parameter
+        requests are *not* served: a changed exposure would leave darks that match nothing.
         """
         last_status = 0.0
         while not (self._force_quit
@@ -1467,25 +1263,15 @@ class JapanWorkerConsole(threading.Thread):
             time.sleep(min(TICK, remaining))
         return False
 
-    # ------------------------------------------------------------------
-    # Sun mode
-    # ------------------------------------------------------------------
     def _sun_angle_fn(self):
         from cameras.common.sun import angle_fn
         return angle_fn(self.cfg.location)
 
     def _run_setup_mode(self):
-        """Idle indefinitely, serving focus_app — no schedule, nothing archived.
-
-        There is no observing programme to follow, so the worker simply keeps
-        :meth:`_wait_until` running: that is already where focus frames, parameter
-        changes and status publication happen, and it is the whole reason a camera
-        without a schedule can be focused at all.
-        """
+        """No programme to follow: _wait_until alone serves focus, parameters and status."""
         self._dash_update(schedule="setup mode — no scheduled captures")
-        # Nothing here opens the shutter otherwise — the schedule modes do it
-        # after their pre-darks — and a focus session on a shut camera produces
-        # nothing but dark frames. Closing it again is the caller's ``finally``.
+        # Nothing else opens it here, the schedule modes do so after their pre-darks.
+        # Closing it again is the caller's ``finally``.
         try:
             self.cam.set_shutter(True)
             console_ui.log("Setup mode: shutter opened for focusing "
@@ -1497,10 +1283,8 @@ class JapanWorkerConsole(threading.Thread):
                 return
 
     def _run_sun_mode(self):
-        # A new session starts here. In sun mode this function is called once
-        # per night, so resetting the counter as the next night is planned is
-        # also what clears it once the last one is over — from then until lights
-        # are taken again there is nothing for closing darks to bracket.
+        # A new session. Called once per night, so this also clears the counter once the
+        # last night is over: from then on there is nothing for closing darks to bracket.
         self._session_shots = 0
         sched = self.cfg.schedule
         angle_fn = self._sun_angle_fn()
@@ -1568,9 +1352,6 @@ class JapanWorkerConsole(threading.Thread):
                         self._stop_event.set()
                         break
 
-    # ------------------------------------------------------------------
-    # Time-cycle mode
-    # ------------------------------------------------------------------
     def _wait_for_start(self):
         """Time mode starts on the operator's word; unattended runs start at once."""
         sched = self.cfg.schedule
@@ -1595,10 +1376,8 @@ class JapanWorkerConsole(threading.Thread):
         last_status = 0.0
         readings = None
         while not self._started_event.is_set():
-            # Nothing is scheduled until Enter, so there is no slot for a live
-            # frame to be late for: ``slack=None`` is the same "take it now"
-            # this passes in setup mode. Ticking at TICK rather than a second
-            # keeps a newly opened focus session from waiting on the sleep.
+            # Nothing is scheduled until Enter, so ``slack=None``: no slot for a live frame
+            # to be late for. TICK keeps a newly opened focus session from waiting on the sleep.
             last_status, readings = self._service_tick(
                 None, status="waiting", last_status=last_status, readings=readings)
             self._started_event.wait(TICK)
@@ -1610,15 +1389,12 @@ class JapanWorkerConsole(threading.Thread):
         return not self._stop_event.is_set()
 
     def _run_time_mode(self):
-        # A new session starts here. In sun mode this function is called once
-        # per night, so resetting the counter as the next night is planned is
-        # also what clears it once the last one is over — from then until lights
-        # are taken again there is nothing for closing darks to bracket.
+        # A new session. Called once per night in sun mode, so this also clears the counter
+        # once the last night is over: from then on there is nothing for closing darks to bracket.
         self._session_shots = 0
         sched = self.cfg.schedule
         started = dt.now()
-        # The occurrence of t_start belonging to the night we are in, which past
-        # midnight is yesterday's — see japan_schedule.cycle_anchor.
+        # The occurrence of t_start belonging to this night, which past midnight is yesterday's.
         t_start = japan_schedule.cycle_anchor(sched.t_start, started)
         period = sched.period
         late = started >= t_start
@@ -1648,10 +1424,8 @@ class JapanWorkerConsole(threading.Thread):
                 schedule=f"cycle {period:.0f} s from {t_start.strftime('%H:%M:%S')}"
                          f"  ·  iteration {iteration}")
 
-            # Prepared on this thread, in the gap before the slot: a filter move
-            # takes about a second and there is normally far more room than that.
-            # The original used a background thread and joined it before the
-            # capture; doing it here is the same guarantee without the thread.
+            # Prepared on this thread, in the gap before the slot: a filter move takes about
+            # a second and there is normally far more room than that.
             self._prepare_entry(entry)
             self._refresh_camera_section()
 
@@ -1660,9 +1434,8 @@ class JapanWorkerConsole(threading.Thread):
             if self._take_schedule_dirty():
                 continue           # the cycle is re-anchored on the clock
 
-            # The camera is the authority on what was actually applied: if
-            # ``prepare`` threw halfway through, filing the frame under the
-            # exposure we merely intended would put a lie in EXPTIME.
+            # If ``prepare`` threw halfway, filing the frame under the intended exposure would
+            # put a lie in EXPTIME.
             exposure = entry.exposure
             applied = self.cam.current_exposure
             if applied and abs(float(applied) - float(exposure)) > 1e-6:
@@ -1679,34 +1452,19 @@ class JapanWorkerConsole(threading.Thread):
                                      f"failures — stopping.")
                     break
 
-    # ------------------------------------------------------------------
-    # Sun-triggered cycle mode
-    # ------------------------------------------------------------------
     def _run_sun_cycle_mode(self):
         """The general cycle of ``time`` mode, started by the sun rather than the clock.
 
-        The same night the ASI imager's ``sun_cycle`` runs, down to its two
-        intensity-control loops: nothing is exposed until the solar altitude
-        reaches ``sun_max_angle``; the pre-darks are timed to finish as the
-        window opens; the cycle then runs until sunrise. Its phase is locked
-        to ``t_start`` in UTC — see :meth:`_sun_cycle_anchor` — so the run opens
-        with whichever slot the cycle is due at, and two stations far apart,
-        whose windows open at different moments, shoot the same filter at the
-        same instant.
+        Before the altitude reaches ``sun_max_angle`` only the pre-darks run, timed to finish
+        as the window opens; the cycle then runs until sunrise. Its phase is locked to
+        ``t_start`` in UTC, so stations far apart, whose windows open at different moments,
+        shoot the same filter at the same instant.
 
-        With ``preflight`` enabled the session opens one setpoint earlier. The
-        same slots, the same anchor and the same cycle phase run through the
-        bright twilight, but with the exposure chosen to hold a mean intensity
-        rather than read from the schedule; at ``sun_max_angle`` the automation
-        stops and the programme above resumes exactly as written. Sunrise still
-        ends the run at ``sun_max_angle``, so the automatic stage is an evening
-        prelude and never a morning encore.
-
-        Called once per night by :meth:`run`, and returns when that night's
-        session is over.
+        With ``preflight`` the session opens earlier: the same slots and phase run through
+        the bright twilight, with the exposure chosen to hold a mean intensity. Sunrise still
+        ends the run at ``sun_max_angle``, so the automatic stage is evening-only.
         """
-        # A new session starts here — see _run_sun_mode for why the counter is
-        # reset as the next night is planned.
+        # A new session: see _run_sun_mode.
         self._session_shots = 0
         sched = self.cfg.schedule
         pre = self.cfg.preflight
@@ -1714,8 +1472,7 @@ class JapanWorkerConsole(threading.Thread):
         angle_fn = self._sun_angle_fn()
         period = sched.period
 
-        # The angle that opens the session. With the preflight stage off this is
-        # sun_max_angle, and everything below is what it always was.
+        # The angle that opens the session: sun_max_angle with the preflight stage off.
         open_angle = pre.sun_start_angle if pre.enabled else sched.sun_max_angle
         activation = japan_schedule.sun_crossing_time(angle_fn, open_angle)
         dark_seconds = japan_schedule.estimate_cycle_dark_duration(
@@ -1763,9 +1520,8 @@ class JapanWorkerConsole(threading.Thread):
             angle = angle_fn(now)
             if self._stage == "preflight" and angle <= sched.sun_max_angle:
                 self._enter_main_stage(auto, sched)
-            # The angle that closes the session is the one this stage runs down
-            # to. Sunrise therefore ends the main programme at sun_max_angle and
-            # never hands the morning twilight back to the automatic stage.
+            # The angle this stage runs down to closes the session: sunrise ends the main
+            # programme at sun_max_angle and never returns the morning to the automatic stage.
             close_angle = (sched.sun_max_angle if self._stage == "main"
                            else pre.sun_start_angle)
             if angle > close_angle:
@@ -1804,10 +1560,8 @@ class JapanWorkerConsole(threading.Thread):
             if self._take_schedule_dirty():
                 continue           # the anchor still holds; the slot does not
 
-            # The sun moved while we waited. In the main stage that can only
-            # close the window; in the preflight stage it can also hand over to
-            # the main programme, and this same slot then shoots the scheduled
-            # exposure instead of the automatic one.
+            # The sun moved during the wait. In the main stage that can only close the window;
+            # in preflight it can hand over, and this slot then shoots the scheduled exposure.
             angle = angle_fn(dt.now())
             if self._stage == "preflight" and angle <= sched.sun_max_angle:
                 self._enter_main_stage(auto, sched)
@@ -1834,17 +1588,11 @@ class JapanWorkerConsole(threading.Thread):
     def _sun_cycle_anchor(self, activation, period):
         """Fix the cycle's phase for tonight and wait for the window to open.
 
-        With ``t_start`` set (UTC in this mode) the phase is that time of day:
-        the run joins the cycle at whichever slot is due when the window opens,
-        so the cycle reaches its slot zero at ``t_start`` — the same instant at
-        every station configured with it, whatever its sun does. Without it the
-        cycle is anchored to the first whole minute of the window, as on the
-        ASI imager. The two drivers say this in the same words on purpose: it
-        is what lets their archives line up.
-
-        Either way the wait happens *here*, before the loop: asked for a slot
-        while the window is still shut, ``next_cycle_slot`` would answer with
-        one that falls before it opens. Returns the anchor, or None on a stop.
+        With ``t_start`` (UTC here) the cycle reaches slot zero at the same instant at every
+        station, which lets the ASI and Japan archives line up; without it the anchor is the
+        window's first whole minute. The wait is here because next_cycle_slot, asked while
+        the window is shut, answers with a slot before it opens. Returns the anchor, or None
+        on a stop.
         """
         sched = self.cfg.schedule
         window = max(activation, dt.now())
@@ -1867,9 +1615,6 @@ class JapanWorkerConsole(threading.Thread):
             return None
         return anchor
 
-    # ------------------------------------------------------------------
-    # Main entry
-    # ------------------------------------------------------------------
     def run(self):
         self._bus.prepare_status_dir()
         if self._service is not None:
@@ -1894,8 +1639,7 @@ class JapanWorkerConsole(threading.Thread):
                     self._cooler_on()
                     self._run_time_mode()
                 else:
-                    # One night per call; sunrise ends a session, not the run,
-                    # exactly as on the ASI imager.
+                    # One night per call: sunrise ends a session, not the run.
                     run_night = (self._run_sun_cycle_mode if mode == "sun_cycle"
                                  else self._run_sun_mode)
                     while not self._stop_event.is_set():
@@ -1911,7 +1655,6 @@ class JapanWorkerConsole(threading.Thread):
                 self.cam.set_shutter(False)
             except Exception:
                 pass
-            # See :meth:`_closing_darks_due` for when these are owed at all.
             if self._closing_darks_due():
                 self._set_phase("closing darks")
                 try:
@@ -1928,11 +1671,7 @@ class JapanWorkerConsole(threading.Thread):
                            f"{self._darks} dark, {self._errors} error(s)")
 
 
-# ---------------------------------------------------------------------------
-# Preview mode
-# ---------------------------------------------------------------------------
 def run_preview_japan(cam: JapanCamera, instance_name, dashboard=None):
-    """Capture continuously into ``preview_{instance}.fits`` at maximum rate."""
     preview_path = os.path.join(APP_DIR, f"preview_{instance_name}.fits")
     tmp_path = preview_path + ".tmp"
     console_ui.log(f"Preview mode: writing {preview_path}")
@@ -1982,19 +1721,11 @@ def _write_preview_fits(path, image):
     fits.writeto(path, image, overwrite=True)
 
 
-# ---------------------------------------------------------------------------
-# --probe
-# ---------------------------------------------------------------------------
 def run_probe_japan(config_path=None):
-    """Report what this hardware is and what it will accept.
+    """Report what DCAM sees and whether the filter wheel answers.
 
-    Two questions in one command, because an operator setting a station up asks
-    them together: does DCAM see the camera and which readout speeds and binnings
-    will it take, and does the filter wheel answer on its serial port.
-
-    The camera half writes nothing. **The wheel half moves the wheel** — it homes
-    it and drives it to three positions — so it is not something to run in the
-    middle of a night's measurements.
+    The camera half writes nothing. **The wheel half moves the wheel**: it homes it and
+    drives it to three positions, so do not run this during a night's measurements.
     """
     from utils import load_config
 
@@ -2007,14 +1738,12 @@ def run_probe_japan(config_path=None):
     _probe_wheel(conf)
 
 
-# The properties the driver actually sets or reads. Anything else DCAM exposes is
-# not this driver's business and would only make the table harder to read.
+# Only the properties the driver sets or reads.
 _PROBE_PROPERTIES = ("EXPOSURETIME", "BINNING", "READOUTSPEED", "SENSORTEMPERATURE",
                      "SENSORCOOLER", "SENSORTEMPERATURETARGET", "SENSORCOOLERSTATUS")
 
 
 def _probe_camera(conf):
-    """Print the camera's identity and the range of each property we set."""
     if conf.camera.backend != "dcam":
         print(f"Camera backend is {conf.camera.backend!r}, so there is no camera "
               f"to ask.")
@@ -2062,15 +1791,12 @@ def _probe_camera(conf):
         sdk.Dcamapi.uninit()
 
 
-# Words in a property's name that mark it as part of the cooling. The camera is
-# asked for every property it has rather than for a fixed list: a model may
+# The camera is asked for every property it has, not a fixed list: a model may
 # switch its cooling through something the table above does not name.
 _PROBE_COOLING_WORDS = ("COOL", "TEMP", "FAN", "PELTIER")
 
 
 def _probe_cooling_properties(dcam):
-    """List every cooling-related property the camera has, with each value's
-    name as the camera words it."""
     print("Every cooling-related property this camera reports "
           "(value = the camera's own name for it):")
     print("-" * 80)
@@ -2102,7 +1828,6 @@ def _probe_cooling_properties(dcam):
 
 
 def _probe_current(dcam, prop):
-    """The value the camera currently holds for one property, as text."""
     value = dcam.prop_getvalue(prop)
     if value is False:
         return "n/a"
@@ -2111,7 +1836,6 @@ def _probe_current(dcam, prop):
 
 
 def _probe_allowed(dcam, prop):
-    """What the camera would accept for one property, as text."""
     attr = dcam.prop_getattr(prop)
     if attr is False:
         return "n/a"
@@ -2126,9 +1850,8 @@ def _probe_allowed(dcam, prop):
 def _probe_wheel(conf):
     """Trace the controller's raw answers while the wheel actually moves.
 
-    Ported from ``japan-camera/wheel_probe.py``. It is the way to see the real move
-    time that ``FilterWheel.select()`` relies on, and to confirm the ``GOSUB4`` →
-    ``FILT:<n>`` protocol on a controller that has been rewired.
+    Shows the real move time ``FilterWheel.select()`` relies on, and confirms the
+    ``GOSUB4`` → ``FILT:<n>`` protocol on a controller that has been rewired.
     """
     port = conf.filter_wheel.port
     if str(port).strip().lower() == "sim":
@@ -2162,12 +1885,8 @@ def _probe_wheel(conf):
         ser.close()
 
 
-# ---------------------------------------------------------------------------
-# Console entry point
-# ---------------------------------------------------------------------------
 def run_console_japan(config_path=None, preview=False, verbose=False,
                       setup_mode=False):
-    """Run the Japan camera in console mode."""
     from utils import load_config, configure_console_japan
     from camera_service import CameraService
     from frame_server import start_frame_server
@@ -2193,10 +1912,8 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
     dash = console_ui.start_dashboard(
         "japan", instance_name, verbose=verbose,
         footer="Ctrl+C — finish the frame, shoot the closing darks, stop")
-    # Alert mail, started before the camera is opened so that a camera which
-    # will not open — and a filter controller that answers nothing — is already
-    # something somebody hears about. The crash handler goes first: it is the
-    # only thing that can speak for a process killed outright.
+    # Before the camera is opened, so a camera that will not open still raises an alert.
+    # The crash handler goes first: it alone can speak for a process killed outright.
     alert_status_path = os.path.join(status_dir, f"{os.getpid()}.json")
     alerts.install_crash_handler(alert_status_path)
     alerts.start(cfg.get("alerts", {}), node_name, instance_name, "japan",
@@ -2239,9 +1956,8 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
             return
 
 
-        # No ``publish_setpoint_limits`` counterpart: every parameter in this
-        # camera's schema has a range known without asking the hardware, the
-        # sensor temperature being a reading rather than a setting.
+        # No setpoint limits to publish: every parameter in this schema has a range known
+        # without asking the hardware.
         service = CameraService("japan", instance_name, conf.output_dir,
                                 node_name=node_name, setup_mode=setup_mode)
         service.set_schedule(japan_schedule.schedule_snapshot(conf.schedule))
@@ -2270,11 +1986,9 @@ def run_console_japan(config_path=None, preview=False, verbose=False,
                 console_ui.warn(f"Second {name} — quitting without closing darks.")
                 worker.request_stop(force=True)
                 return
-            # The second signal is the operator's escape hatch, so it must stay
-            # available under a service manager too: systemd sends SIGTERM again
-            # only when TimeoutStopSec runs out, and by then this is exactly the
-            # behaviour wanted — give up the darks rather than be SIGKILLed
-            # mid-exposure.
+            # The second signal must stay available under a service manager too: systemd sends
+            # SIGTERM again when TimeoutStopSec runs out, and giving up the darks beats being
+            # SIGKILLed mid-exposure.
             console_ui.log(f"{name} — finishing the current frame, then closing "
                            f"darks. Send it again to quit at once.")
             worker.request_stop()

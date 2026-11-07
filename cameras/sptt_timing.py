@@ -1,45 +1,25 @@
-"""Frame timing for the SPTT CSDU-429: how long it integrates, and how often
-it is allowed to start over.
+"""CSDU-429 frame timing, free of pyusb so ``setup_app`` works on a machine with no
+libusb.
 
-The camera takes the exposure and the frame period as two independent
-registers. In continuous mode the period is the frame interval, so a period
-shorter than the exposure does not slow the camera down — it truncates the
-integration, and the frames simply come out dark. Nothing reports it: the
-firmware accepts both numbers and the status block goes on quoting them back.
-
-This driver used to send a fixed 75 000 us period whatever the exposure was, so
-the default 0.88 s exposure was being cut to 75 ms — every SPTT frame ever
-archived by this program is about twelve times shorter than its header claims.
-The vendor's own tools make the operator raise the period by hand
-(``SPTT-CAM/capture.py --period``, the "Period (us)" box in its GUI); here it is
-derived instead, because nothing in this program asks an operator to compute a
-frame period.
-
-Deliberately free of a pyusb import, unlike :mod:`cameras.sptt_driver`: this is
-the arithmetic alone, so ``setup_app`` can show the derived period on a machine
-with no libusb, and the tests can check it without a fake USB device.
+Exposure and frame period are independent registers. In continuous mode a period
+shorter than the exposure truncates the integration and the frames come out dark; the
+firmware accepts both numbers and its status block quotes them back, so nothing
+reports it.
 """
 
 # What the sensor itself can do: the vendor documents 6 us to 60 minutes.
 EXPOSURE_MIN_US = 6
 EXPOSURE_MAX_US = 3_600_000_000
 
-# A command carries its value in four bytes, so anything wider wraps. Worth a
-# named constant because the wrap is silent and lands as a *short* period —
-# the same darkening bug, arrived at from the opposite end.
+# A command carries four bytes. Wider values wrap silently to a short period, which
+# truncates the exposure.
 CMD_VALUE_MAX = 0xFFFF_FFFF
 
-# Time the camera needs after the shutter closes, before the next frame may
-# start: sensor readout plus the USB transfer. This is the vendor's own default
-# period, i.e. what it budgeted for a full 744x576 frame, and it is an absolute
-# margin rather than a fraction of the exposure on purpose — a fraction would
-# leave 44 ms at 0.88 s (too little to read the sensor out) and a pointless
-# minute and a half at a half-hour exposure. Where the constant turns out to be
-# optimistic, the firmware's own MinPeriod raises it (see derive_period_us).
+# Sensor readout plus USB transfer. Absolute, not a fraction of the exposure:
+# a fraction is too little at 0.88 s and pointless at half an hour.
 PERIOD_READOUT_MARGIN_US = 75_000
 
-# The period this driver sent regardless of the exposure, until it didn't.
-# Referenced by the regression test that pins the bug.
+# Fixed period that truncates any longer exposure. Referenced by the regression test.
 LEGACY_PERIOD_US = 75_000
 
 # How far the camera's reported exposure may sit from the requested one before
@@ -49,26 +29,20 @@ EXPOSURE_TOL_US = 50
 
 
 def exposure_to_us(exposure_s):
-    """Convert an exposure in seconds to the microseconds the camera wants.
-
-    Rounds rather than truncates: ``int(0.29 * 1_000_000)`` is 289 999, and a
-    driver that quietly loses a microsecond every time is a bad place to start
-    an investigation into a camera that quietly loses most of them.
-    """
+    """Rounds rather than truncates: ``int(0.29 * 1_000_000)`` is 289 999."""
     us = int(round(float(exposure_s) * 1_000_000))
     return max(EXPOSURE_MIN_US, min(us, EXPOSURE_MAX_US))
 
 
 def derive_period_us(exposure_s, min_period_us=None, override=None,
                      allow_short=False, warn=None):
-    """The frame period that lets ``exposure_s`` actually run to completion.
+    """The frame period that lets ``exposure_s`` run to completion.
 
-    ``override`` is the operator's ``sptt.period_us``; ``None`` means derive it.
-    An override shorter than the exposure is raised to fit and reported through
-    ``warn`` — outside continuous mode, where the period has no bearing on the
-    integration, pass ``allow_short`` and the number goes through untouched.
-    ``min_period_us`` is the firmware's own MinPeriod and always wins: it knows
-    the readout cost of the current binning and ROI, which this module does not.
+    ``override`` is the operator's ``sptt.period_us``; one shorter than the exposure
+    is raised and reported through ``warn``, unless ``allow_short`` is set for modes
+    where the period has no bearing on the integration. ``min_period_us`` is the
+    firmware's MinPeriod and always wins: it knows the readout cost of the current
+    binning and ROI.
     """
     exposure_us = exposure_to_us(exposure_s)
     floor = exposure_us + PERIOD_READOUT_MARGIN_US
@@ -100,12 +74,8 @@ def derive_period_us(exposure_s, min_period_us=None, override=None,
 
 def exposure_mismatch(requested_us, reported_us,
                       tol_frac=EXPOSURE_TOL_FRAC, tol_us=EXPOSURE_TOL_US):
-    """Describe the gap between the exposure asked for and the one in force.
-
-    Returns ``None`` when they agree. The tolerance exists because the firmware
-    quantises to its own clock, not to let a shortened exposure through: the
-    default allowance is 2 %, and the failure this guards against is a factor
-    of twelve.
+    """``None`` when they agree. The tolerance covers the firmware quantising to its own
+    clock.
     """
     tolerance = max(abs(requested_us) * tol_frac, tol_us)
     if abs(reported_us - requested_us) <= tolerance:
@@ -115,11 +85,7 @@ def exposure_mismatch(requested_us, reported_us,
 
 
 def period_mismatch(exposure_us, reported_period_us):
-    """Flag a frame period too short to contain the exposure.
-
-    No tolerance here: this is precisely the condition that darkens the frames,
-    and a period one microsecond short is a period that truncates.
-    """
+    """``None`` when it fits. No tolerance: a period one microsecond short truncates."""
     if reported_period_us >= exposure_us:
         return None
     return (f"Camera reports a {reported_period_us} us frame period, shorter "
@@ -128,10 +94,8 @@ def period_mismatch(exposure_us, reported_period_us):
 
 
 def describe_timing(requested_exposure_us, sl):
-    """One log line covering what was asked for and what the camera is doing.
-
-    ``sl`` is the unpacked status block: index 5 is the exposure in
-    microseconds, 6 the frame period, 14 the firmware's minimum period.
+    """``sl`` is the unpacked status block: 5 exposure (us), 6 frame period, 14 firmware
+    minimum.
     """
     return (f"SPTT timing: requested {requested_exposure_us / 1e6:.6g} s, "
             f"camera reports {sl[5] / 1e6:.6g} s exposure, "

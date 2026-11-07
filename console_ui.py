@@ -1,41 +1,12 @@
-"""
-The measurement console: one live status screen, shared by every camera.
+"""One live status screen shared by every camera, redrawn in place.
 
-Console mode used to be a scrolling wall of ``print()`` calls, so the state of a
-run had to be reconstructed by reading backwards. This module replaces it with a
-single block that is redrawn in place — the model used by the ASI all-sky imager
-program — generalised so that all drivers show the same screen.
-
-Three properties matter, and the design follows from them:
-
-* **It must not freeze during an exposure.** The renderer lives on its own
-  daemon thread and reads a shared state dict, so the clock and the
-  capture-elapsed counter keep ticking while the worker thread is blocked inside
-  a 25-second ``capture()``. The renderer never touches a camera handle; the
-  worker pushes values in with :meth:`Dashboard.update` at points where reading
-  them is safe.
-* **It must not be corrupted by stray output.** While a dashboard is drawing,
-  ``sys.stdout``/``sys.stderr`` are wrapped: anything a library prints (gphoto2,
-  ctypes wrappers, paho) lands in the log panel instead of on top of the screen.
-  Driver code calls :func:`log` rather than ``print``.
-* **It must degrade.** Under systemd, ``nohup`` or a pipe there is no terminal to
-  redraw, so the dashboard switches to plain timestamped lines instead of filling
-  the journal with escape sequences. ``--verbose`` forces the same mode. The full
-  log always goes to a file either way.
-
-Typical use in a driver::
-
-    dash = console_ui.start_dashboard("ASI", instance_name, verbose=args.verbose)
-    try:
-        dash.update(status="running", output_dir=out)
-        dash.set_section("camera", [("Exposure:", "25 s")])
-        dash.capture_begin("LIGHT filter=3", 25.0)
-        ...
-    finally:
-        dash.stop()
-
-Modules that are not drivers just call ``console_ui.log(...)``; with no dashboard
-running it prints the line, so the GUI and the standalone tools are unaffected.
+The renderer runs on its own daemon thread over a shared state dict, so the clock
+keeps ticking while the worker is blocked in ``capture()``. It never touches a camera
+handle; the worker pushes values in at points where reading them is safe.
+While it draws, ``sys.stdout`` and ``sys.stderr`` are wrapped, so library output lands
+in the log panel. Drivers call :func:`log`, not ``print``.
+Under systemd, ``nohup``, a pipe or ``--verbose`` it writes plain timestamped lines
+instead of filling the journal with escape sequences. The log file is always written.
 """
 import contextlib
 import os
@@ -47,9 +18,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 CLEAR_SCREEN = "\033[H\033[J"          # cursor home + erase to end of screen
 MIN_WIDTH = 64
 MAX_WIDTH = 120
@@ -64,7 +32,6 @@ LEVELS = ("DEBUG", "INFO", "WARN", "ERROR")
 
 
 def _enable_ansi():
-    """Enable ANSI/VT escape sequences on Windows consoles (no-op elsewhere)."""
     if os.name == "nt":
         try:
             import ctypes
@@ -92,11 +59,8 @@ def _fmt_size_mb(mb):
     return f"{mb:.0f} MB free"
 
 
-# ---------------------------------------------------------------------------
-# Log file
-# ---------------------------------------------------------------------------
 class _LogFile:
-    """Tiny size-rotating log writer (one backup). Never raises."""
+    """Size-rotating, one backup. Never raises."""
 
     def __init__(self, path, max_bytes=LOG_MAX_BYTES):
         self.path = path
@@ -145,15 +109,9 @@ class _LogFile:
             self._fh = None
 
 
-# ---------------------------------------------------------------------------
-# stdout capture
-# ---------------------------------------------------------------------------
 class _StreamCapture:
-    """File-like object that turns writes into dashboard log lines.
-
-    Installed over ``sys.stdout``/``sys.stderr`` while a dashboard is drawing, so
-    that a chatty C library cannot scribble over the status block. Partial writes
-    are buffered until a newline arrives.
+    """Replaces stdout/stderr while drawing, so a chatty library cannot scribble over
+    the status block. Partial writes wait for a newline.
     """
 
     def __init__(self, dashboard, level="INFO"):
@@ -166,9 +124,8 @@ class _StreamCapture:
         if not text:
             return 0
         with self._lock:
-            # A carriage return ends a line as surely as a newline does: progress
-            # bars (``print(f"\r 50%", end="")``) would otherwise buffer their
-            # whole run into one enormous line.
+            # A carriage return ends a line too: progress bars would otherwise buffer
+            # their whole run into one enormous line.
             self._buf += text.replace("\r\n", "\n").replace("\r", "\n")
             lines = self._buf.split("\n")
             self._buf = lines.pop()
@@ -193,16 +150,9 @@ class _StreamCapture:
         raise OSError("console_ui capture stream has no descriptor")
 
 
-# ---------------------------------------------------------------------------
-# Dashboard
-# ---------------------------------------------------------------------------
 class Dashboard:
-    """Live status screen for one measurement run.
-
-    The renderer thread only ever *reads* the state dict under a lock; the worker
-    thread writes into it. Nothing here talks to hardware, so a hung camera call
-    cannot stop the screen from updating (and a slow terminal cannot stall a
-    capture).
+    """Nothing here talks to hardware, so a hung camera call cannot stop the screen, and
+    a slow terminal cannot stall a capture.
     """
 
     def __init__(self, title, instance="", *, interval=DEFAULT_INTERVAL,
@@ -232,11 +182,7 @@ class Dashboard:
         self._logfile = _LogFile(log_file) if log_file else None
         self._last_status = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
     def start(self):
-        """Begin drawing (or, in plain mode, just start logging)."""
         set_dashboard(self)
         if self.plain:
             self._emit_plain(f"{self.title} — {self.instance}" if self.instance
@@ -252,7 +198,6 @@ class Dashboard:
         return self
 
     def stop(self):
-        """Stop drawing, restore stdout and leave the cursor on a clean line."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
@@ -285,12 +230,8 @@ class Dashboard:
 
     @contextlib.contextmanager
     def suspended(self):
-        """Hand the terminal back for the duration of the block.
-
-        Anything that talks to the operator — the setup wizard's prompts, a
-        password question — needs a plain terminal: with the screen being
-        redrawn three times a second, and stdout captured into the log panel,
-        the questions would never be seen. Drawing resumes on exit.
+        """Hands the terminal back: with redraws and stdout captured, prompts would
+        never be seen.
         """
         if self.plain or self._thread is None:
             yield
@@ -309,17 +250,9 @@ class Dashboard:
             sys.stdout, sys.stderr = saved_out, saved_err
             self._paused.clear()
 
-    # ------------------------------------------------------------------
-    # Worker-side writes (cheap, non-blocking)
-    # ------------------------------------------------------------------
     def update(self, **fields):
-        """Merge fields into the displayed state.
-
-        Recognised keys: ``status``, ``detail``, ``phase``, ``schedule``,
-        ``next_at``, ``frames``, ``darks``, ``errors``, ``last_file``,
-        ``output_dir``, ``disk_free_mb``, ``server_url``, ``node_name``,
-        ``focus``, ``alerts``, ``note``. Unknown keys are stored and ignored by
-        the renderer, so a driver can stage values without breaking the layout.
+        """Unknown keys are stored and ignored by the renderer, so a driver can stage
+        values.
         """
         with self._lock:
             self._state.update(fields)
@@ -331,7 +264,6 @@ class Dashboard:
                              "INFO")
 
     def set_section(self, name, rows):
-        """Replace a named block of ``(label, value)`` rows below the core ones."""
         with self._lock:
             if name not in self._sections:
                 self._section_order.append(name)
@@ -342,22 +274,17 @@ class Dashboard:
             self._footer = text or ""
 
     def note(self, text):
-        """Show a one-line warning in the status block (empty string clears it)."""
+        """An empty string clears it."""
         self.update(note=text)
 
     def capture_begin(self, label, exposure=0.0):
-        """Mark the start of an exposure so the screen can show it elapsing."""
         self.update(capturing_since=time.monotonic(), capturing_label=label,
                     capturing_exposure=float(exposure or 0.0))
 
     def capture_end(self):
         self.update(capturing_since=None)
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
     def log(self, message, level="INFO", _from_stream=False):
-        """Record a line: log panel + log file (plain mode prints it)."""
         level = (level or "INFO").upper()
         stamp = datetime.now().strftime("%H:%M:%S")
         text = str(message).rstrip()
@@ -394,9 +321,6 @@ class Dashboard:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Renderer
-    # ------------------------------------------------------------------
     def _run(self):
         while not self._stop.is_set():
             if self._paused.is_set():
@@ -535,18 +459,14 @@ class Dashboard:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
 _active = None
 _active_lock = threading.Lock()
-# Extra destinations for log lines — the GUI registers one so a driver's
-# messages reach its log pane without the driver knowing a GUI exists.
+# Extra destinations for log lines. The GUI registers one, so a driver's messages
+# reach its log pane without the driver knowing a GUI exists.
 _sinks = []
 
 
 def add_sink(callback):
-    """Also deliver every log line to ``callback(message, level)``."""
     if callback not in _sinks:
         _sinks.append(callback)
 
@@ -584,7 +504,6 @@ def get_dashboard():
 
 
 def default_log_path(camera_type, instance_name=""):
-    """Path of the rotating log file for one console run."""
     stem = f"{camera_type}_{instance_name}" if instance_name else str(camera_type)
     safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in stem)
     return os.path.join(LOG_DIR, f"{safe}.log")
@@ -592,10 +511,8 @@ def default_log_path(camera_type, instance_name=""):
 
 def start_dashboard(camera_type, instance_name="", *, verbose=False,
                     title=None, footer="Ctrl+C — stop", log_file=None):
-    """Create, register and start the dashboard for a console run.
-
-    ``verbose`` (or a non-TTY stdout) selects plain line logging instead of the
-    redrawn screen — the log file is written in both cases.
+    """``verbose`` or a non-TTY stdout selects plain lines; the log file is written
+    either way.
     """
     dash = Dashboard(
         title or f"EVERY CAMERA — {str(camera_type).upper()}",
@@ -609,7 +526,6 @@ def start_dashboard(camera_type, instance_name="", *, verbose=False,
 
 @contextlib.contextmanager
 def suspended():
-    """Give an interactive prompt the terminal; a no-op with no dashboard."""
     dash = _active
     if dash is None:
         yield
@@ -619,7 +535,6 @@ def suspended():
 
 
 def log(message, level="INFO"):
-    """Log a line through the active dashboard, or print it if none is running."""
     dash = _active
     if dash is not None:
         dash.log(message, level)
@@ -646,7 +561,6 @@ def debug(message):
 
 
 def update(**fields):
-    """Update the active dashboard, if there is one."""
     dash = _active
     if dash is not None:
         dash.update(**fields)

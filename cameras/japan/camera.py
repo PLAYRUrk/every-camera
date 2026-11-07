@@ -1,31 +1,16 @@
 """Hamamatsu camera over DCAM-API.
 
-Ported from ``japan-camera/camera.py`` with three changes, all of which the
-every-camera worker depends on:
+``capture()`` cannot hang: a camera that stops producing frames must not take the
+worker thread with it, so the wait is bounded and ends in ``None``, one failed frame.
+Applied values are read back, so ``current_binning`` and ``BINNING`` say what the
+sensor did. Nothing prints: the console dashboard owns stdout.
 
-* **``capture()`` cannot hang.** The original looped on
-  ``wait_capevent_frameready`` with ``while True:`` and no bound, so a camera that
-  stopped producing frames took the worker thread with it — the stop request would
-  never be served and systemd would eventually SIGKILL the process mid-exposure.
-  Here the wait is bounded and a genuine error gives up at once, returning ``None``,
-  which the worker already treats as one failed frame.
-* **Applied values are read back.** ``prop_setgetvalue`` returns what the camera
-  actually took; the original discarded it, so ``current_binning`` could claim 8
-  while the sensor did 4 — and ``BINNING`` in the header would say so too.
-* **Nothing prints.** The console dashboard owns stdout; messages go through
-  ``console_ui``.
+The SDK is imported inside :meth:`__enter__`, never at module scope.
 
-The SDK is imported inside :meth:`__enter__`, never at module scope: see
-``cameras/japan/dcamsdk/__init__.py`` for why that matters.
-
-Cooling is a switch rather than the PIXIS's managed setpoint
-(``cameras/asi/camera.py``): DCAM's ``SENSORCOOLER`` turns the cooler on and off,
-and ``SENSORTEMPERATURETARGET`` moves the target on the models that have one. The
-switch reports whether the camera took it, so a refused "off" is never logged as
-done. Not
-every model exposes either, so :meth:`HamamatsuCamera.cooler_supported` asks
-before anything relies on them; the reading, ``SENSORTEMPERATURE``, is always
-there.
+Cooling is a switch (``SENSORCOOLER``) plus, on some models, a target
+(``SENSORTEMPERATURETARGET``). Not every model exposes either, so
+:meth:`HamamatsuCamera.cooler_supported` asks first; the reading ``SENSORTEMPERATURE``
+is always there.
 """
 from __future__ import annotations
 
@@ -43,10 +28,9 @@ from .config import readout_text
 if TYPE_CHECKING:
     from .config import CameraCfg
 
-# How long ``capture()`` keeps waiting for a frame that is late but not refused.
-# The budget is the exposure plus this many frame-timeout windows: a camera that
-# is merely slow gets several chances, and one that has stopped answering is given
-# up on in bounded time so a stop request is still served.
+# The budget is the exposure plus this many frame-timeout windows: a slow camera gets
+# several chances, and one that stopped answering is given up on, so a stop request is
+# still served.
 MAX_TIMEOUT_WAITS = 5
 
 # Slack over the exposure itself, covering readout and transfer.
@@ -62,16 +46,14 @@ class HamamatsuCamera:
         self.current_binning: int = cfg.binning
         self.current_readout_speed: int = cfg.readout_speed
 
-    # --- lifetime -----------------------------------------------------------
     def __enter__(self) -> HamamatsuCamera:
         sdk = dcamsdk.load()
         if not sdk.Dcamapi.init():
             raise RuntimeError(f"Dcamapi.init() failed: {sdk.Dcamapi.lasterr()}")
         dcam = sdk.Dcam()
         if not dcam.dev_open():
-            # init() succeeded, so it has to be undone before this propagates —
-            # otherwise a retry in the same process meets an already-initialised
-            # library.
+            # init() succeeded, so undo it: a retry in this process would meet an
+            # initialised library.
             sdk.Dcamapi.uninit()
             raise RuntimeError(f"dev_open() failed: {dcam.lasterr()}")
         self._sdk = sdk
@@ -87,13 +69,11 @@ class HamamatsuCamera:
         if self._sdk is not None:
             self._sdk.Dcamapi.uninit()
 
-    # --- configuration ------------------------------------------------------
     def _apply(self, prop, value, label, cast):
-        """Set one DCAM property and return what the camera actually took.
+        """Set one DCAM property and return what the camera took.
 
-        A refused write leaves the cached value alone rather than recording an
-        intention: the header and the frame name are built from these, and a value
-        the sensor never applied would be a lie in the archive.
+        A refused write leaves the cached value alone: the header and the frame name
+        are built from these.
         """
         applied = self._dcam.prop_setgetvalue(prop, float(value))
         if applied is False:
@@ -123,17 +103,14 @@ class HamamatsuCamera:
         if taken is not None:
             self.current_readout_speed = taken
 
-    # --- cooling ------------------------------------------------------------
     def _writable(self, prop) -> bool:
         attr = self._dcam.prop_getattr(prop)
         return attr is not False and attr.is_writable()
 
     def cooler_supported(self) -> bool:
-        """True when this model lets the cooler be switched over DCAM."""
         return self._writable(self._sdk.DCAM_IDPROP.SENSORCOOLER)
 
     def cooler_can_switch_off(self) -> bool:
-        """True when OFF is within the modes this model's SENSORCOOLER takes."""
         attr = self._dcam.prop_getattr(self._sdk.DCAM_IDPROP.SENSORCOOLER)
         if attr is False:
             return False
@@ -142,12 +119,9 @@ class HamamatsuCamera:
     def set_cooler(self, on: bool) -> bool:
         """Switch the cooler; True once the camera has taken the new mode.
 
-        A plain set comes first: some models answer the set-and-read-back that
-        :meth:`_apply` uses with INVALIDPARAM for SENSORCOOLER, though a mode
-        switch needs no read-back. The set-get is still tried after it, so a model
-        that only takes that one is not lost. A refusal is said with the error's
-        name and the range the camera accepts — the caller must not then claim
-        the cooler was switched.
+        A plain set comes first: some models answer the set-and-read-back of
+        :meth:`_apply` with INVALIDPARAM for SENSORCOOLER. The set-get is still tried
+        after it, for a model that only takes that one.
         """
         prop = self._sdk.DCAM_IDPROP.SENSORCOOLER
         mode = self._sdk.DCAMPROP.SENSORCOOLER
@@ -202,14 +176,12 @@ class HamamatsuCamera:
         except ValueError:
             return str(int(value))
 
-    # --- readings -----------------------------------------------------------
     def temperature(self) -> float | None:
-        """Sensor temperature in °C, or ``None`` when DCAM will not report it."""
         value = self._dcam.prop_getvalue(self._sdk.DCAM_IDPROP.SENSORTEMPERATURE)
         return None if value is False else float(value)
 
     def capture(self) -> np.ndarray | None:
-        """Take one frame. Returns ``None`` on any failure, having said why."""
+        """Returns ``None`` on any failure, having said why."""
         if not self._dcam.buf_alloc(1):
             console_ui.error(f"buf_alloc failed: {self._dcam.lasterr()}")
             return None
@@ -232,9 +204,8 @@ class HamamatsuCamera:
                     break
                 error = self._dcam.lasterr()
                 if error != self._sdk.DCAMERR.TIMEOUT:
-                    # Not "still exposing" — the camera is refusing. Waiting
-                    # longer cannot help, and the slot is better spent on the
-                    # next frame.
+                    # The camera is refusing, not still exposing: waiting longer
+                    # cannot help.
                     console_ui.error(f"Frame wait failed: {error}")
                     break
                 if monotonic() >= deadline:
@@ -247,12 +218,10 @@ class HamamatsuCamera:
             self._dcam.buf_release()
         if image is None:
             return None
-        # MONO16 is what this camera is configured for and passes through
-        # untouched; a MONO8 buffer is widened and shifted so the rest of the
-        # program never has to ask which pixel type produced a frame.
+        # MONO16 passes through untouched; a MONO8 buffer is widened and shifted, so
+        # the rest of the program never asks which pixel type produced a frame.
         return intensity.to_full_scale(image, 8 if image.dtype == np.uint8 else 16)
 
-    # --- identification -----------------------------------------------------
     def info(self) -> dict:
         d = self._dcam
         s = self._sdk.DCAM_IDSTR
@@ -268,11 +237,6 @@ class HamamatsuCamera:
         }
 
     def info_rows(self) -> list:
-        """``(label, value)`` rows describing the camera, for the console block.
-
-        Replaces the original's ``print_info()``: the same eight facts, handed to
-        the dashboard instead of to stdout.
-        """
         info = self.info()
         return [
             ("Model:", f"{info['vendor']} {info['model']}"),
