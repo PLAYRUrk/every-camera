@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-Every Camera — Self-updater.
-
-Downloads the latest version from the git remote and updates script files,
-preserving local configuration. Works even on old versions where this
-utility did not exist yet.
-
-Usage:
-    python update.py              # update to latest
-    python update.py --dry-run    # show what would change, don't apply
-    python update.py --force      # overwrite even if local files are modified
-"""
 import argparse
 import os
 import subprocess
@@ -18,7 +6,7 @@ import sys
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Files that should NEVER be overwritten by the updater
+# Never overwritten by the updater.
 CONFIG_FILES = {
     "config.json",
     ".gitignore",
@@ -26,31 +14,28 @@ CONFIG_FILES = {
     ".gitattributes",
 }
 
-# Patterns for config/user-data files that are generated locally
+# Substrings of config and user-data file names generated locally.
 CONFIG_PATTERNS = (
     "camcfg_",       # per-camera config (camcfg_Canon_EOS_6D.ini, ...)
     "schedule",      # schedule.txt, dSchedule.txt, ndSchedule.txt, ...
 )
 
-# Only update files with these extensions
 UPDATEABLE_EXTENSIONS = {
     ".py",
     ".md",    # README.md
 }
 
-# Specific non-.py files that should be updated
 UPDATEABLE_FILES = {
     "requirements.txt",
 }
 
-# Directories to sync (relative to repo root)
 UPDATEABLE_DIRS = {
+    "docs",
     "firmware",
 }
 
 
 def is_config_file(filename):
-    """Check if a file is a config file that should be preserved."""
     if filename in CONFIG_FILES:
         return True
     name_lower = filename.lower()
@@ -61,21 +46,17 @@ def is_config_file(filename):
 
 
 def is_updateable(filepath):
-    """Check if a file should be updated."""
     filename = os.path.basename(filepath)
     if is_config_file(filename):
         return False
 
-    # Files in updateable directories (e.g. firmware/)
     parts = filepath.replace("\\", "/").split("/")
     if len(parts) > 1 and parts[0] in UPDATEABLE_DIRS:
         return True
 
-    # Specific named files
     if filename in UPDATEABLE_FILES:
         return True
 
-    # Root-level files with updateable extensions
     if len(parts) == 1:
         _, ext = os.path.splitext(filename)
         return ext in UPDATEABLE_EXTENSIONS
@@ -84,7 +65,6 @@ def is_updateable(filepath):
 
 
 def run_git(*args, capture=True):
-    """Run a git command and return stdout."""
     cmd = ["git", "-C", APP_DIR] + list(args)
     result = subprocess.run(
         cmd, capture_output=capture, text=True,
@@ -97,7 +77,6 @@ def run_git(*args, capture=True):
 
 
 def get_remote_branch():
-    """Detect the remote tracking branch."""
     try:
         ref = run_git("symbolic-ref", "--short", "HEAD")
     except RuntimeError:
@@ -107,16 +86,13 @@ def get_remote_branch():
 
 
 def fetch_latest(remote):
-    """Fetch latest from remote."""
     print(f"[INFO] Fetching from {remote}...")
     run_git("fetch", remote, capture=False)
 
 
 def get_changed_files(remote, branch):
-    """Get list of files changed between local HEAD and remote."""
     remote_ref = f"{remote}/{branch}"
 
-    # Files that differ between local and remote
     diff_output = run_git("diff", "--name-status", "HEAD", remote_ref)
     if not diff_output:
         return []
@@ -132,7 +108,6 @@ def get_changed_files(remote, branch):
 
 
 def get_local_modifications():
-    """Get set of locally modified files (uncommitted changes)."""
     try:
         output = run_git("status", "--porcelain", "--ignore-submodules=all")
     except RuntimeError:
@@ -152,13 +127,11 @@ def get_local_modifications():
 
 
 def checkout_file(remote, branch, filepath):
-    """Checkout a single file from remote."""
     remote_ref = f"{remote}/{branch}"
     run_git("checkout", remote_ref, "--", filepath)
 
 
 def remove_file(filepath):
-    """Remove a file from working tree and git index."""
     full_path = os.path.join(APP_DIR, filepath)
     if os.path.exists(full_path):
         os.remove(full_path)
@@ -166,8 +139,6 @@ def remove_file(filepath):
 
 
 def update(dry_run=False, force=False):
-    """Main update logic."""
-    # Verify this is a git repo
     if not os.path.isdir(os.path.join(APP_DIR, ".git")):
         print("[ERROR] Not a git repository. Cannot update.")
         return False
@@ -180,7 +151,6 @@ def update(dry_run=False, force=False):
         print(f"[ERROR] Failed to fetch: {e}")
         return False
 
-    # Get changes
     try:
         changes = get_changed_files(remote, branch)
     except RuntimeError as e:
@@ -193,7 +163,6 @@ def update(dry_run=False, force=False):
 
     local_modified = get_local_modifications() if not force else set()
 
-    # Filter to updateable files
     to_update = []
     to_add = []
     to_delete = []
@@ -203,7 +172,6 @@ def update(dry_run=False, force=False):
     for status, filepath in changes:
         if not is_updateable(filepath):
             if not is_config_file(os.path.basename(filepath)):
-                # Not updateable and not config — just skip silently
                 pass
             else:
                 skipped_config.append(filepath)
@@ -220,7 +188,6 @@ def update(dry_run=False, force=False):
             else:
                 to_update.append(filepath)
 
-    # Report
     total = len(to_update) + len(to_add) + len(to_delete)
     if total == 0 and not skipped_modified:
         print("[INFO] No updateable files changed.")
@@ -263,11 +230,9 @@ def update(dry_run=False, force=False):
         print("[DRY RUN] No changes applied.")
         return True
 
-    # Apply updates
     errors = 0
     for filepath in to_add + to_update:
         try:
-            # Ensure parent directory exists
             full_path = os.path.join(APP_DIR, filepath)
             parent = os.path.dirname(full_path)
             if parent and not os.path.isdir(parent):
@@ -286,8 +251,7 @@ def update(dry_run=False, force=False):
             print(f"  [ERROR] {filepath}: {e}")
             errors += 1
 
-    # Update HEAD to match remote for the files we updated
-    # (don't do a full merge/rebase — just advance HEAD)
+    # Just advance HEAD, no merge or rebase: the files are already in place.
     if errors == 0 and not skipped_modified:
         try:
             remote_ref = f"{remote}/{branch}"

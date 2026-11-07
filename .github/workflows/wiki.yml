@@ -1,0 +1,38 @@
+name: Wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/scripts/publish_wiki.py"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki-repo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: python .github/scripts/publish_wiki.py docs wiki-repo
+
+      - name: Push
+        working-directory: wiki-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "Update from ${GITHUB_SHA::7}" && git push; }
