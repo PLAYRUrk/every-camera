@@ -472,6 +472,7 @@ DEFAULT_CONFIG = {
             "mail_minutes": 180,        # resend period; 0 = only when it changes
             "cloudflared": "",          # empty = PATH, ~/.every_camera/bin, download
             "auto_download": True,
+            "protocol": "http2",        # QUIC is often blocked; "auto" tries it first
         },
     },
     # Friendly name of this machine, shown by viewer_app/focus_app/monitor

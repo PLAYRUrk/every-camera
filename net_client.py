@@ -74,8 +74,12 @@ class CameraClient:
         self.timeout = timeout
         # host:port or tunnel URL of the node that will do the fetching, or None.
         self.via = str(via) if via else None
+        via_token = None
+        if self.via and "://" in self.via:
+            # A pasted tunnel address may carry ?token=, which must not end up in paths.
+            self.via, _, via_token = parse_address(self.via)
         # Needed for POST through a tunnel; the LAN ignores it.
-        self.token = token or None
+        self.token = token or via_token or None
 
     @property
     def base_url(self):

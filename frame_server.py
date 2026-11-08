@@ -19,6 +19,7 @@ import select
 import socket
 import threading
 import time
+import traceback
 
 from datetime import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +47,8 @@ MAX_MJPEG_CLIENTS = 4
 MJPEG_BOUNDARY = "everycamframe"
 THUMB_MAX_SIDE = 256
 THUMB_CACHE_SIZE = 64
+# A broken endpoint polled by a page would otherwise fill the log.
+FAILURE_LOG_SECONDS = 60.0
 
 
 class _FrameHTTPServer(ThreadingHTTPServer):
@@ -241,9 +244,26 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
-            self._error(500, f"{type(exc).__name__}: {exc}")
+            self._fail(exc)
 
     do_HEAD = do_GET
+
+    _failure_lock = threading.Lock()
+    _failure_at = {}
+
+    def _fail(self, exc):
+        key = (self.command, urlparse(self.path).path, type(exc).__name__)
+        now = time.monotonic()
+        with self._failure_lock:
+            last = _Handler._failure_at.get(key)
+            log_it = last is None or now - last >= FAILURE_LOG_SECONDS
+            if log_it:
+                _Handler._failure_at[key] = now
+        if log_it:
+            where = "tunnel" if self.control_token is not None else "LAN"
+            console_ui.warn(f"Frame server ({where}): 500 on {key[0]} {key[1]}\n"
+                            f"{traceback.format_exc().rstrip()}")
+        self._error(500, f"{type(exc).__name__}: {exc}")
 
     def _token_ok(self):
         if self.control_token is None:
@@ -269,7 +289,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
-            self._error(500, f"{type(exc).__name__}: {exc}")
+            self._fail(exc)
 
     def _route_get(self, path):
         if path in ("/", "/index.html"):

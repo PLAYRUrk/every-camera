@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 
+from collections import deque
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -27,6 +28,17 @@ RESTART_BASE_SECONDS = 30.0
 RESTART_MAX_SECONDS = 600.0
 # api.trycloudflare.com appears in cloudflared's own errors; it is not a tunnel.
 URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
+# The URL is printed before the edge knows the tunnel; until this line it answers 530.
+REGISTERED_RE = re.compile(r"Registered tunnel connection")
+ERR_RE = re.compile(r"(?:^|\s)ERR\s")
+ERR_WARN_SECONDS = 60.0
+TAIL_LINES = 20
+# QUIC (UDP 7844) is often blocked at stations; TCP 443 nearly never.
+DEFAULT_PROTOCOL = "http2"
+# With --config pointing here, an ingress from ~/.cloudflared or /etc/cloudflared cannot
+# take over the quick tunnel and answer 503.
+CONFIG_STUB = "quick-tunnel.yml"
+CONFIG_STUB_TEXT = "no-autoupdate: true\n"
 TOKEN_HEADER = "X-Everycam-Token"
 
 
@@ -97,6 +109,12 @@ def download(bin_dir=None, timeout=DOWNLOAD_TIMEOUT):
         with urlopen(DOWNLOAD_BASE + asset, timeout=timeout) as response, \
                 open(tmp, "wb") as out:
             shutil.copyfileobj(response, out)
+        with open(tmp, "rb") as check:
+            magic = check.read(4)
+        # A captive portal or proxy answers 200 with a page; kept, it would be "found"
+        # on every later run.
+        if magic[:2] != b"MZ" and magic != b"\x7fELF":
+            raise ValueError(f"not an executable (starts with {magic!r})")
         if os.name != "nt":
             os.chmod(tmp, 0o755)
         os.replace(tmp, target)
@@ -214,6 +232,8 @@ class Tunnel:
         self._stop = threading.Event()
         self._thread = None
         self._job = None
+        self._err_at = None
+        self._err_skipped = 0
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -274,9 +294,29 @@ class Tunnel:
                 break
             delay = min(RESTART_MAX_SECONDS, delay * 2)
 
+    def _config_stub(self):
+        path = Path(self.bin_dir or BIN_DIR) / CONFIG_STUB
+        try:
+            if not path.is_file() or path.read_text(encoding="utf-8") != CONFIG_STUB_TEXT:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(CONFIG_STUB_TEXT, encoding="utf-8")
+            return str(path)
+        except OSError as exc:
+            console_ui.warn(f"Tunnel: cannot write {path}: {exc}; a cloudflared "
+                            f"config.yml on this machine may break the tunnel")
+            return None
+
+    def _args(self, binary):
+        args = [binary, "tunnel", "--no-autoupdate"]
+        config = self._config_stub()
+        if config:
+            args += ["--config", config]
+        protocol = str(self.cfg.get("protocol") or DEFAULT_PROTOCOL).strip()
+        args += ["--protocol", protocol, "--url", f"http://127.0.0.1:{self.port}"]
+        return args
+
     def _spawn(self, binary):
-        args = [binary, "tunnel", "--no-autoupdate",
-                "--url", f"http://127.0.0.1:{self.port}"]
+        args = self._args(binary)
         kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
                   "stdin": subprocess.DEVNULL}
         if os.name == "nt":
@@ -294,16 +334,39 @@ class Tunnel:
 
     def _run_once(self, binary):
         self._process = self._spawn(binary)
+        tail = deque(maxlen=TAIL_LINES)
+        candidate = None
+        # Read to the end even when nothing is wanted: a full pipe would stall cloudflared.
         for raw in self._process.stdout:
             if self._stop.is_set():
                 break
-            if self.url:
-                continue        # drained, or a full pipe would stall cloudflared
-            match = URL_RE.search(raw.decode("utf-8", errors="replace"))
-            if match:
-                self._set_url(match.group(0))
-                console_ui.log(f"Tunnel: {self.url}")
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            tail.append(line)
+            if not self.url:
+                match = URL_RE.search(line)
+                if match:
+                    candidate = match.group(0)
+                elif candidate and REGISTERED_RE.search(line):
+                    self._set_url(candidate)
+                    console_ui.log(f"Tunnel: {self.url}")
+            if ERR_RE.search(line):
+                self._warn_err(line)
         self._kill()
+        if not self._stop.is_set():
+            code = self._process.poll()
+            console_ui.warn(f"Tunnel: cloudflared exited with code {code}; its last "
+                            f"output:\n" + "\n".join(tail))
+
+    def _warn_err(self, line):
+        now = time.monotonic()
+        if self._err_at is not None and now - self._err_at < ERR_WARN_SECONDS:
+            self._err_skipped += 1
+            return
+        skipped = (f" ({self._err_skipped} more since the last one)"
+                   if self._err_skipped else "")
+        self._err_at = now
+        self._err_skipped = 0
+        console_ui.warn(f"Tunnel: cloudflared: {line}{skipped}")
 
     def _kill(self):
         process = self._process
