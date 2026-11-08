@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import time
+import queue
 import struct
 import threading
 import argparse
@@ -13,7 +14,7 @@ import console_ui
 
 import numpy as np
 
-from datetime import datetime as dt, timezone
+from datetime import datetime as dt, timedelta, timezone
 from pathlib import Path
 
 import frame_archive
@@ -74,6 +75,11 @@ USB_READ_TIMEOUT = 10000
 # Dead time added to every frame, and uneven, since the next integration starts
 # only when the read is done and the FIFO re-armed. The vendor's program polls at 5 ms.
 FIFO_POLL_INTERVAL = 0.005
+# A software-started frame cannot arrive before its exposure ends, so the polling only
+# begins this long before then: a minute-long exposure is not 12 000 status requests.
+POLL_LEAD_S = 0.3
+# How often a long frame wait lets the worker publish its status (cam.on_wait).
+WAIT_CALLBACK_INTERVAL = 2.0
 
 STATUS_FIFO_EMPTY = 0x08
 STATUS_FIFO_FULL = 0x10
@@ -92,6 +98,13 @@ PROCESSING_CAP_S = 0.5
 
 SPTT_CAPTURE_SECONDS = [0, 30]
 
+# USB transfer of a frame before one was timed.
+READ_ESTIMATE_S = 0.5
+# Arming, the last FIFO poll and clock jitter: what a capture needs besides its frame.
+SCHEDULE_MARGIN_S = 0.3
+# Frames that may wait for the disk before a capture is refused.
+WRITE_QUEUE_DEPTH = 4
+
 # Named from the top-left 2x2 cell, as FITS BAYERPAT does. RGGB is the ICX285AQ's
 # layout; sptt.bayer_pattern corrects a camera that reads out differently.
 BAYER_PATTERNS = ("RGGB", "GRBG", "GBRG", "BGGR")
@@ -108,6 +121,10 @@ KEEP = object()
 
 class FrameReadError(RuntimeError):
     """The camera stopped sending before the frame was complete."""
+
+
+class FrameCancelled(Exception):
+    """The wait for a frame was abandoned because the run is stopping."""
 
 
 class ExposureNotHonoured(RuntimeError):
@@ -196,6 +213,13 @@ def read_raw_frame(size, ep_tr):
     return chunks
 
 
+def _byte_view(buf):
+    try:
+        return np.frombuffer(buf, dtype=np.uint8)      # pyusb's array, without a copy
+    except TypeError:
+        return np.asarray(buf, dtype=np.uint8)
+
+
 def decode_frame(raw_chunks, w, h, encoding, binning=0, interlaced=True):
     """Unpack one raw USB transfer into a frame on the program's 0..65535 scale.
 
@@ -203,7 +227,8 @@ def decode_frame(raw_chunks, w, h, encoding, binning=0, interlaced=True):
     encoding. Done in numpy: per-pixel Python loops take about a second on a full
     744x576 frame, which is dead time in the focus loop and delays a stop.
     """
-    raw = np.frombuffer(b"".join(bytes(buf) for buf in raw_chunks), dtype=np.uint8)
+    raw = (np.concatenate([_byte_view(buf) for buf in raw_chunks])
+           if raw_chunks else np.empty(0, dtype=np.uint8))
 
     if encoding == ENCODING_12BPP:
         # Three bytes carry two pixels: the high eight bits of each, then
@@ -282,6 +307,67 @@ def seconds_to_next_capture(now, capture_seconds):
     return min(ahead) if ahead else 60 - sec + min(capture_seconds)
 
 
+def next_capture_at(now, capture_seconds):
+    """The first capture tick strictly after ``now``, as a whole-second datetime."""
+    tick = now + timedelta(seconds=seconds_to_next_capture(now, capture_seconds))
+    return (tick + timedelta(microseconds=500_000)).replace(microsecond=0)
+
+
+def idle_wait_s(now, capture_seconds, step=0.1):
+    """A loop pause that never sleeps past the next tick, so a capture starts on it."""
+    return max(0.0, min(step, seconds_to_next_capture(now, capture_seconds)))
+
+
+def missed_ticks(started, finished, capture_seconds):
+    """Ticks after ``started`` whose whole second went by before ``finished``.
+
+    A capture that ends inside a tick's second still fires it, late by under a second.
+    """
+    missed = []
+    tick = next_capture_at(started, capture_seconds)
+    while tick + timedelta(seconds=1) <= finished:
+        missed.append(tick)
+        tick = next_capture_at(tick, capture_seconds)
+    return missed
+
+
+def capture_gap_s(capture_seconds):
+    """The shortest interval between two captures, across the minute boundary too."""
+    secs = sorted({int(s) % 60 for s in capture_seconds})
+    if len(secs) < 2:
+        return 60.0
+    return float(min([b - a for a, b in zip(secs, secs[1:])]
+                     + [60 - secs[-1] + secs[0]]))
+
+
+def schedule_problem(cam, capture_seconds):
+    """A warning when a capture outlasts the gap to the next one, else None.
+
+    A capture that runs into the next tick's second makes the schedule skip it.
+    """
+    gap = capture_gap_s(capture_seconds)
+    need = cam.capture_time_estimate() + SCHEDULE_MARGIN_S
+    if need <= gap:
+        return None
+    longest = max(0.0, gap - (need - cam.exposure))
+    message = (f"SPTT exposure {cam.exposure:g} s does not fit the schedule: a capture "
+               f"takes about {need:.1f} s and the captures are {gap:g} s apart, so "
+               f"frames will be missed. The longest exposure that fits is about "
+               f"{longest:.1f} s")
+    if not cam.single_shot:
+        message += ("; in continuous mode a capture may wait a whole frame period, "
+                    "sptt.trigmode 2 starts each frame at its tick")
+    return message + "."
+
+
+def focus_grab(cam, grab):
+    """A focus frame for display, or None when the run is stopping: not a focus error."""
+    try:
+        return cam.for_display(grab())
+    except FrameCancelled:
+        return None
+
+
 def focus_frame_fits(now, capture_seconds, cam):
     """A focus frame begun at :59.3 would run past :00 and the scheduled frame would never
     be taken, so ``now`` not being a capture second is not enough.
@@ -336,6 +422,10 @@ class SpttCamera:
         self._armed_at = None
         # Lets a frame wait tell that a change from another thread overtook it.
         self._settings_gen = 0
+        # Set by a stopping worker: a frame wait can last a whole exposure.
+        self.cancel_event = threading.Event()
+        # Called from long frame waits, so a worker blocked in one still reports in.
+        self.on_wait = None
         # One USB conversation at a time: the GUI changes settings from its own thread, and
         # a status request interleaved with a frame readout gets the wrong bytes back.
         self._lock = threading.RLock()
@@ -453,8 +543,11 @@ class SpttCamera:
 
     @property
     def single_shot(self):
-        # An operator's external trigger mode is left alone.
-        return self.model.single_shot and self.trigmode in (0, TRIGMODE_SOFTSTART)
+        # An operator's external trigger mode is left alone. Software start is taken
+        # one frame at a time on any model: each frame needs its own CAM_START.
+        if self.trigmode == TRIGMODE_SOFTSTART:
+            return True
+        return self.model.single_shot and self.trigmode == 0
 
     @property
     def hardware_trigmode(self):
@@ -625,6 +718,19 @@ class SpttCamera:
             return self.exposure + 1.0
         return 2 * period_us / 1_000_000.0 + 1.0
 
+    def capture_time_estimate(self):
+        """From a scheduled tick to the frame read, settings unchanged.
+
+        A software-started frame takes its exposure; a free-running one may first have
+        to wait out the period under way.
+        """
+        read_s = self.last_read_s if self.last_read_s is not None else READ_ESTIMATE_S
+        if self.single_shot:
+            return self.exposure + read_s
+        period_us = (self.period_us
+                     or exposure_to_us(self.exposure) + PERIOD_READOUT_MARGIN_US)
+        return period_us / 1_000_000.0 + read_s
+
     def _trigger(self):
         self._read_done_at = None
         self._params_dirty = False
@@ -642,8 +748,28 @@ class SpttCamera:
     def _wait_for_fifo(self, budget):
         # The lock is taken per poll, not for the whole wait: a wait can last
         # a full exposure, and the GUI must be able to change a setting in it.
-        deadline = time.monotonic() + budget
-        while time.monotonic() < deadline:
+        start = time.monotonic()
+        deadline = start + budget
+        # Only a software start is known to begin the integration at _armed_at; a
+        # free-running camera may already be streaming into the FIFO.
+        quiet_until = ((self._armed_at or start) + self.exposure - POLL_LEAD_S
+                       if self.single_shot else start)
+        next_report = start + WAIT_CALLBACK_INTERVAL
+        while True:
+            now = time.monotonic()
+            if self.cancel_event.is_set():
+                raise FrameCancelled("Frame wait abandoned: the run is stopping")
+            if now >= deadline:
+                raise RuntimeError("FIFO timeout — no frame data")
+            if self.on_wait is not None and now >= next_report:
+                next_report = now + WAIT_CALLBACK_INTERVAL
+                try:
+                    self.on_wait()
+                except Exception:
+                    pass
+            if now < quiet_until:
+                self.cancel_event.wait(min(quiet_until, next_report, deadline) - now)
+                continue
             try:
                 with self._lock:
                     sb, _ = read_crb(self.ep_wr, self.ep_rd)
@@ -653,7 +779,6 @@ class SpttCamera:
             if not (sb & STATUS_FIFO_EMPTY):
                 return sb
             time.sleep(FIFO_POLL_INTERVAL)
-        raise RuntimeError("FIFO timeout — no frame data")
 
     def _read_one_frame(self):
         """Returns the arguments for decode_frame: decoding happens outside the USB lock."""
@@ -1068,6 +1193,67 @@ def _save_fits_minimal(filepath, frame, metadata=None):
         f.write(data)
 
 
+class FrameWriter(threading.Thread):
+    """Archives frames off the capture thread, so a slow disk delays a file and not the
+    next exposure.
+
+    ``results`` gets ``(filepath, error, summary)`` per frame; the worker counts them.
+    """
+
+    def __init__(self, cam, service=None, depth=WRITE_QUEUE_DEPTH):
+        super().__init__(daemon=True, name="sptt-writer")
+        self.cam = cam
+        self._service = service
+        self._jobs = queue.Queue(maxsize=depth)
+        self.results = queue.Queue()
+
+    def submit(self, filepath, frame, metadata, debayered, when, summary=""):
+        try:
+            self._jobs.put_nowait((filepath, frame, metadata, debayered, when, summary))
+        except queue.Full:
+            raise RuntimeError(f"{self._jobs.maxsize} frames are still waiting for "
+                               "the disk; this one is dropped") from None
+
+    def run(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            filepath, frame, metadata, debayered, when, summary = job
+            # Before the write: a focus frame taken meanwhile must not be overtaken
+            # by this older one.
+            if self._service is not None:
+                try:
+                    # Demosaiced: the focus measures would read a mosaic's colour
+                    # checkerboard as fine detail.
+                    self._service.publish_frame(self.cam.for_display(frame), when)
+                except Exception:
+                    pass
+            try:
+                save_fits(filepath, self.cam.to_rgb(frame) if debayered else frame,
+                          metadata)
+                self.results.put((filepath, None, summary))
+            except Exception as exc:
+                self.results.put((filepath, exc, summary))
+
+    def close(self, timeout=60.0):
+        """Writes what is queued, then ends the thread."""
+        if not self.is_alive():
+            return
+        try:
+            self._jobs.put(None, timeout=timeout)
+        except queue.Full:
+            return
+        self.join(timeout)
+
+    def take_results(self):
+        while True:
+            try:
+                yield self.results.get_nowait()
+            except queue.Empty:
+                return
+
+
 class SpttWorkerConsole(threading.Thread):
     MAX_CONSECUTIVE_ERRORS = 5
 
@@ -1094,8 +1280,14 @@ class SpttWorkerConsole(threading.Thread):
         self.failed = False
         self._shots = 0
         self._errors = 0
+        self._missed = 0
+        self._consecutive_errors = 0
         self._last_shot = None
         self._last_frame = None
+        self._writer = None
+        # Whether a schedule check has already used a timed transfer.
+        self._schedule_checked_read = False
+        self._last_status = "running"
         # Whether the last pass ran under a focus hold: entering and leaving it are
         # logged once, not ten times a second.
         self._held = False
@@ -1106,6 +1298,17 @@ class SpttWorkerConsole(threading.Thread):
 
     def request_stop(self):
         self._stop_event.set()
+        cancel = getattr(self.cam, "cancel_event", None)
+        if cancel is not None:
+            cancel.set()
+
+    def _check_schedule(self):
+        if self.setup_mode:
+            return
+        self._schedule_checked_read = self.cam.last_read_s is not None
+        problem = schedule_problem(self.cam, self.capture_seconds)
+        if problem:
+            console_ui.warn(problem)
 
     def _apply_params(self, params):
         applied = {}
@@ -1114,6 +1317,7 @@ class SpttWorkerConsole(threading.Thread):
             if "exposure" in params:
                 self.cam.set_exposure(float(params["exposure"]))
                 applied["exposure"] = float(params["exposure"])
+                self._check_schedule()
             if "gain" in params:
                 self.cam.set_gain(int(params["gain"]))
                 applied["gain"] = int(params["gain"])
@@ -1144,15 +1348,6 @@ class SpttWorkerConsole(threading.Thread):
             errors.append(str(e))
         return applied, errors
 
-    def _push_live_frame(self, frame, ts):
-        if self._service is not None:
-            try:
-                # Demosaiced: the focus measures would read a mosaic's colour checkerboard as fine
-                # detail. Sharpness and stats are taken over the mean of the colours.
-                self._service.publish_frame(self.cam.for_display(frame), ts)
-            except Exception:
-                pass
-
     def _current_params(self):
         return {
             "exposure": self.cam.exposure,
@@ -1182,14 +1377,12 @@ class SpttWorkerConsole(threading.Thread):
         # the contaminated one anyway, so the focus loop otherwise keeps its rate.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: self.cam.for_display(grab()),
+            self._service, lambda: focus_grab(self.cam, grab),
             on_error=lambda exc, stopped: console_ui.warn(
                           f"Focus frame failed: {exc}"
                           f"{' — focus mode disabled' if stopped else ''}"))
 
     def run(self):
-        last_fired = (-1, -1)
-        consecutive_errors = 0
         self._bus.prepare_status_dir()
         if self._service is not None:
             self._service.set_current_params(self._current_params())
@@ -1202,6 +1395,9 @@ class SpttWorkerConsole(threading.Thread):
                            f"{', sun permitting' if self.sun_gate else ''})")
             self._save_status("running", force=True)
 
+        cancel = getattr(self.cam, "cancel_event", None)
+        if cancel is not None and not self._stop_event.is_set():
+            cancel.clear()
         try:
             self.cam.start()
         except Exception as exc:
@@ -1211,11 +1407,37 @@ class SpttWorkerConsole(threading.Thread):
             self._bus.shutdown(failed=f"Failed to start camera: {exc}")
             return
 
+        self._writer = FrameWriter(self.cam, self._service)
+        self._writer.start()
+        if hasattr(self.cam, "on_wait"):
+            self.cam.on_wait = lambda: self._save_status(self._last_status)
+        if hasattr(self.cam, "capture_time_estimate"):
+            self._check_schedule()
+
         if self.sun_gate is not None:
             # The first altitude imports astropy, seconds: not on a capture second.
             self.sun_gate.is_open(dt.now())
 
+        try:
+            self._loop()
+        finally:
+            self.cam.stop()
+            self._writer.close()
+            self._collect_saved()
+
+        self._save_status("error" if self.failed else "stopped", force=True)
+        self._bus.shutdown(failed="consecutive capture errors" if self.failed else None)
+        console_ui.log("SPTT measurement stopped")
+
+    def _loop(self):
+        last_fired = (-1, -1)
         while not self._stop_event.is_set():
+            self._collect_saved()
+            if self._consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                console_ui.error(f"{self._consecutive_errors} consecutive errors, "
+                                 "stopping")
+                self.failed = True
+                return
             now = dt.now()
 
             fire_key = (now.minute, now.second)
@@ -1246,32 +1468,55 @@ class SpttWorkerConsole(threading.Thread):
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
                 ok = self._capture_one(now)
+                if ok is None:
+                    continue                # stopping
                 if ok:
-                    consecutive_errors = 0
-                    self._shots += 1
                     self._last_shot = now
                     self._save_status("running", force=True)
                 else:
-                    consecutive_errors += 1
+                    self._consecutive_errors += 1
                     self._errors += 1
                     self._save_status("error", force=True)
-                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        console_ui.error(f"{consecutive_errors} consecutive errors, stopping")
-                        self.failed = True
-                        break
+                self._note_missed(now, dt.now())
+                if (ok and not self._schedule_checked_read
+                        and hasattr(self.cam, "capture_time_estimate")):
+                    self._check_schedule()          # now with a timed transfer
+                continue
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
                 self._handle_focus(now)
 
             self._save_status("running")
-            self._stop_event.wait(0.1)
+            self._stop_event.wait(idle_wait_s(dt.now(), self.capture_seconds))
 
-        self.cam.stop()
-        self._save_status("error" if self.failed else "stopped", force=True)
-        self._bus.shutdown(failed="consecutive capture errors" if self.failed else None)
-        console_ui.log("SPTT measurement stopped")
+    def _note_missed(self, started, finished):
+        ticks = missed_ticks(started, finished, self.capture_seconds)
+        if not ticks:
+            return
+        self._missed += len(ticks)
+        took = (finished - started).total_seconds()
+        console_ui.warn(f"Missed the {', '.join(f'{t:%H:%M:%S}' for t in ticks)} "
+                        f"capture{'s' if len(ticks) > 1 else ''}: the one before "
+                        f"took {took:.1f} s")
+
+    def _collect_saved(self):
+        if self._writer is None:
+            return
+        for filepath, error, summary in self._writer.take_results():
+            if error is None:
+                self._shots += 1
+                self._consecutive_errors = 0
+                console_ui.log(f"Frame saved: {os.path.basename(filepath)} {summary}")
+            else:
+                self._errors += 1
+                self._consecutive_errors += 1
+                console_ui.error(f"Could not save {os.path.basename(filepath)}: {error}")
+                self._save_status("error", force=True)
 
     def _capture_one(self, now):
+        """True once the frame is queued for the disk, False on an error, None when the
+        run is stopping.
+        """
         timestamp = now.strftime("%Y%m%dT%H%M%S")
         filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
         try:
@@ -1279,18 +1524,16 @@ class SpttWorkerConsole(threading.Thread):
             frame = self.cam.grab_fresh_frame()
             debayered = self.debayer and self.cam.is_mosaic()
             metadata = frame_metadata(self.cam, now, debayered=debayered)
-
-            save_fits(filepath, self.cam.to_rgb(frame) if debayered else frame,
-                      metadata)
             self._last_frame = frame
-            self._push_live_frame(frame, now)
-            console_ui.log(f"Frame saved: {os.path.basename(filepath)} "
-                           f"({frame.shape[1]}x{frame.shape[0]}"
-                           f"{', RGB' if debayered else ''}, "
-                           f"exp={metadata['EXPTIME']}s, "
-                           f"period={metadata['PERIOD']}us, "
-                           f"gain={self.cam.gain})")
+            self._writer.submit(filepath, frame, metadata, debayered, now,
+                                f"({frame.shape[1]}x{frame.shape[0]}"
+                                f"{', RGB' if debayered else ''}, "
+                                f"exp={metadata['EXPTIME']}s, "
+                                f"period={metadata['PERIOD']}us, "
+                                f"gain={self.cam.gain})")
             return True
+        except FrameCancelled:
+            return None
         except Exception as exc:
             console_ui.error(f"Capture error: {exc}")
             return False
@@ -1320,6 +1563,7 @@ class SpttWorkerConsole(threading.Thread):
         return self._cam_status
 
     def _save_status(self, status, force=False):
+        self._last_status = status
         # focus_app only sees the values published here, so they follow the status cadence.
         publish_current_params(self._service, self._current_params)
         cam_status = self._camera_status(force)
@@ -1335,6 +1579,7 @@ class SpttWorkerConsole(threading.Thread):
             "shots_taken": self._shots,
             "last_shot": self._last_shot.isoformat() if self._last_shot else None,
             "errors": self._errors,
+            "missed": self._missed,
             "setup_mode": self.setup_mode,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
             "exposure_s": self.cam.exposure,
@@ -1358,7 +1603,7 @@ class SpttWorkerConsole(threading.Thread):
             console_ui.update(schedule=self.sun_gate.describe())
 
         console_ui.update(status=status, frames=self._shots, errors=self._errors,
-                          output_dir=self.output_dir)
+                          missed=self._missed, output_dir=self.output_dir)
         console_ui.set_section("camera", [
             ("Exposure / gain:", f"{self.cam.exposure} s  ·  {self.cam.gain}"),
             # On screen because a period shorter than the exposure silently truncates frames.
@@ -1367,6 +1612,7 @@ class SpttWorkerConsole(threading.Thread):
             ("Frame size:", f"{self.cam.w}x{self.cam.h}"),
             ("Encoding:", "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit"),
             ("CCD temperature:", str(cam_status.get("temp_ccd", "n/a"))),
+            ("Missed captures:", str(self._missed)),
         ])
         self._bus.publish_status(payload, force=force)
 

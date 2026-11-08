@@ -31,7 +31,7 @@ from utils import (
     load_schedule_safe,
     write_status_file, get_system_info,
     SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR, schedule_now, schedule_to_local,
-    unique_path,
+    unique_path, STATUS_MIN_INTERVAL,
 )
 from monitor import MonitorWidget
 from worker_common import (
@@ -750,15 +750,31 @@ class SpttScheduledWorkerQt(QThread):
         self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
         self._service = service
         self._stop = False
+        self._stop_event = threading.Event()
         self._shots = 0
         self._errors = 0
+        self._missed = 0
+        self._consecutive_errors = 0
         self._last_shot = None
         self._last_frame = None
+        self._writer = None
+        self._last_status = "running"
+        self._cam_status = {}
+        self._system_info = None
+        self._cam_status_at = None
         self._bus = WorkerBus("sptt", instance_name, status_dir,
                               service=service, status_suffix="_sptt")
 
     def request_stop(self):
         self._stop = True
+        self._stop_event.set()
+        self.cam.cancel_event.set()
+
+    def _check_schedule(self):
+        from sptt_driver import schedule_problem
+        problem = schedule_problem(self.cam, self.capture_seconds)
+        if problem:
+            self.log_msg.emit(problem, "warn")
 
     def _apply_sptt_params(self, params):
         applied = {}
@@ -768,6 +784,7 @@ class SpttScheduledWorkerQt(QThread):
             if "exposure" in params:
                 self.cam.set_exposure(float(params["exposure"]))
                 applied["exposure"] = float(params["exposure"])
+                self._check_schedule()
             if "gain" in params:
                 self.cam.set_gain(int(params["gain"]))
                 applied["gain"] = int(params["gain"])
@@ -800,17 +817,16 @@ class SpttScheduledWorkerQt(QThread):
         return applied, errors
 
     def run(self):
-        from sptt_driver import save_fits, frame_metadata, seconds_to_next_capture
+        from sptt_driver import FrameWriter
 
-        last_fired = (-1, -1)
-        waiting_saved = 0.0
-        consecutive_errors = 0
         self._bus.prepare_status_dir()
 
         self.log_msg.emit("SPTT measurement started", "info")
         self.status_msg.emit("Running")
         self._save_status("running", force=True)
 
+        if not self._stop:
+            self.cam.cancel_event.clear()
         try:
             self.cam.start()
         except Exception as e:
@@ -820,11 +836,40 @@ class SpttScheduledWorkerQt(QThread):
             self.finished.emit()
             return
 
+        self._writer = FrameWriter(self.cam, self._service)
+        self._writer.start()
+        self.cam.on_wait = lambda: self._save_status(self._last_status)
+        self._check_schedule()
+
         if self.sun_gate is not None:
             # The first altitude imports astropy, seconds: not on a capture second.
             self.sun_gate.is_open(dt.now())
 
+        try:
+            self._loop()
+        finally:
+            self.cam.on_wait = None
+            self.cam.stop()
+            self._writer.close()
+            self._collect_saved()
+
+        self._save_status("stopped", force=True)
+        self._bus.shutdown()
+        self.log_msg.emit("SPTT measurement stopped", "info")
+        self.finished.emit()
+
+    def _loop(self):
+        from sptt_driver import seconds_to_next_capture, idle_wait_s
+
+        last_fired = (-1, -1)
+        waiting_saved = 0.0
+        checked_read = self.cam.last_read_s is not None
         while not self._stop:
+            self._collect_saved()
+            if self._consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                self.log_msg.emit(f"Stopped: {self._consecutive_errors} consecutive "
+                                  "errors", "error")
+                return
             now = dt.now()
 
             if self.sun_gate is not None and not self.sun_gate.is_open(
@@ -833,12 +878,10 @@ class SpttScheduledWorkerQt(QThread):
                 self.countdown.emit(self.sun_gate.describe())
                 self.status_msg.emit("Waiting for the night")
                 self._handle_focus(now)
-                # Each save asks the camera for its status over USB: not ten times a
-                # second, but often enough that the sentinel does not call it hung.
                 if time.monotonic() - waiting_saved > 10.0:
                     waiting_saved = time.monotonic()
                     self._save_status("waiting", force=True)
-                self.msleep(100)
+                self._stop_event.wait(0.1)
                 continue
             waiting_saved = 0.0
 
@@ -848,46 +891,78 @@ class SpttScheduledWorkerQt(QThread):
             fire_key = (now.minute, now.second)
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
-                timestamp = now.strftime("%Y%m%dT%H%M%S")
-                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
-                try:
-                    # A frame started at the tick, not one that has been
-                    # sitting in the FIFO since the last capture.
-                    frame = self.cam.grab_fresh_frame()
-                    debayered = self.debayer and self.cam.is_mosaic()
-                    metadata = frame_metadata(self.cam, now, debayered=debayered)
-                    save_fits(filepath,
-                              self.cam.to_rgb(frame) if debayered else frame,
-                              metadata)
-                    self._last_frame = frame
-                    self._push_live(frame, now)
-                    self.log_msg.emit(f"Frame saved: {os.path.basename(filepath)}", "info")
-                    consecutive_errors = 0
-                    self._shots += 1
-                    self._last_shot = now
-                    self.shot_taken.emit(self._shots)
-                    self.status_msg.emit("Running")
-                    self._save_status("running", force=True)
-                except Exception as e:
-                    self.log_msg.emit(f"Capture error: {e}", "error")
-                    consecutive_errors += 1
+                ok = self._capture_one(now)
+                if ok is None:
+                    continue                # stopping
+                if not ok:
+                    self._consecutive_errors += 1
                     self._errors += 1
                     self.error_count.emit(self._errors)
                     self._save_status("error", force=True)
-                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        self.log_msg.emit(f"Stopped: {consecutive_errors} consecutive errors", "error")
-                        break
+                self._note_missed(now, dt.now())
+                if ok and not checked_read:
+                    checked_read = True
+                    self._check_schedule()          # now with a timed transfer
+                continue
             elif now.second not in self.capture_seconds:
                 last_fired = (-1, -1)
                 self._handle_focus(now)
 
-            self.msleep(100)
+            self._stop_event.wait(idle_wait_s(dt.now(), self.capture_seconds))
 
-        self.cam.stop()
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
-        self.log_msg.emit("SPTT measurement stopped", "info")
-        self.finished.emit()
+    def _capture_one(self, now):
+        """True once the frame is queued for the disk, False on an error, None when the
+        run is stopping.
+        """
+        from sptt_driver import frame_metadata, FrameCancelled
+        timestamp = now.strftime("%Y%m%dT%H%M%S")
+        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
+        try:
+            # A frame started at the tick, not one that has been
+            # sitting in the FIFO since the last capture.
+            frame = self.cam.grab_fresh_frame()
+            debayered = self.debayer and self.cam.is_mosaic()
+            metadata = frame_metadata(self.cam, now, debayered=debayered)
+            self._last_frame = frame
+            self._writer.submit(filepath, frame, metadata, debayered, now)
+            self._last_shot = now
+            return True
+        except FrameCancelled:
+            return None
+        except Exception as e:
+            self.log_msg.emit(f"Capture error: {e}", "error")
+            return False
+
+    def _collect_saved(self):
+        if self._writer is None:
+            return
+        for filepath, error, _ in self._writer.take_results():
+            name = os.path.basename(filepath)
+            if error is None:
+                self._shots += 1
+                self._consecutive_errors = 0
+                self.log_msg.emit(f"Frame saved: {name}", "info")
+                self.shot_taken.emit(self._shots)
+                self.status_msg.emit("Running")
+                self._save_status("running", force=True)
+            else:
+                self._errors += 1
+                self._consecutive_errors += 1
+                self.log_msg.emit(f"Could not save {name}: {error}", "error")
+                self.error_count.emit(self._errors)
+                self._save_status("error", force=True)
+
+    def _note_missed(self, started, finished):
+        from sptt_driver import missed_ticks
+        ticks = missed_ticks(started, finished, self.capture_seconds)
+        if not ticks:
+            return
+        self._missed += len(ticks)
+        took = (finished - started).total_seconds()
+        self.log_msg.emit(
+            f"Missed the {', '.join(f'{t:%H:%M:%S}' for t in ticks)} "
+            f"capture{'s' if len(ticks) > 1 else ''}: the one before took "
+            f"{took:.1f} s", "warn")
 
     def _current_params(self):
         return {"exposure": self.cam.exposure, "gain": self.cam.gain,
@@ -897,7 +972,7 @@ class SpttScheduledWorkerQt(QThread):
         """Scheduled captures win: skipped on capture seconds, and a focus session
         expires on its own if the observer's program goes away.
         """
-        from sptt_driver import focus_frame_fits
+        from sptt_driver import focus_frame_fits, focus_grab
         if self._service is None or not self._service.focus_active():
             return
         # Not just "not on a capture second": a focus frame that runs past
@@ -913,26 +988,33 @@ class SpttScheduledWorkerQt(QThread):
         # grab_frame drops the contaminated one either way.
         grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
         run_focus_iteration(
-            self._service, lambda: self.cam.for_display(grab()),
+            self._service, lambda: focus_grab(self.cam, grab),
             on_error=lambda exc, stopped: self.log_msg.emit(
                 f"Focus frame failed: {exc}"
                 + (" — focus mode disabled" if stopped else ""), "warn"))
 
-    def _push_live(self, frame, ts=None):
-        if self._service is not None:
-            try:
-                self._service.publish_frame(self.cam.for_display(frame), ts or dt.now())
-            except Exception:
-                pass
+    def _camera_status(self, force=False):
+        """Cached like the console worker's: each refresh is USB traffic and a disk stat."""
+        now = time.monotonic()
+        if (not force and self._cam_status_at is not None
+                and now - self._cam_status_at < STATUS_MIN_INTERVAL):
+            return self._cam_status
+        try:
+            self._cam_status = self.cam.get_status_info()
+        except Exception:
+            self._cam_status = {}
+        try:
+            self._system_info = get_system_info(self.output_dir)
+        except Exception:
+            pass
+        self._cam_status_at = now
+        return self._cam_status
 
     def _save_status(self, status, force=False):
         from sptt_driver import ENCODING_12BPP
+        self._last_status = status
         publish_current_params(self._service, self._current_params)
-        cam_status = {}
-        try:
-            cam_status = self.cam.get_status_info()
-        except Exception:
-            pass
+        cam_status = self._camera_status(force)
         payload = {
             "instance_name": self.instance_name,
             "camera_type": "sptt",
@@ -941,6 +1023,7 @@ class SpttScheduledWorkerQt(QThread):
             "shots_taken": self._shots,
             "last_shot": self._last_shot.isoformat() if self._last_shot else None,
             "errors": self._errors,
+            "missed": self._missed,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
             "exposure_s": self.cam.exposure,
             "gain": self.cam.gain,
@@ -952,10 +1035,8 @@ class SpttScheduledWorkerQt(QThread):
             payload["sun_altitude"] = self.sun_gate.angle
             payload["sun_max_angle"] = self.sun_gate.max_angle
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
-        try:
-            payload["system"] = get_system_info(self.output_dir)
-        except Exception:
-            pass
+        if self._system_info is not None:
+            payload["system"] = self._system_info
         self._bus.publish_status(payload, force=force)
 
 
@@ -1196,6 +1277,7 @@ class SpttTab(QWidget):
     def _on_preview_start(self):
         if not self.cam:
             return
+        self.cam.cancel_event.clear()
         try:
             self.cam.start()
         except Exception as e:
@@ -1358,6 +1440,10 @@ class SpttTab(QWidget):
             self._server = None
         _release_claim(self)
         self.btn_meas_stop.setEnabled(False)
+        if self.scheduled_worker and self.scheduled_worker.isRunning():
+            # Still writing queued frames: _on_meas_finished frees the camera.
+            self.lbl_meas_status.setText("Stopping…")
+            return
         self.btn_meas_start.setEnabled(self.cam is not None)
         self.btn_preview_start.setEnabled(self.cam is not None)
         self.lbl_meas_status.setText("Idle")
