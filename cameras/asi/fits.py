@@ -18,6 +18,7 @@ from ..common.fits import (  # noqa: F401
     UNKNOWN_TEMP, utc_string as _utc_string, write_core_header, write_image,
     write_legacy_keys,
 )
+from ..common.intensity_control import intensity_cards
 
 # imagerd_rt's ``SOFTWARE_VERSION``, which the processing program expects.
 LEGACY_VERSION = "3.0"
@@ -95,13 +96,7 @@ def write_fits(
         h["GAIN"] = (gain, "ADC analog gain: 1 Low, 2 Medium, 3 High")
     if set_temp is not None:
         h["SETTEMP"] = (set_temp, "[C] sensor temperature setpoint")
-    # SKYMEAN goes on every frame: it costs one pass over the array and answers the
-    # first question asked of an archived frame.
-    if sky_mean is not None:
-        h["SKYMEAN"] = (round(float(sky_mean), 2), "[ADU] mean frame intensity")
-    if split_count and split_count > 1:
-        h["SPLITNUM"] = (int(split_count), "sub-frames this slot was divided into")
-        h["SPLITIDX"] = (int(split_index), "index of this sub-frame, 1-based")
+    h.update(intensity_cards(sky_mean, split_count, split_index))
 
     write_legacy_keys(
         h,

@@ -58,6 +58,12 @@ def configure_iers():
     if hasattr(iers.conf, "iers_degraded_accuracy"):
         iers.conf.iers_degraded_accuracy = "ignore" if offline else "warn"
 
+    if offline:
+        # Polar motion past the bundled table falls back to the 50-year mean, arcsec
+        # level; offline this repeats on every start and says nothing new.
+        import warnings
+        warnings.filterwarnings("ignore", message=r"Tried to get polar motions")
+
     _iers_configured = True
     _iers_offline = offline
 

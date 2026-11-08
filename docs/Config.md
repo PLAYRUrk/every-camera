@@ -13,7 +13,6 @@
   "cannon": { },
   "sptt": { },
   "infra": { },
-  "sentry": { },
   "asi": { },
   "japan": { },
   "alerts": { "to": ["ivanov@example.ru"] },
@@ -28,7 +27,6 @@
 | `cannon` | [Canon](Camera-Canon.md#параметры) |
 | `sptt` | [SPTT](Camera-SPTT.md#параметры) |
 | `infra` | [Infra](Camera-Infra.md#параметры) |
-| `sentry` | [Sentry](Camera-Sentry.md#параметры) |
 | `asi` | [ASI](Camera-ASI.md#параметры) |
 | `japan` | [Japan](Camera-Japan.md#параметры) |
 | `alerts` | [Оповещения](Alerts.md#параметры) |

@@ -11,7 +11,6 @@
 - [Canon](Camera-Canon.md)
 - [SPTT](Camera-SPTT.md)
 - [Infra](Camera-Infra.md)
-- [Sentry](Camera-Sentry.md)
 - [ASI](Camera-ASI.md)
 - [Japan](Camera-Japan.md)
 

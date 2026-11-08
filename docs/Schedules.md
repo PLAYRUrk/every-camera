@@ -6,7 +6,6 @@
 |---|---|
 | Canon, Infra | [файл интервалов](#файл-интервалов-canon-и-infra) |
 | SPTT | не нужно: `capture_seconds` |
-| Sentry | [`slots` в `config.json`](Camera-Sentry.md#слоты) |
 | ASI, Japan | [слоты и режимы](#режимы-asi-и-japan) в `config.json` или файле |
 
 Камера без расписания не падает, а поднимается в [режиме настройки](Setup-Mode.md).

@@ -19,6 +19,7 @@ from astropy.io import fits
 from ..common.fits import (  # noqa: F401
     UNKNOWN_TEMP, write_core_header, write_image, write_legacy_keys,
 )
+from ..common.intensity_control import intensity_cards
 
 # READSPD carries DCAM's READOUTSPEED setting, an enumeration of 1 or 2, so the shared
 # "[MHz]" comment would be wrong.
@@ -140,13 +141,7 @@ def write_sun_cycle_fits(
         instrument=False,
     )
     h["NAME"] = (name, "instrument name")
-    # SKYMEAN goes on every frame: it costs one pass over the array and answers the
-    # first question asked of an archived frame.
-    if sky_mean is not None:
-        h["SKYMEAN"] = (round(float(sky_mean), 2), "[ADU] mean frame intensity")
-    if split_count and split_count > 1:
-        h["SPLITNUM"] = (int(split_count), "sub-frames this slot was divided into")
-        h["SPLITIDX"] = (int(split_index), "index of this sub-frame, 1-based")
+    h.update(intensity_cards(sky_mean, split_count, split_index))
     write_legacy_keys(
         h,
         binning=binning,

@@ -11,7 +11,6 @@ python main.py --type infra --preview
 | Canon | `preview_<экземпляр>.png` | непрерывная съёмка |
 | SPTT | `preview_<экземпляр>.png` | непрерывная съёмка |
 | Infra | `preview_<экземпляр>.fits` | непрерывная съёмка |
-| Sentry | `preview_<экземпляр>.fits` | копия `image.fits` при каждом новом кадре |
 | ASI | `preview_<экземпляр>.fits` | непрерывная съёмка |
 | Japan | `preview_<экземпляр>.fits` | непрерывная съёмка |
 

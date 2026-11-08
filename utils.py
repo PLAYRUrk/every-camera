@@ -120,6 +120,65 @@ def _lock_file_exclusive(fd):
     return True
 
 
+def _same_file(fd, path):
+    """A lock taken on an inode another process has just unlinked reserves nothing."""
+    try:
+        held, current = os.fstat(fd), os.stat(path)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+
+def _replace_foreign_lock(path):
+    """A lock file left by another user — a run as root before ``User=`` was set — opens
+    read-only only, but the directory still lets its owner replace it.
+
+    True: replaced, try again. False: a live process holds it. None: cannot tell.
+    """
+    if os.name != "posix":
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        if not _lock_file_exclusive(fd):
+            return False
+        os.unlink(path)
+        return True
+    except OSError as exc:
+        console_ui.warn(f"Cannot replace {path}, left by another user: {exc}. "
+                        f"Run: sudo chown -R $(id -un): "
+                        f"{os.path.dirname(os.path.dirname(path))}")
+        return None
+    finally:
+        os.close(fd)
+
+
+def _open_lock_file(path, attempts=3):
+    """A locked descriptor of ``path``, or None when the name is taken or unusable."""
+    for _ in range(attempts):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        except PermissionError:
+            if _replace_foreign_lock(path):
+                continue
+            return None
+        except OSError:
+            return None
+        try:
+            locked = _lock_file_exclusive(fd)
+        except NotImplementedError:
+            os.close(fd)
+            raise
+        if locked and _same_file(fd, path):
+            return fd
+        os.close(fd)
+        if not locked:
+            return None
+    return None
+
+
 def claim_instance_name(base_name, lock_dir=None):
     """Appends ``-2``, ``-3`` ... while a *live* process holds the name, so several
     copies can run from one identical config.json without sharing log or preview files.
@@ -141,20 +200,14 @@ def claim_instance_name(base_name, lock_dir=None):
         name = base_name if ordinal == 1 else f"{base_name}-{ordinal}"
         path = os.path.join(directory, f"{name}.lock")
         try:
-            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
-        except OSError:
-            continue
-        try:
-            locked = _lock_file_exclusive(fd)
+            fd = _open_lock_file(path)
         except NotImplementedError:
-            os.close(fd)
             console_ui.warn(f"This platform offers no file locking; instance "
                             f"name '{base_name}' is not reserved. Run one copy "
                             f"at a time, or set distinct instance names.")
             return InstanceClaim(base_name)
-        if not locked:
-            os.close(fd)          # held by a live process — try the next name
-            continue
+        if fd is None:
+            continue              # held by a live process — try the next name
         try:
             os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()}\n".encode())
@@ -225,6 +278,30 @@ DEFAULT_CONFIG = {
             "lon": 0.0,
             "elevation": 0.0,
         },
+        # mode "sun" only: open the window at sun_start_angle and hold a mean frame
+        # intensity until the sun reaches sun_max_angle. Same keys as asi.preflight.
+        "preflight": {
+            "enabled": False,
+            "sun_start_angle": -6.0,    # must be ABOVE sun_max_angle
+            "target_mean": 20000.0,     # mean frame intensity to hold, ADU 0..65535
+            "tolerance": 0.15,          # deadband, as a fraction of the target
+            "min_exposure": 0.05,       # shortest exposure the loop may pick, s
+            "max_exposure": None,       # None = no longer than "exposure"
+            "max_step": 4.0,            # largest exposure change per measurement
+            "bias": 0.0,                # pedestal, ADU: SPTT takes no darks
+        },
+        # Divide a tick's frame into shorter sub-frames within exposure + readout
+        # when it comes back over the threshold. Same keys as asi.overexposure.
+        "overexposure": {
+            "enabled": False,
+            "threshold": 55000.0,       # mean ADU above which the frame divides
+            "release": 0.85,            # hysteresis on the way back to one frame
+            "max_splits": 4,
+            "min_exposure": 0.05,       # shortest sub-frame, s
+            "margin": 0.5,              # slack kept inside the frame budget, s
+            "min_frame_gap": 1.0,       # sub-frames stay this far apart, s
+            "bias": 0.0,                # pedestal, ADU: these cameras take no darks
+        },
     },
     "infra": {
         "instance_name": "",
@@ -235,6 +312,18 @@ DEFAULT_CONFIG = {
         "gain": 0,
         "roi": "1280x1024",
         "save_format": "tiff",
+        # Same as sptt.overexposure; a frame interval measured on the stream is the
+        # dead time, so millisecond exposures cannot be divided.
+        "overexposure": {
+            "enabled": False,
+            "threshold": 55000.0,       # mean ADU above which the frame divides
+            "release": 0.85,            # hysteresis on the way back to one frame
+            "max_splits": 4,
+            "min_exposure": 0.05,       # shortest sub-frame, s
+            "margin": 0.5,              # slack kept inside the frame budget, s
+            "min_frame_gap": 1.0,       # sub-frames stay this far apart, s
+            "bias": 0.0,                # pedestal, ADU: these cameras take no darks
+        },
     },
     # ASI all-sky imager: Princeton PIXIS through PICAM + SmartMotor filter wheel.
     # The schedule lives here rather than in a separate file; ``schedule_file``
@@ -417,18 +506,6 @@ DEFAULT_CONFIG = {
         # (cameras/common/filters.py). {"slot":1,"wavelength":"5577",
         # "description":"557.7nm x 2.0nm"}
         "filters": [],
-    },
-    "sentry": {
-        "instance_name": "",
-        "imagerd_rt_dir": "/usr/local/imagerd_rt",
-        "output_dir": "",
-        "device_id": "ASI1",
-        "site_id": "SITE",
-        "zenith_angle_start": -10,
-        "schedule_len_ms": 1440000,
-        "imaging_mode": "schedule",
-        "capture_seconds": [0, 30],
-        "slots": [],
     },
     # Alert mail. Only "to" has to be filled in: the sender's credentials live in
     # ~/.every_camera/mail_account.json. See mailer.py.
@@ -938,6 +1015,45 @@ def configure_console_cannon(cfg, config_path=None):
     print("\nConfiguration saved.\n")
 
 
+def _ask_preflight(name, section):
+    """Keeps the keys it does not ask about: a station that tuned them by hand must not
+    lose them to a pass through the wizard.
+    """
+    preflight = _deep_copy(DEFAULT_CONFIG[name]["preflight"])
+    preflight.update(section.get("preflight") or {})
+    preflight["enabled"] = _ask_bool(
+        "Start earlier, in the bright twilight, with automatic exposure?",
+        preflight.get("enabled", False))
+    if preflight["enabled"]:
+        preflight["sun_start_angle"] = _ask_float(
+            f"  Start the automatic stage below (degrees, above "
+            f"{section.get('sun_max_angle', -10.0):g})",
+            preflight.get("sun_start_angle", -6.0))
+        preflight["target_mean"] = _ask_float(
+            "  Mean frame intensity to hold (ADU, 0-65535)",
+            preflight.get("target_mean", 20000.0))
+        preflight["min_exposure"] = _ask_float(
+            "  Shortest exposure the loop may pick (s)",
+            preflight.get("min_exposure", 0.05))
+    section["preflight"] = preflight
+
+
+def _ask_overexposure(name, section):
+    guard = _deep_copy(DEFAULT_CONFIG[name]["overexposure"])
+    guard.update(section.get("overexposure") or {})
+    guard["enabled"] = _ask_bool(
+        "Split a frame into shorter ones when it over-exposes?",
+        guard.get("enabled", False))
+    if guard["enabled"]:
+        guard["threshold"] = _ask_float(
+            "  Mean intensity above which the frame splits (ADU, 0-65535)",
+            guard.get("threshold", 55000.0))
+        guard["max_splits"] = _ask_int(
+            "  Most sub-frames one frame may be divided into",
+            guard.get("max_splits", 4))
+    section["overexposure"] = guard
+
+
 def configure_console_sptt(cfg, config_path=None):
     sptt = cfg.get("sptt", {})
     print("\n--- SPTT (CSDU-429/423/285C) Camera Configuration ---\n")
@@ -986,8 +1102,10 @@ def configure_console_sptt(cfg, config_path=None):
         location["elevation"] = _ask_float("Site elevation (m)",
                                            location.get("elevation", 0.0))
         sptt["location"] = location
+        _ask_preflight("sptt", sptt)
     else:
         sptt["mode"] = "always"
+    _ask_overexposure("sptt", sptt)
 
     cfg["sptt"] = sptt
     _configure_server(cfg)
@@ -1017,72 +1135,9 @@ def configure_console_infra(cfg, config_path=None):
     infra["roi"] = roi if roi in ("1280x256", "1280x1024") else "1280x1024"
     fmt = _ask("Save format (tiff, png or fits)", infra.get("save_format", "tiff"))
     infra["save_format"] = fmt if fmt in ("tiff", "png", "fits") else "tiff"
+    _ask_overexposure("infra", infra)
 
     cfg["infra"] = infra
-    _configure_server(cfg)
-
-    save_config(cfg, config_path)
-    print("\nConfiguration saved.\n")
-
-
-def configure_console_sentry(cfg, config_path=None):
-    sentry = cfg.get("sentry", {})
-    print("\n--- Sentry (imagerd_rt) Camera Configuration ---\n")
-
-    sentry["imagerd_rt_dir"] = _ask(
-        "imagerd_rt installation directory",
-        sentry.get("imagerd_rt_dir", "/usr/local/imagerd_rt"),
-    )
-    sentry["output_dir"] = _ask(
-        "Output directory for archived FITS files (optional)",
-        sentry.get("output_dir", ""),
-    )
-    sentry["instance_name"] = _ask(
-        "Instance name (auto if empty)",
-        sentry.get("instance_name", ""),
-    )
-    sentry["device_id"] = _ask("Camera device ID", sentry.get("device_id", "ASI1"))
-    sentry["site_id"] = _ask("Site ID", sentry.get("site_id", "SITE"))
-    sentry["zenith_angle_start"] = _ask_float(
-        "Solar zenith angle to start imaging (degrees, negative = below horizon)",
-        sentry.get("zenith_angle_start", -10),
-    )
-    sentry["schedule_len_ms"] = _ask_int(
-        "Schedule cycle length (ms)", sentry.get("schedule_len_ms", 1440000)
-    )
-    cur_mode = sentry.get("imaging_mode", "schedule")
-    if isinstance(cur_mode, int):
-        cur_mode = "schedule" if cur_mode == 0 else "rapid"
-    mode_in = _ask("Imaging mode (schedule / rapid)", cur_mode)
-    sentry["imaging_mode"] = mode_in if mode_in in ("schedule", "rapid") else "schedule"
-
-    secs_str = _ask(
-        "Capture seconds for the status publish (comma-separated)",
-        ", ".join(str(s) for s in sentry.get("capture_seconds", [0, 30])),
-    )
-    try:
-        sentry["capture_seconds"] = [int(s.strip()) for s in secs_str.split(",") if s.strip()]
-    except ValueError:
-        sentry["capture_seconds"] = [0, 30]
-
-    if _ask_bool("Configure imaging slots now?", bool(sentry.get("slots"))):
-        slots = []
-        while True:
-            print(f"\n  Slot {len(slots) + 1}:")
-            slot = {
-                "filter_num":  _ask_int("    Filter number", 1),
-                "start_ms":    _ask_int("    Start time in cycle (ms)", 0),
-                "exposure_ms": _ask_int("    Exposure length (ms)", 55000),
-                "binning":     _ask_int("    Binning (1/2/4)", 2),
-                "gain":        _ask_int("    CCD gain (1-3)", 3),
-                "readout_ms":  _ask_int("    Filter wheel + readout overhead (ms)", 5000),
-            }
-            slots.append(slot)
-            if not _ask_bool("  Add another slot?", False):
-                break
-        sentry["slots"] = slots
-
-    cfg["sentry"] = sentry
     _configure_server(cfg)
 
     save_config(cfg, config_path)

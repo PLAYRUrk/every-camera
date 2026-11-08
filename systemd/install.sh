@@ -20,7 +20,7 @@ usage() {
     cat <<EOF
 Usage: sudo $0 <camera-type> [--user NAME] [--python PATH] [--config-dir DIR]
 
-  camera-type    asi | japan | sentry | cannon | sptt | infra, optionally
+  camera-type    asi | japan | cannon | sptt | infra, optionally
                  with a label for a second camera of a type: sptt-north
   --user NAME    whose home receives the logs and status files
                  (default: the user invoking sudo)
@@ -48,7 +48,7 @@ done
 
 [[ -n "$CAMERA" ]] || { usage; exit 1; }
 case "${CAMERA%%-*}" in
-    asi|japan|sentry|cannon|sptt|infra) ;;
+    asi|japan|cannon|sptt|infra) ;;
     *) die "unknown camera type '$CAMERA'" ;;
 esac
 [[ "$CAMERA" =~ ^[a-z]+(-[A-Za-z0-9_]+)?$ ]]     || die "a label may hold only letters, digits and _: '$CAMERA'"

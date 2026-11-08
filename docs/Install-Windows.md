@@ -12,7 +12,6 @@
 | `alerts.py`, `mailer.py`, `sentinel.py` | да |
 | Камера ASI | нет: в `cameras/asi/picam.py` нет кандидата `Picam.dll` |
 | Камера Canon | нет: нужны `gphoto2`, `gio`, `pkill`, `fuser` |
-| Камера Sentry | нет: управляет Linux-демоном `imagerd_rt` |
 | Камера Infra | нет: нужны `libTanhoAPI.so` и `libusb-1.0.so.0` |
 | `run.sh`, systemd | нет, вместо них `run.cmd` и «Планировщик заданий» |
 

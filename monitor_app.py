@@ -135,15 +135,6 @@ def camera_rows(rec):
                     if rec.get(key)]
         if settings:
             rows.append(("Camera", " · ".join(settings)))
-    elif kind == "sentry":
-        if rec.get("daemon_running") is not None:
-            rows.append(("imagerd_rt",
-                         "running" if rec["daemon_running"] else "DOWN"))
-        if rec.get("ccdtemp") is not None:
-            rows.append(("Sensor", f"{rec['ccdtemp']} °C"))
-        if rec.get("seqno") is not None:
-            rows.append(("Sequence", str(rec["seqno"])))
-
     shots = rec.get("shots_taken")
     if shots is not None:
         text = str(shots)

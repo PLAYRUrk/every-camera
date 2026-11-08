@@ -2,7 +2,7 @@
 
 `schedule_generator.py` рассчитывает время захода и восхода Солнца через заданный угол высоты и создаёт [файл интервалов](Schedules.md#файл-интервалов-canon-и-infra) для камер Canon и Infra.
 
-Нужен `astropy`, он входит в зависимости SPTT, Infra, ASI, Japan и Sentry.
+Нужен `astropy`, он входит в зависимости SPTT, Infra, ASI и Japan.
 
 ## Использование
 

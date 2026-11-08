@@ -96,4 +96,9 @@ class TelemetryLog:
         except Exception as exc:
             if not self._failed:
                 self._failed = True
-                console_ui.warn(f"Telemetry not written: {exc}")
+                hint = ""
+                if isinstance(exc, PermissionError):
+                    # Typically left by a run as root before the service got User=.
+                    hint = (f" — fix the owner: sudo chown -R $(id -un): "
+                            f"{self._dir.parent}")
+                console_ui.warn(f"Telemetry not written: {exc}{hint}")

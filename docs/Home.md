@@ -7,7 +7,6 @@
 | [`cannon`](Camera-Canon.md) | Canon DSLR через gphoto2 | JPEG |
 | [`sptt`](Camera-SPTT.md) | CSDU-429/423, CSDU-285C по USB | FITS |
 | [`infra`](Camera-Infra.md) | Tanho SW1300 SWIR | TIFF, PNG или FITS |
-| [`sentry`](Camera-Sentry.md) | Princeton CCD через демон `imagerd_rt` | FITS |
 | [`asi`](Camera-ASI.md) | всенебный имиджер: Princeton PIXIS (PICAM) и колесо фильтров | FITS |
 | [`japan`](Camera-Japan.md) | всенебный имиджер: Hamamatsu (DCAM-API) и колесо фильтров | FITS |
 

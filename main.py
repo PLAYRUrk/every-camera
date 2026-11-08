@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import can_use_gui
 
-CAMERA_TYPES = ("cannon", "sptt", "infra", "sentry", "asi", "japan")
+CAMERA_TYPES = ("cannon", "sptt", "infra", "asi", "japan")
 
 
 def camera_type(value):
@@ -33,7 +33,6 @@ Camera types:
   cannon    Canon DSLR cameras via gphoto2 (schedule-based capture, JPEG)
   sptt      CSDU-429 scientific camera via USB (captures at :00 and :30, FITS)
   infra     SW1300 SWIR camera (Tanho THCAMSW1300, schedule-based, TIFF/PNG/FITS)
-  sentry    Princeton Instruments CCD via imagerd_rt daemon (FITS, autonomous schedule)
   asi       ASI all-sky imager: Princeton PIXIS via PICAM + filter wheel (FITS)
   japan     Japan all-sky imager: Hamamatsu via DCAM-API + filter wheel (FITS)
 
@@ -101,11 +100,6 @@ that mode explicitly, even when a schedule is configured.
             run_console_infra(args.config, preview=args.preview,
                               verbose=args.verbose,
                               setup_mode=args.setup)
-        elif args.type == "sentry":
-            from cameras.sentry_driver import run_console_sentry
-            run_console_sentry(args.config, preview=args.preview,
-                               verbose=args.verbose,
-                               setup_mode=args.setup)
         elif args.type == "asi":
             if args.probe:
                 from cameras.asi_driver import run_probe_asi
@@ -129,7 +123,7 @@ that mode explicitly, even when a schedule is configured.
         run_gui(args)
     else:
         print("Error: No display available. "
-              "Use --type <cannon|sptt|infra|sentry|asi|japan> for console mode.")
+              "Use --type <cannon|sptt|infra|asi|japan> for console mode.")
         print("       Or use --gui to force GUI mode (requires DISPLAY).")
         parser.print_help()
         sys.exit(1)

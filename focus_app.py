@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Live view for focusing: streams frames, edits camera parameters, scores sharpness.
 
-Controls come from ``GET /api/params``; sentry, whose schedule belongs to imagerd_rt,
-is read-only. ``--via`` reaches a camera through another one (``gateway.py``).
+Controls come from ``GET /api/params``. ``--via`` reaches a camera through another one
+(``gateway.py``).
 
 Measurements stay safe: free-running needs a renewed deadline, so losing this program
 returns the camera to schedule-only within a minute, and the camera skips focus frames
@@ -392,9 +392,7 @@ class ParamForm(QGroupBox):
 
         if not schema:
             self._hint.setText(
-                "This camera does not accept live parameter changes.\n"
-                "For the sentry camera the schedule lives in schedule.conf and "
-                "only takes effect when imagerd_rt restarts.")
+                "This camera does not accept live parameter changes.")
             self.btn_apply.setEnabled(False)
             self.btn_revert.setEnabled(False)
             return
@@ -939,9 +937,8 @@ class FocusWindow(QMainWindow):
         """
         if not info.get("hold_supported", True):
             self._status(
-                f"{info.get('instance_name')}'s schedule belongs to its "
-                f"imagerd_rt daemon — focusing cannot pause it, so the live "
-                f"view shows whatever the daemon is producing.")
+                f"{info.get('instance_name')} cannot pause its schedule for "
+                f"focusing — the live view shows the scheduled frames.")
             return True
         if info.get("setup_mode") or not info.get("schedule_active"):
             return True

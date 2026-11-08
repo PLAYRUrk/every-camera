@@ -38,6 +38,14 @@ from .sptt_load_firmware import (
     load_fx2_firmware, wait_for_configured_device, load_fpga_bitstream,
 )
 from .common.sun_gate import SunSettingsError, gate_from_config
+from .common.exposure import frame_stats
+from .common.exposure_config import (
+    PreflightCfg, OverexposureCfg, parse_preflight, parse_overexposure,
+    check_threshold_above_target,
+)
+from .common.intensity_control import (
+    IntensityController, TickSlot, intensity_cards, shoot_split,
+)
 from .sptt_timing import (
     exposure_to_us, derive_period_us, exposure_mismatch, period_mismatch,
     describe_timing, PERIOD_READOUT_MARGIN_US, CMD_VALUE_MAX,
@@ -1062,6 +1070,26 @@ def _load_firmware(backend, model, port, dev_raw, fx2_blocks, fpga_data):
     return False
 
 
+def intensity_settings(section):
+    """``(preflight, overexposure, errors)``; a stage that cannot run as configured is
+    switched off and reported. Preflight needs ``mode: "sun"``: it starts at a solar
+    altitude.
+    """
+    section = section or {}
+    errors = []
+    mode = str(section.get("mode") or "always").strip().lower()
+    try:
+        sun_max_angle = float(section.get("sun_max_angle", -10.0))
+    except (TypeError, ValueError):
+        sun_max_angle = -10.0
+    preflight = parse_preflight(section.get("preflight") or {}, mode, sun_max_angle,
+                                errors, prefix="sptt", modes=("sun",))
+    overexposure = parse_overexposure(section.get("overexposure") or {}, errors,
+                                      prefix="sptt")
+    check_threshold_above_target(preflight, overexposure, errors, prefix="sptt")
+    return preflight, overexposure, errors
+
+
 def frame_metadata(cam, when, status=None, debayered=False):
     """The FITS header for one archived SPTT frame.
 
@@ -1160,6 +1188,8 @@ def _save_fits_minimal(filepath, frame, metadata=None):
     if metadata:
         for key, value in metadata.items():
             fits_key = key[:8].upper().ljust(8)
+            if isinstance(value, tuple):
+                value = value[0]
             if isinstance(value, bool):
                 val_str = "T" if value else "F"
                 cards.append(f"{fits_key}= {val_str:>20s}")
@@ -1259,7 +1289,8 @@ class SpttWorkerConsole(threading.Thread):
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
                  capture_seconds=None, service=None, node_name="",
-                 setup_mode=False, debayer=False, sun_gate=None):
+                 setup_mode=False, debayer=False, sun_gate=None,
+                 preflight=None, overexposure=None):
         super().__init__(daemon=True)
         self.cam = cam
         # None: captures around the clock.
@@ -1295,6 +1326,16 @@ class SpttWorkerConsole(threading.Thread):
         self._cam_status = {}
         self._cam_status_at = None
         self._system_info = None
+        # The exposure the operator set, which focus_app and the status report. A split
+        # or preflight exposure stays on the camera between ticks: in continuous mode
+        # every change costs a dropped frame, so it moves only when the plan does.
+        self._base_exposure = None
+        self._last_mean = None
+        self._last_saturation = 0.0
+        self._night = None
+        self._intensity = IntensityController(
+            preflight or PreflightCfg(), overexposure or OverexposureCfg(),
+            budget=self._preflight_budget, dead_time=self._dead_time)
 
     def request_stop(self):
         self._stop_event.set()
@@ -1316,6 +1357,7 @@ class SpttWorkerConsole(threading.Thread):
         try:
             if "exposure" in params:
                 self.cam.set_exposure(float(params["exposure"]))
+                self._base_exposure = float(params["exposure"])
                 applied["exposure"] = float(params["exposure"])
                 self._check_schedule()
             if "gain" in params:
@@ -1350,7 +1392,8 @@ class SpttWorkerConsole(threading.Thread):
 
     def _current_params(self):
         return {
-            "exposure": self.cam.exposure,
+            "exposure": (self.cam.exposure if self._base_exposure is None
+                         else self._base_exposure),
             "gain": self.cam.gain,
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
@@ -1407,6 +1450,8 @@ class SpttWorkerConsole(threading.Thread):
             self._bus.shutdown(failed=f"Failed to start camera: {exc}")
             return
 
+        self._base_exposure = float(self.cam.exposure)
+        self._intensity.begin_session()
         self._writer = FrameWriter(self.cam, self._service)
         self._writer.start()
         if hasattr(self.cam, "on_wait"):
@@ -1421,6 +1466,10 @@ class SpttWorkerConsole(threading.Thread):
         try:
             self._loop()
         finally:
+            if hasattr(self.cam, "on_wait"):
+                # The camera outlives the run in the GUI, whose preview would keep
+                # publishing this finished worker's status.
+                self.cam.on_wait = None
             self.cam.stop()
             self._writer.close()
             self._collect_saved()
@@ -1465,9 +1514,10 @@ class SpttWorkerConsole(threading.Thread):
                 self._save_status("waiting")
                 self._stop_event.wait(0.1)
                 continue
+            self._follow_sun_stage()
             if now.second in self.capture_seconds and fire_key != last_fired:
                 last_fired = fire_key
-                ok = self._capture_one(now)
+                ok = self._capture_tick(now)
                 if ok is None:
                     continue                # stopping
                 if ok:
@@ -1513,24 +1563,112 @@ class SpttWorkerConsole(threading.Thread):
                 console_ui.error(f"Could not save {os.path.basename(filepath)}: {error}")
                 self._save_status("error", force=True)
 
-    def _capture_one(self, now):
+    def _follow_sun_stage(self):
+        """A new night starts from the scheduled exposure; the sun reaching
+        ``sun_max_angle`` ends the automatic stage.
+        """
+        gate = self.sun_gate
+        if gate is None:
+            return
+        if gate.night != self._night:
+            self._night = gate.night
+            self._intensity.begin_session(preflight=gate.stage == "preflight")
+            if self._intensity.stage == "preflight":
+                console_ui.log(f"Preflight stage: holding "
+                               f"{self._intensity.preflight.target_mean:.0f} ADU until "
+                               f"the sun reaches {gate.max_angle:g}°")
+        elif gate.stage == "main" and self._intensity.stage == "preflight":
+            self._intensity.enter_main(f"Sun at {gate.max_angle:g}° — scheduled "
+                                       f"exposure {self._base_exposure:g} s")
+
+    def _dead_time(self):
+        """From the end of one exposure to the start of the next one asked for at once."""
+        estimate = getattr(self.cam, "capture_time_estimate", None)
+        if estimate is None:
+            return READ_ESTIMATE_S
+        return max(float(estimate()) - float(self.cam.exposure), 0.0)
+
+    def _preflight_budget(self, entry):
+        """The longest exposure that still leaves the next tick its start. A free-running
+        camera drops the frame under way when the exposure changes, which preflight
+        does on most ticks.
+        """
+        dropped = 0.0
+        if not getattr(self.cam, "single_shot", True):
+            dropped = (getattr(self.cam, "period_us", 0) or 0) / 1e6
+        return max(capture_gap_s(self.capture_seconds) - self._dead_time()
+                   - SCHEDULE_MARGIN_S - dropped, 0.0)
+
+    def _obs_mode(self):
+        if self.sun_gate is None:
+            return "always"
+        return self._intensity.obs_mode("sun", "sun_auto")
+
+    def _use_exposure(self, seconds):
+        if abs(float(self.cam.exposure) - float(seconds)) < 1e-9:
+            return True
+        try:
+            self.cam.set_exposure(float(seconds))
+            return True
+        except Exception as exc:
+            console_ui.warn(f"Exposure {seconds:g} s refused: {exc}")
+            return False
+
+    def _capture_tick(self, now):
+        """One scheduled tick: a frame, or the sub-frames the split guard asks for. True,
+        False on an error, None when the run is stopping.
+        """
+        entry = TickSlot(exposure=self._base_exposure)
+        exposure, frames = self._intensity.plan(entry)
+        if not self._use_exposure(exposure):
+            exposure, frames = self._base_exposure, 1
+            self._intensity.idle()
+            if not self._use_exposure(exposure):
+                return False
+        obs_mode = self._obs_mode()
+        outcome = {"stopping": False}
+
+        def capture(index):
+            result = self._capture_one(now if index == 1 else dt.now(), obs_mode,
+                                       frames, index)
+            if result is None:
+                outcome["stopping"] = True
+                return False, None
+            return result, self._last_mean
+
+        ok, mean = shoot_split(frames, capture,
+                               lambda: self._stop_event.is_set() or outcome["stopping"])
+        if outcome["stopping"] and not ok:
+            return None
+        self._intensity.feed(entry, exposure, mean, self._last_saturation)
+        return ok
+
+    def _capture_one(self, now, obs_mode="always", split_count=1, split_index=1):
         """True once the frame is queued for the disk, False on an error, None when the
         run is stopping.
         """
         timestamp = now.strftime("%Y%m%dT%H%M%S")
-        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
+        suffix = "_pf" if obs_mode == "sun_auto" else ""
+        filepath = unique_path(os.path.join(self.output_dir,
+                                            f"{timestamp}{suffix}.fit"))
         try:
             # Started at the tick, not one sitting in the FIFO since the last capture.
             frame = self.cam.grab_fresh_frame()
             debayered = self.debayer and self.cam.is_mosaic()
+            self._last_mean, self._last_saturation = frame_stats(frame)
             metadata = frame_metadata(self.cam, now, debayered=debayered)
+            metadata["OBSMODE"] = (obs_mode, "always, sun, or sun_auto (preflight)")
+            metadata.update(intensity_cards(self._last_mean, split_count, split_index))
             self._last_frame = frame
+            part = f", {split_index}/{split_count}" if split_count > 1 else ""
+            mean = ("" if self._last_mean is None
+                    else f", mean={self._last_mean:.0f}")
             self._writer.submit(filepath, frame, metadata, debayered, now,
                                 f"({frame.shape[1]}x{frame.shape[0]}"
                                 f"{', RGB' if debayered else ''}, "
                                 f"exp={metadata['EXPTIME']}s, "
                                 f"period={metadata['PERIOD']}us, "
-                                f"gain={self.cam.gain})")
+                                f"gain={self.cam.gain}{mean}{part})")
             return True
         except FrameCancelled:
             return None
@@ -1582,7 +1720,7 @@ class SpttWorkerConsole(threading.Thread):
             "missed": self._missed,
             "setup_mode": self.setup_mode,
             "frame_size": f"{self.cam.w}x{self.cam.h}",
-            "exposure_s": self.cam.exposure,
+            "exposure_s": self._current_params()["exposure"],
             "period_us": self.cam.period_us,
             "min_period_us": self.cam.min_period_us,
             "trigmode": self.cam.hardware_trigmode,
@@ -1590,6 +1728,7 @@ class SpttWorkerConsole(threading.Thread):
             "binning": self.cam.binning,
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
             "capture_seconds": self.capture_seconds,
+            **self._intensity.status_fields(self._last_mean),
             "last_update": dt.now().isoformat(),
         }
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
@@ -1604,8 +1743,9 @@ class SpttWorkerConsole(threading.Thread):
 
         console_ui.update(status=status, frames=self._shots, errors=self._errors,
                           missed=self._missed, output_dir=self.output_dir)
-        console_ui.set_section("camera", [
-            ("Exposure / gain:", f"{self.cam.exposure} s  ·  {self.cam.gain}"),
+        rows = [
+            ("Exposure / gain:",
+             f"{self._current_params()['exposure']} s  ·  {self.cam.gain}"),
             # On screen because a period shorter than the exposure silently truncates frames.
             ("Frame period:", f"{self.cam.period_us} us  "
                               f"(min {self.cam.min_period_us})"),
@@ -1613,7 +1753,11 @@ class SpttWorkerConsole(threading.Thread):
             ("Encoding:", "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit"),
             ("CCD temperature:", str(cam_status.get("temp_ccd", "n/a"))),
             ("Missed captures:", str(self._missed)),
-        ])
+        ]
+        control = self._intensity.row(self._last_mean)
+        if control:
+            rows.append(("Intensity control:", control))
+        console_ui.set_section("camera", rows)
         self._bus.publish_status(payload, force=force)
 
 
@@ -1815,8 +1959,13 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         console_ui.error("output_dir is required.")
         sys.exit(1)
 
+    preflight, overexposure, problems = intensity_settings(sptt_cfg)
+    for problem in problems:
+        console_ui.warn(problem)
     try:
-        sun_gate = None if setup_mode else gate_from_config(sptt_cfg)
+        sun_gate = None if setup_mode else gate_from_config(
+            sptt_cfg,
+            start_angle=preflight.sun_start_angle if preflight.enabled else None)
     except SunSettingsError as exc:
         console_ui.error(f"sptt: {exc}")
         sys.exit(1)
@@ -1878,6 +2027,8 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         setup_mode=setup_mode,
         debayer=sptt_cfg.get("debayer", False),
         sun_gate=sun_gate,
+        preflight=preflight,
+        overexposure=overexposure,
     )
 
     def _stop(sig, frame):

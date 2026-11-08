@@ -19,7 +19,7 @@ sudo systemd/install.sh asi                    # установка
 
 | Параметр | Назначение |
 |---|---|
-| `<тип>` | `asi`, `japan`, `sentry`, `cannon`, `sptt`, `infra`; допускается метка: `sptt-north` |
+| `<тип>` | `asi`, `japan`, `cannon`, `sptt`, `infra`; допускается метка: `sptt-north` |
 | `--user NAME` | чей домашний каталог получает логи и статусы; по умолчанию тот, кто вызвал `sudo` |
 | `--python PATH` | интерпретатор; записывается в юнит только если указан, иначе его выбирает `run.sh` (`env.sh`, затем `venv/` или `.venv/`, затем `python3` из `PATH`) |
 | `--config-dir DIR` | каталог конфигов, по умолчанию `/etc/every-camera` |

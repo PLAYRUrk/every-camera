@@ -30,7 +30,6 @@ python focus_app.py --host "https://….trycloudflare.com/?token=…"   # изв
 - В режиме настройки и вне окна наблюдений предупреждения нет: прерывать нечего.
 - **Stop**, закрытие окна или потеря связи возвращают камеру к расписанию. При обрыве связи удержание снимается по тайм-ауту, не дольше 10 минут. Расписание продолжается со следующего подходящего слота.
 - Начатая экспозиция никогда не прерывается.
-- Исключение — **Sentry**: расписанием владеет `imagerd_rt`. Живой поток работает, а `focus_app` сообщает об этом в строке статуса.
 
 Пока удержание действует, на панели Connection горит `measurements paused for focusing`, а в мониторе плитка пишет «Measurements paused while someone focuses this camera».
 
@@ -66,7 +65,6 @@ python focus_app.py --host "https://….trycloudflare.com/?token=…"   # изв
 | Canon | Live View (`get_preview`), при отказе — обычный снимок полной выдержки, только если он закончится не позже чем за 5 с до ближайшей секунды съёмки | `iso`, `shutterspeed`, `aperture`, `whitebalance` |
 | SPTT | непрерывный захват между плановыми снимками | `exposure`, `gain`, `binning`, `encoding` |
 | Infra | поток кадров камеры | `exposure_us`, `gain`, `roi` (при смене ROI экспозиция сохраняется) |
-| Sentry | кадры `imagerd_rt` по мере появления | нет |
 | ASI | кадр в паузе между плановыми, если успевает до слота | `exposure`, `binning`, `gain`, `filter`, `shutter`, `target_temp` |
 | Japan | то же, что у ASI | `exposure`, `binning`, `readout_speed`, `filter`, `shutter` |
 

@@ -49,7 +49,7 @@ class DiscoveryResponder(threading.Thread):
         self._group = group
         self._joined = False
         self._sock = None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._announcer = None
 
     def start_safely(self):
@@ -102,7 +102,7 @@ class DiscoveryResponder(threading.Thread):
         return True
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 data, addr = self._sock.recvfrom(_RECV_BYTES)
             except socket.timeout:
@@ -110,9 +110,9 @@ class DiscoveryResponder(threading.Thread):
             except OSError:
                 # Windows reports an ICMP "port unreachable" from an earlier reply
                 # here; only a stop ends the listener.
-                if self._stop.is_set():
+                if self._halt.is_set():
                     break
-                self._stop.wait(0.2)
+                self._halt.wait(0.2)
                 continue
             if data.startswith(ANNOUNCE):
                 self._note_announcement(data[len(ANNOUNCE):], addr)
@@ -173,7 +173,7 @@ class DiscoveryResponder(threading.Thread):
 
     def _announce_loop(self):
         # Short first wait, so a camera just started is known within seconds.
-        if self._stop.wait(2.0):
+        if self._halt.wait(2.0):
             return
         while True:
             payload = self._describe()
@@ -186,11 +186,11 @@ class DiscoveryResponder(threading.Thread):
                                           (target, self._port))
                     except OSError:
                         continue
-            if self._stop.wait(ANNOUNCE_EVERY):
+            if self._halt.wait(ANNOUNCE_EVERY):
                 return
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         try:
             if self._sock and self._joined:
                 mreq = struct.pack("4sl", socket.inet_aton(self._group),

@@ -118,15 +118,6 @@ def _extra_info(rec):
             parts.append(f"G:{rec['gain']}")
         if rec.get("roi"):
             parts.append(rec["roi"])
-    elif cam_type == "sentry":
-        if rec.get("seqno") is not None:
-            parts.append(f"Seq:{rec['seqno']}")
-        if rec.get("ccdtemp") is not None:
-            parts.append(f"T:{rec['ccdtemp']}\u00b0")
-        if rec.get("exposure") is not None:
-            parts.append(f"Exp:{rec['exposure']}")
-        if rec.get("daemon_running") is not None:
-            parts.append("daemon:up" if rec["daemon_running"] else "daemon:DOWN")
     elif cam_type == "asi":
         if rec.get("phase"):
             parts.append(str(rec["phase"]))

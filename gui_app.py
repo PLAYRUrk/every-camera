@@ -29,14 +29,10 @@ from utils import (
     claim_instance_name,
     parse_schedule_text, load_schedule_file, save_schedule_file,
     load_schedule_safe,
-    write_status_file, get_system_info,
-    SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR, schedule_now, schedule_to_local,
-    unique_path, STATUS_MIN_INTERVAL,
+    write_status_file,
+    SCHEDULE_DT_FMT, HOME_STATUS_DIR, APP_DIR, schedule_now,
 )
 from monitor import MonitorWidget
-from worker_common import (
-    WorkerBus, publish_current_params, run_focus_iteration,
-)
 
 
 # Closing the window waits this long for an exposure in progress to end.
@@ -102,6 +98,67 @@ def _start_tab_server(cfg, camera_type, instance_name, output_dir,
     return service, start_frame_server(cfg.get("server", {}), service)
 
 
+_RUN_STATUS_TEXT = {"running": "Running", "waiting": "Waiting for schedule",
+                    "error": "Error", "stopped": "Stopped"}
+
+
+def run_status_text(snap):
+    name = str(snap.get("status") or "")
+    return _RUN_STATUS_TEXT.get(name, name.capitalize() or "—")
+
+
+class ConsoleRun(QObject):
+    """A console worker run from a tab, the way AsiTab runs its own: one implementation
+    of the schedule for main.py, systemd and the GUI. Log lines arrive through a
+    ``console_ui`` sink; the status is read back from the CameraService.
+    """
+
+    log_line = pyqtSignal(str, str)
+    status = pyqtSignal(dict)
+    finished = pyqtSignal()
+
+    def __init__(self, worker, service, log_fn, interval_ms=1000):
+        super().__init__()
+        self.worker = worker
+        self._service = service
+        self._done = False
+        self.log_line.connect(log_fn)
+        self._timer = QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._poll)
+
+    def _sink(self, msg, level):
+        # Called from the worker thread — hop to the GUI thread via the signal.
+        self.log_line.emit(str(msg), str(level).lower())
+
+    def start(self):
+        import console_ui
+        console_ui.add_sink(self._sink, owner=lambda: self.worker)
+        self.worker.start()
+        self._timer.start()
+
+    def is_running(self):
+        return self.worker.is_alive()
+
+    def stop(self, wait=5.0):
+        """Waits up to ``wait`` seconds; a worker still writing finishes on its own and
+        ``finished`` follows.
+        """
+        self.worker.request_stop()
+        self.worker.join(timeout=wait)
+        self._poll()
+
+    def _poll(self):
+        if self._service is not None:
+            self.status.emit(self._service.status())
+        if not self.worker.is_alive() and not self._done:
+            import console_ui
+            self._done = True
+            self._timer.stop()
+            console_ui.remove_sink(self._sink)
+            self.finished.emit()
+
+
 class CannonConnectThread(QThread):
     connected = pyqtSignal(object, object, str)  # cam, config, model_name
     failed = pyqtSignal(str)
@@ -125,201 +182,6 @@ class CannonConnectThread(QThread):
             self.connected.emit(cam, config, model_name)
         except Exception as e:
             self.failed.emit(str(e))
-
-
-class CannonWorkerQt(QThread):
-    log_msg = pyqtSignal(str, str)
-    shot_taken = pyqtSignal(int)
-    status_msg = pyqtSignal(str)
-    countdown = pyqtSignal(str)
-    error_count = pyqtSignal(int)
-    finished = pyqtSignal()
-
-    MAX_CONSECUTIVE_ERRORS = 5
-
-    def __init__(self, cam, config, schedule, output_dir, instance_name,
-                 status_dir, capture_seconds, service=None):
-        super().__init__()
-        self.cam = cam
-        self.config = config
-        self.schedule = schedule
-        self.output_dir = output_dir
-        self.instance_name = instance_name
-        self.status_dir = status_dir
-        self.capture_seconds = sorted(capture_seconds)
-        self._service = service
-        self._stop = False
-        self._shots = 0
-        self._errors = 0
-        self._last_shot = None
-        self._last_frame_data = None
-        self._active_until = None
-        self._bus = WorkerBus("cannon", instance_name, status_dir,
-                              service=service, status_suffix="_cannon")
-
-    def request_stop(self):
-        self._stop = True
-
-    def _apply_cannon_params(self, params):
-        failures = []
-        for key, value in params.items():
-            applied = False
-            for section in self.config:
-                if section in ("status", "actions", ""):
-                    continue
-                if key in self.config[section]:
-                    try:
-                        self.config[section][key].set(str(value))
-                        applied = True
-                    except Exception as e:
-                        failures.append((key, str(e)))
-                    break
-            if not applied and not failures or (not applied and key not in [f[0] for f in failures]):
-                failures.append((key, "param not found in camera config"))
-        return failures
-
-    def run(self):
-        from cannon_driver import capture_image, get_camera_settings_info
-
-        last_fired = (-1, -1)
-        consecutive_errors = 0
-        self._bus.prepare_status_dir()
-
-        self.log_msg.emit("Measurement started", "info")
-        self.status_msg.emit("Running")
-        self._save_status("running", force=True)
-
-        while not self._stop:
-            now = dt.now()
-            now_utc = schedule_now()
-
-            active_end = None
-            for entry in self.schedule:
-                if entry.start <= now_utc <= entry.end:
-                    active_end = schedule_to_local(entry.end)
-                    break
-
-            if active_end is None:
-                self.status_msg.emit("Waiting for schedule")
-                self._save_status("waiting")
-                self.countdown.emit("--")
-                self._handle_focus(now)
-                self.msleep(500)
-                continue
-
-            self._active_until = active_end
-
-            sec = now.second + now.microsecond / 1_000_000
-            next_secs = [s for s in self.capture_seconds if s > sec]
-            if next_secs:
-                remaining = next_secs[0] - sec
-            else:
-                remaining = (60 - sec) + self.capture_seconds[0]
-            self.countdown.emit(f"{remaining:.1f}s")
-
-            fire_key = (now.minute, now.second)
-            if now.second in self.capture_seconds and fire_key != last_fired:
-                last_fired = fire_key
-                timestamp = now.strftime("%Y%m%dT%H%M%S")
-                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.jpeg"))
-                try:
-                    img_data = capture_image(self.cam)
-                    with open(filepath, "wb") as f:
-                        f.write(img_data)
-                    self._last_frame_data = img_data
-                    self._push_live(img_data, now)
-                    self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
-                    consecutive_errors = 0
-                    self._shots += 1
-                    self._last_shot = now
-                    self.shot_taken.emit(self._shots)
-                    self.status_msg.emit("Running")
-                    self._save_status("running", force=True)
-                except Exception as e:
-                    self.log_msg.emit(f"Capture error: {e}", "error")
-                    consecutive_errors += 1
-                    self._errors += 1
-                    self.error_count.emit(self._errors)
-                    self._save_status("error", force=True)
-                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        self.log_msg.emit(
-                            f"Stopped: {consecutive_errors} consecutive errors", "error")
-                        break
-            elif now.second not in self.capture_seconds:
-                last_fired = (-1, -1)
-                self._handle_focus(now)
-
-            self.msleep(100)
-
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
-        self.log_msg.emit("Measurement stopped", "info")
-        self.finished.emit()
-
-
-    def _handle_focus(self, now):
-        """Scheduled captures win: skipped on capture seconds, and a focus session
-        expires on its own if the observer's program goes away.
-        """
-        if self._service is None or not self._service.focus_active():
-            return
-        if now.second in self.capture_seconds:
-            return
-        req_id, params = self._service.take_param_request()
-        if params:
-            failures = self._apply_cannon_params(params)
-            self._service.complete_param_request(
-                req_id, applied=params,
-                errors=[f"{k}: {e}" for k, e in failures])
-            from cannon_driver import get_camera_settings_info
-            publish_current_params(
-                self._service, lambda: get_camera_settings_info(self.config))
-        run_focus_iteration(
-            self._service, lambda: self._grab_focus_frame(),
-            on_error=lambda exc, stopped: self.log_msg.emit(
-                f"Focus frame failed: {exc}"
-                + (" — focus mode disabled" if stopped else ""), "warn"))
-
-    def _grab_focus_frame(self):
-        from cannon_driver import capture_image
-        try:
-            return self.cam.get_preview()
-        except Exception:
-            return capture_image(self.cam)
-
-    def _push_live(self, frame, ts=None):
-        if self._service is not None:
-            try:
-                self._service.publish_frame(frame, ts or dt.now())
-            except Exception:
-                pass
-
-    def _save_status(self, status, force=False):
-        from cannon_driver import get_camera_settings_info
-        cam_info = {}
-        try:
-            cam_info = get_camera_settings_info(self.config)
-        except Exception:
-            pass
-        publish_current_params(self._service, lambda: cam_info)
-        payload = {
-            "instance_name": self.instance_name,
-            "camera_type": "cannon",
-            "pid": os.getpid(),
-            "status": status,
-            "shots_taken": self._shots,
-            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
-            "active_until": self._active_until.isoformat() if self._active_until else None,
-            "errors": self._errors,
-            "capture_seconds": self.capture_seconds,
-            "last_update": dt.now().isoformat(),
-        }
-        payload.update(cam_info)
-        try:
-            payload["system"] = get_system_info(self.output_dir)
-        except Exception:
-            pass
-        self._bus.publish_status(payload, force=force)
 
 
 class CannonTab(QWidget):
@@ -599,18 +461,16 @@ class CannonTab(QWidget):
         self._service, self._server = _start_tab_server(
             self._cfg, "cannon", instance_name, output_dir, setup_mode)
 
-        self.worker = CannonWorkerQt(
+        from cameras.cannon_driver import CannonWorkerConsole
+        from utils import get_node_name
+        self.worker = ConsoleRun(CannonWorkerConsole(
             cam=self.cam, config=self.config, schedule=entries,
             output_dir=output_dir, instance_name=instance_name,
             status_dir=status_dir, capture_seconds=capture_seconds,
-            service=self._service,
-        )
-        self.worker.log_msg.connect(self._log)
-        self.worker.shot_taken.connect(lambda n: self.lbl_shots.setText(f"Shots: {n}"))
-        self.worker.status_msg.connect(self._on_status_msg)
-        self.worker.countdown.connect(lambda t: self.lbl_countdown.setText(f"Next: {t}"))
-        self.worker.error_count.connect(
-            lambda n: self.lbl_errors.setText(f"Errors: {n}" if n else ""))
+            service=self._service, node_name=get_node_name(self._cfg),
+            setup_mode=setup_mode,
+        ), self._service, self._log)
+        self.worker.status.connect(self._on_run_status)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
@@ -618,9 +478,8 @@ class CannonTab(QWidget):
         self.btn_stop.setEnabled(True)
 
     def _on_stop(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.request_stop()
-            self.worker.wait(5000)
+        if self.worker and self.worker.is_running():
+            self.worker.stop()
         if self._server:
             self._server.stop()
             self._server = None
@@ -636,6 +495,13 @@ class CannonTab(QWidget):
         self._on_status_msg("Idle")
         self.lbl_countdown.setText("")
 
+    def _on_run_status(self, snap):
+        self.lbl_shots.setText(f"Shots: {snap.get('shots_taken', 0)}")
+        errors = snap.get("errors") or 0
+        self.lbl_errors.setText(f"Errors: {errors}" if errors else "")
+        if snap.get("status"):
+            self._on_status_msg(run_status_text(snap))
+
     def _on_status_msg(self, msg):
         colors = {"Running": "#007700", "Waiting for schedule": "#aa6600",
                   "Idle": "#555", "Stopped": "#555"}
@@ -643,8 +509,6 @@ class CannonTab(QWidget):
         self.lbl_status.setStyleSheet(f"font-weight:bold; color:{colors.get(msg, '#555')};")
 
     def _update_idle_countdown(self):
-        if self.worker and self.worker.isRunning():
-            return
         now = dt.now()
         sec = now.second + now.microsecond / 1_000_000
         cap_secs = self._parse_capture_seconds()
@@ -725,319 +589,6 @@ class SpttCaptureThread(QThread):
     def stop(self):
         self._running = False
         self.wait(5000)
-
-
-class SpttScheduledWorkerQt(QThread):
-    log_msg = pyqtSignal(str, str)
-    shot_taken = pyqtSignal(int)
-    status_msg = pyqtSignal(str)
-    countdown = pyqtSignal(str)
-    error_count = pyqtSignal(int)
-    finished = pyqtSignal()
-
-    MAX_CONSECUTIVE_ERRORS = 5
-
-    def __init__(self, cam, output_dir, instance_name, status_dir,
-                 service=None, capture_seconds=None, debayer=False, sun_gate=None):
-        super().__init__()
-        from sptt_driver import SPTT_CAPTURE_SECONDS
-        self.cam = cam
-        self.sun_gate = sun_gate
-        self.debayer = bool(debayer)
-        self.output_dir = output_dir
-        self.instance_name = instance_name
-        self.status_dir = status_dir
-        self.capture_seconds = sorted(capture_seconds or SPTT_CAPTURE_SECONDS)
-        self._service = service
-        self._stop = False
-        self._stop_event = threading.Event()
-        self._shots = 0
-        self._errors = 0
-        self._missed = 0
-        self._consecutive_errors = 0
-        self._last_shot = None
-        self._last_frame = None
-        self._writer = None
-        self._last_status = "running"
-        self._cam_status = {}
-        self._system_info = None
-        self._cam_status_at = None
-        self._bus = WorkerBus("sptt", instance_name, status_dir,
-                              service=service, status_suffix="_sptt")
-
-    def request_stop(self):
-        self._stop = True
-        self._stop_event.set()
-        self.cam.cancel_event.set()
-
-    def _check_schedule(self):
-        from sptt_driver import schedule_problem
-        problem = schedule_problem(self.cam, self.capture_seconds)
-        if problem:
-            self.log_msg.emit(problem, "warn")
-
-    def _apply_sptt_params(self, params):
-        applied = {}
-        errors = []
-        from sptt_driver import ENCODING_12BPP, ENCODING_8BPP
-        try:
-            if "exposure" in params:
-                self.cam.set_exposure(float(params["exposure"]))
-                applied["exposure"] = float(params["exposure"])
-                self._check_schedule()
-            if "gain" in params:
-                self.cam.set_gain(int(params["gain"]))
-                applied["gain"] = int(params["gain"])
-            # Binning/encoding require full reconfigure + restart
-            need_reconfig = "binning" in params or "encoding" in params
-            if need_reconfig:
-                binning = int(params.get("binning", self.cam.binning))
-                enc_param = params.get("encoding")
-                if enc_param in ("12bit", "12", 12):
-                    encoding = ENCODING_12BPP
-                elif enc_param in ("8bit", "8", 8):
-                    encoding = ENCODING_8BPP
-                else:
-                    encoding = self.cam.encoding
-                self.cam.stop()
-                try:
-                    self.cam.configure(
-                        exposure=self.cam.exposure,
-                        gain=self.cam.gain,
-                        binning=binning,
-                        encoding=encoding,
-                    )
-                finally:
-                    # A refused timing must not leave the camera stopped.
-                    self.cam.start()
-                applied["binning"] = binning
-                applied["encoding"] = "12bit" if encoding == ENCODING_12BPP else "8bit"
-        except Exception as e:
-            errors.append(str(e))
-        return applied, errors
-
-    def run(self):
-        from sptt_driver import FrameWriter
-
-        self._bus.prepare_status_dir()
-
-        self.log_msg.emit("SPTT measurement started", "info")
-        self.status_msg.emit("Running")
-        self._save_status("running", force=True)
-
-        if not self._stop:
-            self.cam.cancel_event.clear()
-        try:
-            self.cam.start()
-        except Exception as e:
-            self.log_msg.emit(f"Failed to start camera: {e}", "error")
-            self._save_status("error", force=True)
-            self._bus.shutdown()
-            self.finished.emit()
-            return
-
-        self._writer = FrameWriter(self.cam, self._service)
-        self._writer.start()
-        self.cam.on_wait = lambda: self._save_status(self._last_status)
-        self._check_schedule()
-
-        if self.sun_gate is not None:
-            # The first altitude imports astropy, seconds: not on a capture second.
-            self.sun_gate.is_open(dt.now())
-
-        try:
-            self._loop()
-        finally:
-            self.cam.on_wait = None
-            self.cam.stop()
-            self._writer.close()
-            self._collect_saved()
-
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
-        self.log_msg.emit("SPTT measurement stopped", "info")
-        self.finished.emit()
-
-    def _loop(self):
-        from sptt_driver import seconds_to_next_capture, idle_wait_s
-
-        last_fired = (-1, -1)
-        waiting_saved = 0.0
-        checked_read = self.cam.last_read_s is not None
-        while not self._stop:
-            self._collect_saved()
-            if self._consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                self.log_msg.emit(f"Stopped: {self._consecutive_errors} consecutive "
-                                  "errors", "error")
-                return
-            now = dt.now()
-
-            if self.sun_gate is not None and not self.sun_gate.is_open(
-                    now, refresh=now.second not in self.capture_seconds):
-                last_fired = (-1, -1)
-                self.countdown.emit(self.sun_gate.describe())
-                self.status_msg.emit("Waiting for the night")
-                self._handle_focus(now)
-                if time.monotonic() - waiting_saved > 10.0:
-                    waiting_saved = time.monotonic()
-                    self._save_status("waiting", force=True)
-                self._stop_event.wait(0.1)
-                continue
-            waiting_saved = 0.0
-
-            remaining = seconds_to_next_capture(now, self.capture_seconds)
-            self.countdown.emit(f"{remaining:.1f}s")
-
-            fire_key = (now.minute, now.second)
-            if now.second in self.capture_seconds and fire_key != last_fired:
-                last_fired = fire_key
-                ok = self._capture_one(now)
-                if ok is None:
-                    continue                # stopping
-                if not ok:
-                    self._consecutive_errors += 1
-                    self._errors += 1
-                    self.error_count.emit(self._errors)
-                    self._save_status("error", force=True)
-                self._note_missed(now, dt.now())
-                if ok and not checked_read:
-                    checked_read = True
-                    self._check_schedule()          # now with a timed transfer
-                continue
-            elif now.second not in self.capture_seconds:
-                last_fired = (-1, -1)
-                self._handle_focus(now)
-
-            self._stop_event.wait(idle_wait_s(dt.now(), self.capture_seconds))
-
-    def _capture_one(self, now):
-        """True once the frame is queued for the disk, False on an error, None when the
-        run is stopping.
-        """
-        from sptt_driver import frame_metadata, FrameCancelled
-        timestamp = now.strftime("%Y%m%dT%H%M%S")
-        filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.fit"))
-        try:
-            # A frame started at the tick, not one that has been
-            # sitting in the FIFO since the last capture.
-            frame = self.cam.grab_fresh_frame()
-            debayered = self.debayer and self.cam.is_mosaic()
-            metadata = frame_metadata(self.cam, now, debayered=debayered)
-            self._last_frame = frame
-            self._writer.submit(filepath, frame, metadata, debayered, now)
-            self._last_shot = now
-            return True
-        except FrameCancelled:
-            return None
-        except Exception as e:
-            self.log_msg.emit(f"Capture error: {e}", "error")
-            return False
-
-    def _collect_saved(self):
-        if self._writer is None:
-            return
-        for filepath, error, _ in self._writer.take_results():
-            name = os.path.basename(filepath)
-            if error is None:
-                self._shots += 1
-                self._consecutive_errors = 0
-                self.log_msg.emit(f"Frame saved: {name}", "info")
-                self.shot_taken.emit(self._shots)
-                self.status_msg.emit("Running")
-                self._save_status("running", force=True)
-            else:
-                self._errors += 1
-                self._consecutive_errors += 1
-                self.log_msg.emit(f"Could not save {name}: {error}", "error")
-                self.error_count.emit(self._errors)
-                self._save_status("error", force=True)
-
-    def _note_missed(self, started, finished):
-        from sptt_driver import missed_ticks
-        ticks = missed_ticks(started, finished, self.capture_seconds)
-        if not ticks:
-            return
-        self._missed += len(ticks)
-        took = (finished - started).total_seconds()
-        self.log_msg.emit(
-            f"Missed the {', '.join(f'{t:%H:%M:%S}' for t in ticks)} "
-            f"capture{'s' if len(ticks) > 1 else ''}: the one before took "
-            f"{took:.1f} s", "warn")
-
-    def _current_params(self):
-        return {"exposure": self.cam.exposure, "gain": self.cam.gain,
-                "binning": self.cam.binning}
-
-    def _handle_focus(self, now):
-        """Scheduled captures win: skipped on capture seconds, and a focus session
-        expires on its own if the observer's program goes away.
-        """
-        from sptt_driver import focus_frame_fits, focus_grab
-        if self._service is None or not self._service.focus_active():
-            return
-        # Not just "not on a capture second": a focus frame that runs past
-        # the next one makes the schedule miss it.
-        if not focus_frame_fits(now, self.capture_seconds, self.cam):
-            return
-        req_id, params = self._service.take_param_request()
-        if params:
-            applied, errors = self._apply_sptt_params(params)
-            self._service.complete_param_request(req_id, applied, errors)
-            publish_current_params(self._service, self._current_params)
-        # Only the frame right after a change is worth a full period's wait;
-        # grab_frame drops the contaminated one either way.
-        grab = self.cam.grab_fresh_frame if params else self.cam.grab_frame
-        run_focus_iteration(
-            self._service, lambda: focus_grab(self.cam, grab),
-            on_error=lambda exc, stopped: self.log_msg.emit(
-                f"Focus frame failed: {exc}"
-                + (" — focus mode disabled" if stopped else ""), "warn"))
-
-    def _camera_status(self, force=False):
-        """Cached like the console worker's: each refresh is USB traffic and a disk stat."""
-        now = time.monotonic()
-        if (not force and self._cam_status_at is not None
-                and now - self._cam_status_at < STATUS_MIN_INTERVAL):
-            return self._cam_status
-        try:
-            self._cam_status = self.cam.get_status_info()
-        except Exception:
-            self._cam_status = {}
-        try:
-            self._system_info = get_system_info(self.output_dir)
-        except Exception:
-            pass
-        self._cam_status_at = now
-        return self._cam_status
-
-    def _save_status(self, status, force=False):
-        from sptt_driver import ENCODING_12BPP
-        self._last_status = status
-        publish_current_params(self._service, self._current_params)
-        cam_status = self._camera_status(force)
-        payload = {
-            "instance_name": self.instance_name,
-            "camera_type": "sptt",
-            "pid": os.getpid(),
-            "status": status,
-            "shots_taken": self._shots,
-            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
-            "errors": self._errors,
-            "missed": self._missed,
-            "frame_size": f"{self.cam.w}x{self.cam.h}",
-            "exposure_s": self.cam.exposure,
-            "gain": self.cam.gain,
-            "binning": self.cam.binning,
-            "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
-            "last_update": dt.now().isoformat(),
-        }
-        if self.sun_gate is not None:
-            payload["sun_altitude"] = self.sun_gate.angle
-            payload["sun_max_angle"] = self.sun_gate.max_angle
-        payload.update({f"cam_{k}": v for k, v in cam_status.items()})
-        if self._system_info is not None:
-            payload["system"] = self._system_info
-        self._bus.publish_status(payload, force=force)
 
 
 class SpttTab(QWidget):
@@ -1390,8 +941,15 @@ class SpttTab(QWidget):
             return
 
         from cameras.common.sun_gate import SunSettingsError, gate_from_config
+        from cameras.sptt_driver import SpttWorkerConsole, intensity_settings
+        from utils import get_node_name
+        preflight, overexposure, problems = intensity_settings(self._sptt_cfg)
+        for problem in problems:
+            self._log(problem, "warn")
         try:
-            sun_gate = gate_from_config(self._sptt_cfg)
+            sun_gate = gate_from_config(
+                self._sptt_cfg,
+                start_angle=preflight.sun_start_angle if preflight.enabled else None)
         except SunSettingsError as exc:
             QMessageBox.warning(self, "Sun settings", f"sptt: {exc}")
             return
@@ -1402,23 +960,20 @@ class SpttTab(QWidget):
         self._service, self._server = _start_tab_server(
             self._cfg, "sptt", instance_name, output_dir)
 
-        self.scheduled_worker = SpttScheduledWorkerQt(
+        self.scheduled_worker = ConsoleRun(SpttWorkerConsole(
             cam=self.cam,
             output_dir=output_dir,
             instance_name=instance_name,
             status_dir=status_dir,
-            service=self._service,
             capture_seconds=self._capture_seconds,
+            service=self._service,
+            node_name=get_node_name(self._cfg),
             debayer=self._sptt_cfg.get("debayer", False),
             sun_gate=sun_gate,
-        )
-        self.scheduled_worker.log_msg.connect(self._log)
-        self.scheduled_worker.shot_taken.connect(
-            lambda n: self.lbl_meas_shots.setText(f"Shots: {n}"))
-        self.scheduled_worker.status_msg.connect(
-            lambda s: self.lbl_meas_status.setText(s))
-        self.scheduled_worker.countdown.connect(
-            lambda t: self.lbl_meas_countdown.setText(f"Next: {t}"))
+            preflight=preflight,
+            overexposure=overexposure,
+        ), self._service, self._log)
+        self.scheduled_worker.status.connect(self._on_run_status)
         self.scheduled_worker.finished.connect(self._on_meas_finished)
         self.scheduled_worker.start()
 
@@ -1426,21 +981,22 @@ class SpttTab(QWidget):
         self.btn_meas_stop.setEnabled(True)
         self.btn_preview_start.setEnabled(False)
         # Apply stops and reconfigures the camera, which would pull it out
-        # from under the running schedule. Exposure and gain stay live: the
-        # driver serialises them against the worker's frame reads.
+        # from under the running schedule. The exposure belongs to the worker while
+        # it runs (split and preflight plan from it): focus_app changes it through
+        # the worker. Gain stays live: the driver serialises it against frame reads.
         self.btn_apply.setEnabled(False)
         self.btn_reconnect.setEnabled(False)
+        self.spin_exp.setEnabled(False)
 
     def _on_meas_stop(self):
-        if self.scheduled_worker and self.scheduled_worker.isRunning():
-            self.scheduled_worker.request_stop()
-            self.scheduled_worker.wait(5000)
+        if self.scheduled_worker and self.scheduled_worker.is_running():
+            self.scheduled_worker.stop()
         if self._server:
             self._server.stop()
             self._server = None
         _release_claim(self)
         self.btn_meas_stop.setEnabled(False)
-        if self.scheduled_worker and self.scheduled_worker.isRunning():
+        if self.scheduled_worker and self.scheduled_worker.is_running():
             # Still writing queued frames: _on_meas_finished frees the camera.
             self.lbl_meas_status.setText("Stopping…")
             return
@@ -1455,7 +1011,24 @@ class SpttTab(QWidget):
         self.btn_preview_start.setEnabled(self.cam is not None)
         self.btn_apply.setEnabled(self.cam is not None)
         self.btn_reconnect.setEnabled(self.cam is not None)
+        self.spin_exp.setEnabled(True)
         self.lbl_meas_status.setText("Idle")
+        self.lbl_meas_countdown.setText("")
+
+    def _on_run_status(self, snap):
+        from cameras.sptt_driver import seconds_to_next_capture
+        self.lbl_meas_shots.setText(f"Shots: {snap.get('shots_taken', 0)}")
+        status = snap.get("status")
+        if status:
+            self.lbl_meas_status.setText(run_status_text(snap))
+        if status == "running" and self._capture_seconds:
+            remaining = seconds_to_next_capture(dt.now(), self._capture_seconds)
+            self.lbl_meas_countdown.setText(f"Next: {remaining:.0f}s")
+        elif status == "waiting" and snap.get("sun_altitude") is not None:
+            self.lbl_meas_countdown.setText(
+                f"Sun {snap['sun_altitude']:+.1f}° — waiting for the night")
+        else:
+            self.lbl_meas_countdown.setText("")
 
     def cleanup(self):
         self._on_meas_stop()
@@ -1539,213 +1112,6 @@ class InfraCaptureThread(QThread):
             self.camera.set_exposure(exposure)
         if gain is not None:
             self.camera.set_gain(gain)
-
-
-class InfraWorkerQt(QThread):
-    log_msg = pyqtSignal(str, str)
-    shot_taken = pyqtSignal(int)
-    status_msg = pyqtSignal(str)
-    countdown = pyqtSignal(str)
-    error_count = pyqtSignal(int)
-    finished = pyqtSignal()
-
-    MAX_CONSECUTIVE_ERRORS = 5
-
-    def __init__(self, cam, schedule, output_dir, instance_name,
-                 status_dir, capture_seconds, save_format="tiff",
-                 service=None):
-        super().__init__()
-        self._service = service
-        self.cam = cam
-        self.schedule = schedule
-        self.output_dir = output_dir
-        self.instance_name = instance_name
-        self.status_dir = status_dir
-        self.capture_seconds = sorted(capture_seconds)
-        self.save_format = save_format
-        self._stop = False
-        self._shots = 0
-        self._errors = 0
-        self._last_shot = None
-        self._last_frame = None
-        self._active_until = None
-        self._bus = WorkerBus("infra", instance_name, status_dir,
-                              service=service, status_suffix="_infra")
-
-    def request_stop(self):
-        self._stop = True
-
-    def _apply_infra_params(self, params):
-        applied = {}
-        errors = []
-        try:
-            from cameras.infra_driver import ROI_MODES
-            # "roi" is what focus_app sends; ROI first, since it resets the exposure.
-            if "roi" in params:
-                if params["roi"] not in ROI_MODES:
-                    raise ValueError(f"roi must be one of {', '.join(ROI_MODES)}")
-                params = dict(params)
-                params["roi_width"], params["roi_height"] = ROI_MODES[params["roi"]]
-            if "roi_width" in params or "roi_height" in params:
-                w = int(params.get("roi_width", self.cam.roi_width))
-                h = int(params.get("roi_height", self.cam.roi_height))
-                self.cam.set_roi(width=w, height=h)
-                applied["roi_width"] = w
-                applied["roi_height"] = h
-            if "exposure_us" in params:
-                self.cam.set_exposure(float(params["exposure_us"]))
-                applied["exposure_us"] = float(params["exposure_us"])
-            elif "exposure" in params:
-                exp_us = float(params["exposure"]) * 1_000_000
-                self.cam.set_exposure(exp_us)
-                applied["exposure_us"] = exp_us
-            if "gain" in params:
-                self.cam.set_gain(int(params["gain"]))
-                applied["gain"] = int(params["gain"])
-        except Exception as e:
-            errors.append(str(e))
-        return applied, errors
-
-    def run(self):
-        from infra_driver import save_tiff, save_png, save_fits
-
-        last_fired = (-1, -1)
-        consecutive_errors = 0
-        self._bus.prepare_status_dir()
-
-        self.log_msg.emit("Infra measurement started", "info")
-        self.status_msg.emit("Running")
-        self._save_status("running", force=True)
-
-        while not self._stop:
-            now = dt.now()
-            now_utc = schedule_now()
-
-            active_end = None
-            for entry in self.schedule:
-                if entry.start <= now_utc <= entry.end:
-                    active_end = schedule_to_local(entry.end)
-                    break
-
-            if active_end is None:
-                self.status_msg.emit("Waiting for schedule")
-                self._save_status("waiting")
-                self.countdown.emit("--")
-                self._handle_focus(now)
-                self.msleep(500)
-                continue
-
-            self._active_until = active_end
-
-            sec = now.second + now.microsecond / 1_000_000
-            next_secs = [s for s in self.capture_seconds if s > sec]
-            if next_secs:
-                remaining = next_secs[0] - sec
-            else:
-                remaining = (60 - sec) + self.capture_seconds[0]
-            self.countdown.emit(f"{remaining:.1f}s")
-
-            fire_key = (now.minute, now.second)
-            if now.second in self.capture_seconds and fire_key != last_fired:
-                last_fired = fire_key
-                timestamp = now.strftime("%Y%m%dT%H%M%S")
-                ext_map = {"tiff": "tiff", "png": "png", "fits": "fits"}
-                ext = ext_map.get(self.save_format, "tiff")
-                filepath = unique_path(os.path.join(self.output_dir, f"{timestamp}.{ext}"))
-                try:
-                    frame = self.cam.grab_frame()
-                    if self.save_format == "fits":
-                        roi_str = f"{self.cam.roi_width}x{self.cam.roi_height}"
-                        save_fits(filepath, frame,
-                                  exposure_us=self.cam.exposure_us,
-                                  gain=self.cam.gain,
-                                  roi=roi_str)
-                    elif self.save_format == "tiff":
-                        save_tiff(filepath, frame)
-                    else:
-                        save_png(filepath, frame)
-                    self._last_frame = frame
-                    self._push_live(frame, now)
-                    self.log_msg.emit(f"Shot saved: {os.path.basename(filepath)}", "info")
-                    consecutive_errors = 0
-                    self._shots += 1
-                    self._last_shot = now
-                    self.shot_taken.emit(self._shots)
-                    self.status_msg.emit("Running")
-                    self._save_status("running", force=True)
-                except Exception as e:
-                    self.log_msg.emit(f"Capture error: {e}", "error")
-                    consecutive_errors += 1
-                    self._errors += 1
-                    self.error_count.emit(self._errors)
-                    self._save_status("error", force=True)
-                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                        self.log_msg.emit(
-                            f"Stopped: {consecutive_errors} consecutive errors", "error")
-                        break
-            elif now.second not in self.capture_seconds:
-                last_fired = (-1, -1)
-                self._handle_focus(now)
-
-            self.msleep(100)
-
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
-        self.log_msg.emit("Infra measurement stopped", "info")
-        self.finished.emit()
-
-    def _current_params(self):
-        return {"exposure_us": self.cam.exposure_us, "gain": self.cam.gain,
-                "roi": f"{self.cam.roi_width}x{self.cam.roi_height}"}
-
-    def _handle_focus(self, now):
-        """Scheduled captures win: skipped on capture seconds, and a focus session
-        expires on its own if the observer's program goes away.
-        """
-        if self._service is None or not self._service.focus_active():
-            return
-        if now.second in self.capture_seconds:
-            return
-        req_id, params = self._service.take_param_request()
-        if params:
-            applied, errors = self._apply_infra_params(params)
-            self._service.complete_param_request(req_id, applied, errors)
-            publish_current_params(self._service, self._current_params)
-        run_focus_iteration(
-            self._service, lambda: self.cam.grab_frame(),
-            on_error=lambda exc, stopped: self.log_msg.emit(
-                f"Focus frame failed: {exc}"
-                + (" — focus mode disabled" if stopped else ""), "warn"))
-
-    def _push_live(self, frame, ts=None):
-        if self._service is not None:
-            try:
-                self._service.publish_frame(frame, ts or dt.now())
-            except Exception:
-                pass
-
-    def _save_status(self, status, force=False):
-        publish_current_params(self._service, self._current_params)
-        payload = {
-            "instance_name": self.instance_name,
-            "camera_type": "infra",
-            "pid": os.getpid(),
-            "status": status,
-            "shots_taken": self._shots,
-            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
-            "active_until": self._active_until.isoformat() if self._active_until else None,
-            "errors": self._errors,
-            "capture_seconds": self.capture_seconds,
-            "exposure_us": self.cam.exposure_us,
-            "gain": self.cam.gain,
-            "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
-            "last_update": dt.now().isoformat(),
-        }
-        try:
-            payload["system"] = get_system_info(self.output_dir)
-        except Exception:
-            pass
-        self._bus.publish_status(payload, force=force)
 
 
 class InfraTab(QWidget):
@@ -2073,7 +1439,7 @@ class InfraTab(QWidget):
     def _measuring(self):
         """The measurement thread owns the camera; a set from here would reach the USB
         link in the middle of its grab."""
-        if self.worker and self.worker.isRunning():
+        if self.worker and self.worker.is_running():
             self._log("Stop the measurement first, or change it from focus_app.py.",
                       "warn")
             return True
@@ -2196,7 +1562,9 @@ class InfraTab(QWidget):
         self._service, self._server = _start_tab_server(
             self._cfg, "infra", instance_name, output_dir, setup_mode)
 
-        self.worker = InfraWorkerQt(
+        from cameras.infra_driver import InfraWorkerConsole, overexposure_settings
+        from utils import get_node_name
+        self.worker = ConsoleRun(InfraWorkerConsole(
             cam=self.cam,
             schedule=entries,
             output_dir=output_dir,
@@ -2205,13 +1573,11 @@ class InfraTab(QWidget):
             capture_seconds=capture_seconds,
             save_format=save_format,
             service=self._service,
-        )
-        self.worker.log_msg.connect(self._log)
-        self.worker.shot_taken.connect(lambda n: self.lbl_meas_shots.setText(f"Shots: {n}"))
-        self.worker.status_msg.connect(self._on_meas_status_msg)
-        self.worker.countdown.connect(lambda t: self.lbl_meas_countdown.setText(f"Next: {t}"))
-        self.worker.error_count.connect(
-            lambda n: self.lbl_meas_errors.setText(f"Errors: {n}" if n else ""))
+            node_name=get_node_name(self._cfg),
+            setup_mode=setup_mode,
+            overexposure=overexposure_settings(self._cfg.get("infra", {})),
+        ), self._service, self._log)
+        self.worker.status.connect(self._on_run_status)
         self.worker.finished.connect(self._on_meas_finished)
         self.worker.start()
 
@@ -2220,9 +1586,8 @@ class InfraTab(QWidget):
         self.btn_preview_start.setEnabled(False)
 
     def _on_meas_stop(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.request_stop()
-            self.worker.wait(5000)
+        if self.worker and self.worker.is_running():
+            self.worker.stop()
         if self._server:
             self._server.stop()
             self._server = None
@@ -2239,6 +1604,13 @@ class InfraTab(QWidget):
         self.btn_preview_start.setEnabled(self.cam is not None)
         self._on_meas_status_msg("Idle")
 
+    def _on_run_status(self, snap):
+        self.lbl_meas_shots.setText(f"Shots: {snap.get('shots_taken', 0)}")
+        errors = snap.get("errors") or 0
+        self.lbl_meas_errors.setText(f"Errors: {errors}" if errors else "")
+        if snap.get("status"):
+            self._on_meas_status_msg(run_status_text(snap))
+
     def _on_meas_status_msg(self, msg):
         colors = {"Running": "#007700", "Waiting for schedule": "#aa6600",
                   "Idle": "#555", "Stopped": "#555"}
@@ -2246,8 +1618,6 @@ class InfraTab(QWidget):
         self.lbl_meas_status.setStyleSheet(f"font-weight:bold; color:{colors.get(msg, '#555')};")
 
     def _update_idle_countdown(self):
-        if self.worker and self.worker.isRunning():
-            return
         now = dt.now()
         sec = now.second + now.microsecond / 1_000_000
         cap_secs = self._parse_capture_seconds()
@@ -2263,311 +1633,6 @@ class InfraTab(QWidget):
         self._on_preview_stop()
         if self.cam:
             self.cam.disconnect()
-
-
-class SentryWorkerQt(QThread):
-    log_msg = pyqtSignal(str, str)
-    status_msg = pyqtSignal(str)
-    finished = pyqtSignal()
-
-    def __init__(self, cam, output_dir, instance_name, status_dir,
-                 capture_seconds, service=None):
-        super().__init__()
-        self.cam = cam
-        self.output_dir = output_dir
-        self.instance_name = instance_name
-        self.status_dir = status_dir
-        self.capture_seconds = sorted(capture_seconds)
-        self._service = service
-        self._bus = WorkerBus("sentry", instance_name, status_dir,
-                              service=service, status_suffix="_sentry")
-        self._stop = False
-        self._shots = 0
-        self._errors = 0
-        self._last_shot = None
-        self._last_seqno = -1
-
-    def request_stop(self):
-        self._stop = True
-
-    def _save_status(self, status, force=False):
-        meta = self.cam.get_metadata()
-        payload = {
-            "instance_name": self.instance_name,
-            "camera_type": "sentry",
-            "pid": os.getpid(),
-            "status": status,
-            "output_dir": self.output_dir,
-            "shots_taken": self._shots,
-            "last_shot": self._last_shot.isoformat() if self._last_shot else None,
-            "errors": self._errors,
-            "seqno": self.cam.get_seqno(),
-            "capture_seconds": self.capture_seconds,
-            "daemon_running": self.cam.is_running(),
-            "last_update": dt.now().isoformat(),
-        }
-        for key in ("CCDTemp", "Exposure", "Binning", "CCDGain", "FilterPo",
-                    "SiteID", "DeviceID"):
-            if key in meta:
-                payload[key.lower()] = meta[key]
-        try:
-            payload["system"] = get_system_info(self.output_dir or None)
-        except Exception:
-            pass
-        self._bus.publish_status(payload, force=force)
-
-    def run(self):
-        self._bus.prepare_status_dir()
-
-        if not self.cam.is_running():
-            self.log_msg.emit("[SENTRY] Starting imagerd_rt daemon...", "info")
-            try:
-                self.cam.start()
-                time.sleep(2)
-            except Exception as exc:
-                self.log_msg.emit(f"[ERROR] Could not start daemon: {exc}", "error")
-                self._errors += 1
-                self._save_status("error", force=True)
-                self._bus.shutdown()
-                self.finished.emit()
-                return
-
-        self.log_msg.emit("[INFO] Sentry worker running", "info")
-        self.status_msg.emit("running")
-        self._save_status("running", force=True)
-
-        last_fired = (-1, -1)
-        while not self._stop:
-            now = dt.now()
-            fire_key = (now.minute, now.second)
-            if now.second in self.capture_seconds and fire_key != last_fired:
-                last_fired = fire_key
-                seqno = self.cam.get_seqno()
-                meta = self.cam.get_metadata()
-                running = self.cam.is_running()
-                self.status_msg.emit("running" if running else "waiting")
-                self.log_msg.emit(
-                    f"[SENTRY] seqno={seqno} "
-                    f"temp={meta.get('CCDTemp', '?')} "
-                    f"exp={meta.get('Exposure', '?')}",
-                    "info",
-                )
-                if seqno != self._last_seqno and seqno > 0:
-                    self._last_seqno = seqno
-                    self._shots += 1
-                    self._last_shot = now
-                    self._archive_and_publish(now)
-                self._save_status("running" if running else "waiting", force=True)
-            elif now.second not in self.capture_seconds:
-                last_fired = (-1, -1)
-            time.sleep(0.1)
-
-        if self.cam.is_running():
-            self.cam.stop()
-        self.status_msg.emit("stopped")
-        self.log_msg.emit("[INFO] Sentry worker stopped", "info")
-        self._save_status("stopped", force=True)
-        self._bus.shutdown()
-        self.finished.emit()
-
-    def _archive_and_publish(self, now):
-        if self.output_dir:
-            path = self.cam.archive_latest_image(self.output_dir, now)
-            if path:
-                self.log_msg.emit(f"[SENTRY] Archived {os.path.basename(path)}",
-                                  "info")
-        frame = self.cam.get_latest_image()
-        if frame is None:
-            return
-        if self._service is not None:
-            self._service.publish_frame(frame, now, self.cam.get_metadata())
-
-
-class SentryTab(QWidget):
-    def __init__(self, cfg: dict, log_fn):
-        super().__init__()
-        self._cfg = cfg
-        self._log = log_fn
-        self._worker = None
-        self._server = None
-        self._service = None
-        self.cam = None
-        self._build_ui()
-
-    def _build_ui(self):
-        sentry_cfg = self._cfg.get("sentry", {})
-        layout = QVBoxLayout(self)
-
-        cfg_box = QGroupBox("Sentry Camera (imagerd_rt)")
-        cfg_grid = QGridLayout(cfg_box)
-        cfg_grid.setColumnStretch(1, 1)
-        row = 0
-
-        cfg_grid.addWidget(QLabel("imagerd_rt dir:"), row, 0)
-        self.le_dir = QLineEdit(sentry_cfg.get("imagerd_rt_dir", "/usr/local/imagerd_rt"))
-        cfg_grid.addWidget(self.le_dir, row, 1)
-        row += 1
-
-        cfg_grid.addWidget(QLabel("Output dir:"), row, 0)
-        self.le_output = QLineEdit(sentry_cfg.get("output_dir", ""))
-        cfg_grid.addWidget(self.le_output, row, 1)
-        btn_browse = QPushButton("Browse…")
-        btn_browse.clicked.connect(self._browse_output)
-        cfg_grid.addWidget(btn_browse, row, 2)
-        row += 1
-
-        cfg_grid.addWidget(QLabel("Instance name:"), row, 0)
-        self.le_instance = QLineEdit(sentry_cfg.get("instance_name", ""))
-        self.le_instance.setPlaceholderText("auto")
-        cfg_grid.addWidget(self.le_instance, row, 1)
-        row += 1
-
-        layout.addWidget(cfg_box)
-
-        ctrl_lay = QHBoxLayout()
-        self.btn_start = QPushButton("Start Monitoring")
-        self.btn_start.clicked.connect(self._on_start)
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._on_stop)
-        ctrl_lay.addWidget(self.btn_start)
-        ctrl_lay.addWidget(self.btn_stop)
-        ctrl_lay.addStretch()
-        layout.addLayout(ctrl_lay)
-
-        status_box = QGroupBox("Status")
-        status_lay = QGridLayout(status_box)
-        status_lay.addWidget(QLabel("Status:"), 0, 0)
-        self.lbl_status = QLabel("stopped")
-        status_lay.addWidget(self.lbl_status, 0, 1)
-        status_lay.addWidget(QLabel("Daemon:"), 0, 2)
-        self.lbl_daemon = QLabel("unknown")
-        status_lay.addWidget(self.lbl_daemon, 0, 3)
-        status_lay.addWidget(QLabel("Seq#:"), 1, 0)
-        self.lbl_seqno = QLabel("—")
-        status_lay.addWidget(self.lbl_seqno, 1, 1)
-        status_lay.addWidget(QLabel("CCD Temp:"), 1, 2)
-        self.lbl_temp = QLabel("—")
-        status_lay.addWidget(self.lbl_temp, 1, 3)
-        status_lay.addWidget(QLabel("Exposure:"), 2, 0)
-        self.lbl_exp = QLabel("—")
-        status_lay.addWidget(self.lbl_exp, 2, 1)
-        status_lay.addWidget(QLabel("Filter pos:"), 2, 2)
-        self.lbl_filter = QLabel("—")
-        status_lay.addWidget(self.lbl_filter, 2, 3)
-        layout.addWidget(status_box)
-
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Monospace", 9))
-        layout.addWidget(self.log_text, 1)
-
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(2000)
-        self._poll_timer.timeout.connect(self._refresh_status)
-
-    def _browse_output(self):
-        d = QFileDialog.getExistingDirectory(self, "Select output directory",
-                                             self.le_output.text())
-        if d:
-            self.le_output.setText(d)
-
-    def _log_local(self, msg, level="info"):
-        colors = {"info": "#000", "warn": "#aa6600", "error": "#cc0000"}
-        ts = dt.now().strftime("%H:%M:%S")
-        self.log_text.append(
-            f'<span style="color:{colors.get(level, "#000")}">[{ts}] {msg}</span>'
-        )
-        self._log(msg, level)
-
-    def _on_start(self):
-        from cameras.sentry_driver import SentryCamera
-        from utils import get_instance_name, claim_instance_name, HOME_STATUS_DIR
-        from pathlib import Path
-
-        imagerd_rt_dir = self.le_dir.text().strip()
-        output_dir = self.le_output.text().strip()
-        self._claim = claim_instance_name(
-            self.le_instance.text().strip() or get_instance_name("Sentry", self._cfg))
-        instance = self._claim.name
-
-        self.cam = SentryCamera(imagerd_rt_dir)
-        if not self.cam.is_available():
-            self._log_local(
-                f"[ERROR] imagerd_rt not found at: {imagerd_rt_dir}", "error"
-            )
-            _release_claim(self)
-            return
-
-        status_dir = self._cfg.get("status_dir") or str(
-            Path.home() / ".every_camera" / "status")
-        sentry_cfg = self._cfg.get("sentry", {})
-        capture_seconds = sentry_cfg.get("capture_seconds", [0, 30])
-
-        from camera_service import CameraService
-        from frame_server import start_frame_server
-        from utils import get_node_name
-        self._service = CameraService("sentry", instance, output_dir,
-                                      supports_params=False,
-                                      node_name=get_node_name(self._cfg))
-        self._server = start_frame_server(self._cfg.get("server", {}),
-                                          self._service)
-
-        self._worker = SentryWorkerQt(
-            cam=self.cam,
-            output_dir=output_dir,
-            instance_name=instance,
-            status_dir=status_dir,
-            capture_seconds=capture_seconds,
-            service=self._service,
-        )
-        self._worker.log_msg.connect(self._log_local)
-        self._worker.status_msg.connect(self.lbl_status.setText)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.start()
-
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self._poll_timer.start()
-        self._log_local(f"[INFO] Sentry monitoring started — instance: {instance}")
-
-    def _on_stop(self):
-        if self._worker:
-            self._worker.request_stop()
-        self.btn_stop.setEnabled(False)
-
-    def _on_finished(self):
-        self._poll_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        if self._server:
-            self._server.stop()
-            self._server = None
-        _release_claim(self)
-
-    def _refresh_status(self):
-        if self.cam is None:
-            return
-        running = self.cam.is_running()
-        self.lbl_daemon.setText("running" if running else "stopped")
-        seqno = self.cam.get_seqno()
-        self.lbl_seqno.setText(str(seqno) if seqno >= 0 else "—")
-        meta = self.cam.get_metadata()
-        self.lbl_temp.setText(meta.get("CCDTemp", "—"))
-        self.lbl_exp.setText(meta.get("Exposure", "—"))
-        self.lbl_filter.setText(meta.get("FilterPo", "—"))
-
-    def cleanup(self):
-        self._poll_timer.stop()
-        if self._worker and self._worker.isRunning():
-            self._worker.request_stop()
-            self._worker.wait(3000)
-        if self._server:
-            self._server.stop()
-            self._server = None
-        _release_claim(self)
-        if self.cam and self.cam.is_running():
-            self.cam.stop()
 
 
 class AsiTab(QWidget):
@@ -3214,11 +2279,6 @@ class MainWindow(QMainWindow):
             self._infra_tab = InfraTab(self._cfg, self._log)
             self.tab_widget.addTab(self._infra_tab, "Infra Camera")
             self._tabs["infra"] = self._infra_tab
-
-        if camera_type is None or camera_type == "sentry":
-            self._sentry_tab = SentryTab(self._cfg, self._log)
-            self.tab_widget.addTab(self._sentry_tab, "Sentry Camera")
-            self._tabs["sentry"] = self._sentry_tab
 
         if camera_type is None or camera_type == "asi":
             self._asi_tab = AsiTab(self._cfg, self._log)

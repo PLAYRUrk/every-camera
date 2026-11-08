@@ -19,7 +19,6 @@ pip install -r requirements-<роль>.txt
 | `requirements-infra.txt` | узел с камерой Infra | `opencv-python-headless` (необязательно), `astropy` |
 | `requirements-asi.txt` | узел с камерой ASI | `pyserial`, `astropy` |
 | `requirements-japan.txt` | узел с камерой Japan | `pyserial`, `astropy`; нужен DCAM-API SDK |
-| `requirements-sentry.txt` | узел с камерой Sentry | `astropy`; нужен установленный `imagerd_rt` |
 | `requirements-gui.txt` | дополнительно для GUI (`gui_app.py`, `setup_app.py`) | `PyQt5`, `PyQt5-Qt5`, `PyQt5-sip` |
 | `requirements-observer.txt` | машина наблюдателя | ядро и GUI |
 
@@ -38,7 +37,6 @@ pip install -r requirements-asi.txt -r requirements-gui.txt
 | [Canon](Camera-Canon.md#подключение) | обычно ничего |
 | [SPTT](Camera-SPTT.md#подключение) | правило udev |
 | [Infra](Camera-Infra.md#подключение) | правило udev |
-| [Sentry](Camera-Sentry.md#подключение) | установленный `imagerd_rt` |
 | [ASI](Camera-ASI.md#подключение) | PICAM SDK, доступ к последовательному порту |
 | [Japan](Camera-Japan.md#подключение) | DCAM-API SDK, доступ к последовательному порту |
 

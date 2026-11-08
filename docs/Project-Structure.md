@@ -52,10 +52,10 @@ cameras/
   sptt_spt.py           чтение вендорских скриптов .spt
   sptt_timing.py        экспозиция и период кадра, без pyusb
   infra_driver.py       Tanho SW1300: USB, съёмка, TIFF/PNG/FITS
-  sentry_driver.py      супервизор imagerd_rt
   asi_driver.py         ASI: цикл измерений, тёмные кадры, расписание
   japan_driver.py       Japan: режимы sun, time, sun_cycle
-  common/               общее для asi и japan
+  common/               общее для камер; intensity_control.py — управление
+                        интенсивностью для asi, japan, sptt и infra
   asi/                  оборудование ASI
     picam.py            ctypes-биндинг PICAM SDK
     camera.py           PixisCamera
@@ -78,7 +78,7 @@ cameras/
 
 Состав `common/` описан на странице [Общее у ASI и Japan](ASI-Japan-Shared.md).
 
-Файлы `cannon_driver.py`, `sptt_driver.py`, `infra_driver.py`, `sentry_driver.py`, `asi_driver.py`, `japan_driver.py`, `sptt_load_firmware.py` в корне — шимы для совместимости, логика в `cameras/`.
+Файлы `cannon_driver.py`, `sptt_driver.py`, `infra_driver.py`, `asi_driver.py`, `japan_driver.py`, `sptt_load_firmware.py` в корне — шимы для совместимости, логика в `cameras/`.
 
 ## Данные и окружение
 

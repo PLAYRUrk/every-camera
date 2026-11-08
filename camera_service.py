@@ -105,9 +105,6 @@ PARAM_SCHEMAS = {
          "tooltip": "The wheel controller's shutter. Closed means the sensor "
                     "sees nothing — dark frames are taken this way."},
     ],
-    # imagerd_rt owns the sentry schedule; parameters live in schedule.conf and
-    # only take effect on a daemon restart, so live editing is not offered.
-    "sentry": [],
 }
 
 DEFAULT_FOCUS_TTL = 60.0
@@ -121,7 +118,7 @@ _MAX_RESULTS = 16
 class CameraService:
     def __init__(self, camera_type, instance_name, output_dir="",
                  supports_focus=True, supports_params=True, node_name="",
-                 setup_mode=False, supports_hold=None):
+                 setup_mode=False):
         self.camera_type = camera_type
         self.instance_name = instance_name
         self.output_dir = output_dir or ""
@@ -129,10 +126,7 @@ class CameraService:
         # address.
         self.node_name = node_name or ""
         self.supports_focus = bool(supports_focus)
-        # False for the sentry: its programme belongs to the imagerd_rt daemon, which
-        # this driver supervises rather than drives.
-        self.supports_hold = (bool(supports_focus) if supports_hold is None
-                              else bool(supports_hold))
+        self.supports_hold = self.supports_focus
         self.supports_params = bool(supports_params)
         # Up for focusing only: no schedule, nothing archived. Reported so an idle setup
         # node is not mistaken for a broken measurement.

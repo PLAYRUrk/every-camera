@@ -10,7 +10,6 @@
 python main.py --type cannon     # Canon DSLR
 python main.py --type sptt       # CSDU-429/423/285C: модель определяется по USB ID
 python main.py --type infra      # SW1300 SWIR
-python main.py --type sentry     # Princeton CCD через imagerd_rt
 python main.py --type asi        # всенебный имиджер PIXIS
 python main.py --type japan      # всенебный имиджер Hamamatsu
 
@@ -58,7 +57,6 @@ python focus_app.py       # живой поток и настройка резк
 | ASI, Japan | повторный сигнал | немедленный выход без финальной серии |
 | systemd | `systemctl stop` | `SIGTERM`, то же, что `Ctrl+C`; см. [Службы systemd](Systemd.md#остановка-не-мгновенная) |
 | GUI | закрыть окно | GUI заново читает `config.json` с диска и записывает обратно только поля своих вкладок: `output_dir`, `capture_seconds`, `save_format` Infra, `output_dir` и `camera.backend` ASI и Japan. Если `config.json` не удалось прочитать, не записывается ничего |
-| Sentry | любой | драйвер записывает `10` в `stop_file`, демон завершает цикл и останавливается |
 
 При включённом `cooling.warm_on_exit` камера ASI отогревает сенсор при выходе.
 

@@ -34,6 +34,12 @@ from worker_common import (
     install_stop_handler, stop_signal_name,
 )
 
+from .common.exposure import frame_stats
+from .common.exposure_config import OverexposureCfg, PreflightCfg, parse_overexposure
+from .common.intensity_control import (
+    IntensityController, TickSlot, intensity_cards, shoot_split,
+)
+
 RAW_HALF_WIDTH = 640
 BYTES_PER_PIXEL = 2
 
@@ -534,6 +540,10 @@ class _CameraStreamThread(threading.Thread):
         self._latest_frame = None
         self._latest_ts = None
         self._frame_counter = 0
+        # Seconds between the last two frames: exposure plus readout, the dead time
+        # the split guard budgets for.
+        self.frame_interval = None
+        self._interval_from = None
         self._stop_event = threading.Event()
         self._paused = threading.Event()
         self._pause_ack = threading.Event()
@@ -543,6 +553,8 @@ class _CameraStreamThread(threading.Thread):
         while not self._stop_event.is_set():
             if self._paused.is_set():
                 self._pause_ack.set()
+                # The gap a pause leaves is not readout time.
+                self._interval_from = None
                 self._stop_event.wait(0.05)
                 continue
             self._pause_ack.clear()
@@ -550,6 +562,9 @@ class _CameraStreamThread(threading.Thread):
                 frame = self._cam.grab_frame(verbose_timing=False)
                 ts = dt.now()
                 with self._cond:
+                    if self._interval_from is not None:
+                        self.frame_interval = (ts - self._interval_from).total_seconds()
+                    self._interval_from = ts
                     self._latest_frame = frame
                     self._latest_ts = ts
                     self._frame_counter += 1
@@ -604,8 +619,8 @@ class _CameraStreamThread(threading.Thread):
         self._paused.clear()
 
 
-def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
-              stack_n=1, sub_exposure_us=None, date_obs=None):
+def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None, date_obs=None,
+              sky_mean=None, split_count=1, split_index=1):
     """Supports uint16 and stacked uint32 frames. ``date_obs``: aware start of exposure."""
     from astropy.io import fits
     hdu = fits.PrimaryHDU(data=frame)
@@ -623,10 +638,7 @@ def save_fits(filepath, frame, exposure_us=None, gain=None, roi=None,
         hdr['GAIN'] = (gain, 'Camera gain')
     if roi is not None:
         hdr['ROI'] = (roi, 'Region of interest')
-    if stack_n > 1:
-        hdr['STACK_N'] = (stack_n, 'Number of stacked sub-frames')
-        if sub_exposure_us is not None:
-            hdr['SUB_EXP'] = (sub_exposure_us / 1e6, 'Sub-frame exposure (s)')
+    hdr.update(intensity_cards(sky_mean, split_count, split_index))
     hdu.writeto(filepath, overwrite=True)
 
 
@@ -665,6 +677,16 @@ def save_png(filepath, frame_16):
         raise RuntimeError("Install opencv-python or Pillow to save PNG images")
 
 
+def overexposure_settings(section):
+    """The split guard's settings; problems are reported and switch it off."""
+    errors = []
+    cfg = parse_overexposure((section or {}).get("overexposure") or {}, errors,
+                             prefix="infra")
+    for problem in errors:
+        console_ui.warn(problem)
+    return cfg
+
+
 def frame_to_jpeg_bytes(frame):
     stretch = "minmax" if frame.dtype == np.uint32 else "raw"
     return frame_archive.to_jpeg_bytes(frame, stretch=stretch)
@@ -675,7 +697,7 @@ class InfraWorkerConsole(threading.Thread):
 
     def __init__(self, cam, schedule, output_dir, instance_name,
                  status_dir, capture_seconds, save_format="tiff",
-                 service=None, node_name="", setup_mode=False):
+                 service=None, node_name="", setup_mode=False, overexposure=None):
         super().__init__(daemon=True)
         self.cam = cam
         self.schedule = schedule
@@ -701,9 +723,27 @@ class InfraWorkerConsole(threading.Thread):
         # Whether the last pass ran under a focus hold: entering and leaving it are
         # logged once, not twice a second.
         self._held = False
+        # The operator's exposure. A split keeps the camera at the sub-exposure between
+        # ticks: changing it costs the stream a frame or two, so it moves only when the
+        # split factor does.
+        self._base_exposure_us = float(cam.exposure_us)
+        self._stream = None
+        self._last_mean = None
+        self._last_saturation = 0.0
+        over = overexposure or OverexposureCfg()
+        self._intensity = IntensityController(
+            PreflightCfg(), over, dead_time=self._dead_time,
+            split_runs=lambda: over.enabled and self._dead_time() is not None)
 
     def request_stop(self):
         self._stop_event.set()
+
+    def _dead_time(self):
+        """None until the stream has timed two frames in a row."""
+        interval = getattr(self._stream, "frame_interval", None)
+        if interval is None:
+            return None
+        return max(interval - self.cam.exposure_us / 1e6, 0.0)
 
     def _publish_error(self, status, error, ts_iso=None):
         self._bus.publish_error(status, error, ts_iso=ts_iso)
@@ -738,6 +778,7 @@ class InfraWorkerConsole(threading.Thread):
                 exp_us = float(params["exposure"]) * 1_000_000
             if exp_us is not None:
                 self.cam.set_exposure(exp_us)
+                self._base_exposure_us = exp_us
                 applied["exposure_us"] = exp_us
                 time.sleep(0.05)
             if "gain" in params:
@@ -750,9 +791,41 @@ class InfraWorkerConsole(threading.Thread):
             stream.resume()
         return applied, errors
 
+    def _use_exposure_us(self, exposure_us, stream):
+        """For the tick's split, not the operator: the base exposure stays as set."""
+        stream.pause(timeout=self.cam.exposure_us / 1e6 + 10.0)
+        try:
+            self.cam.set_exposure(exposure_us)
+            time.sleep(0.05)
+            return True
+        except Exception as exc:
+            console_ui.warn(f"Exposure {exposure_us:.0f} us refused: {exc}")
+            return False
+        finally:
+            stream.resume()
+            self._params_changed_at = dt.now()
+
+    def _capture_tick(self, now, stream, timeout):
+        entry = TickSlot(exposure=self._base_exposure_us / 1e6)
+        exposure, frames = self._intensity.plan(entry)
+        if abs(exposure * 1e6 - self.cam.exposure_us) > 0.5:
+            if not self._use_exposure_us(exposure * 1e6, stream):
+                frames = 1
+                self._intensity.idle()
+
+        def capture(index):
+            ok = self._capture_one_stream(now if index == 1 else dt.now(), stream,
+                                          timeout, frames, index)
+            return ok, self._last_mean
+
+        ok, mean = shoot_split(frames, capture, self._stop_event.is_set)
+        self._intensity.feed(entry, self.cam.exposure_us / 1e6, mean,
+                             self._last_saturation)
+        return ok
+
     def _current_params(self):
         return {
-            "exposure_us": self.cam.exposure_us,
+            "exposure_us": self._base_exposure_us,
             "gain": self.cam.gain,
             "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
         }
@@ -795,6 +868,7 @@ class InfraWorkerConsole(threading.Thread):
 
         # Continuous capture keeps the FX3 FIFO clean, as in preview mode.
         stream = _CameraStreamThread(self.cam)
+        self._stream = stream
         stream.start()
         console_ui.log("Infra camera stream thread started")
 
@@ -844,7 +918,7 @@ class InfraWorkerConsole(threading.Thread):
                 fire_key = (now.minute, now.second)
                 if now.second in self.capture_seconds and fire_key != last_fired:
                     last_fired = fire_key
-                    ok = self._capture_one_stream(now, stream, frame_timeout())
+                    ok = self._capture_tick(now, stream, frame_timeout())
                     if ok:
                         consecutive_errors = 0
                         self._shots += 1
@@ -874,7 +948,7 @@ class InfraWorkerConsole(threading.Thread):
         console_ui.log("Infra camera measurement stopped")
 
     def _capture_one_stream(self, now, stream: "_CameraStreamThread",
-                             timeout: float) -> bool:
+                             timeout: float, split_count=1, split_index=1) -> bool:
         """Saves the next frame of the stream; the wait is at most about one frame period.
 
         No flush or discarded frames: the stream thread keeps the FIFO clean.
@@ -905,6 +979,7 @@ class InfraWorkerConsole(threading.Thread):
 
         console_ui.log(f"Frame received: waited {wait_ms:.0f}ms, "
                        f"frame_ts={frame_ts.isoformat()}")
+        self._last_mean, self._last_saturation = frame_stats(frame)
         try:
             if self.save_format == "fits":
                 # frame_ts marks the end of the readout, local and naive.
@@ -915,7 +990,8 @@ class InfraWorkerConsole(threading.Thread):
                           exposure_us=self.cam.exposure_us,
                           gain=self.cam.gain,
                           roi=f"{self.cam.roi_width}x{self.cam.roi_height}",
-                          date_obs=started)
+                          date_obs=started, sky_mean=self._last_mean,
+                          split_count=split_count, split_index=split_index)
             elif self.save_format == "tiff":
                 save_tiff(filepath, frame)
             else:
@@ -924,7 +1000,11 @@ class InfraWorkerConsole(threading.Thread):
             self._last_file = os.path.basename(filepath)
             if self._service is not None:
                 self._service.publish_frame(frame, frame_ts or now)
-            console_ui.log(f"Shot saved: {self._last_file}")
+            detail = ("" if self._last_mean is None
+                      else f"  mean {self._last_mean:.0f} ADU")
+            if split_count > 1:
+                detail += f"  ({split_index}/{split_count})"
+            console_ui.log(f"Shot saved: {self._last_file}{detail}")
             return True
         except Exception as exc:
             console_ui.error(f"Save error: {exc}")
@@ -944,10 +1024,11 @@ class InfraWorkerConsole(threading.Thread):
             "active_until": self._active_until.isoformat() if self._active_until else None,
             "errors": self._errors,
             "capture_seconds": self.capture_seconds,
-            "exposure_us": self.cam.exposure_us,
+            "exposure_us": self._base_exposure_us,
             "gain": self.cam.gain,
             "roi": f"{self.cam.roi_width}x{self.cam.roi_height}",
             "setup_mode": self.setup_mode,
+            **self._intensity.status_fields(self._last_mean),
             "last_update": dt.now().isoformat(),
         }
         try:
@@ -959,13 +1040,17 @@ class InfraWorkerConsole(threading.Thread):
         console_ui.update(status=status, frames=self._shots, errors=self._errors,
                           output_dir=self.output_dir,
                           last_file=self._last_file)
-        console_ui.set_section("camera", [
-            ("Exposure:", f"{self.cam.exposure_us / 1000:.1f} ms"),
+        rows = [
+            ("Exposure:", f"{self._base_exposure_us / 1000:.1f} ms"),
             ("Gain:", str(self.cam.gain)),
             ("ROI:", f"{self.cam.roi_width}x{self.cam.roi_height}"),
             ("Window ends:", self._active_until.strftime("%Y-%m-%d %H:%M:%S")
              if self._active_until else "-"),
-        ])
+        ]
+        control = self._intensity.row(self._last_mean)
+        if control:
+            rows.append(("Intensity control:", control))
+        console_ui.set_section("camera", rows)
         self._bus.publish_status(payload, force=force)
 
 
@@ -1172,6 +1257,7 @@ def _run_console_infra(cfg, infra_cfg, config_path, preview, dash,
         service=service,
         node_name=node_name,
         setup_mode=setup_mode,
+        overexposure=overexposure_settings(infra_cfg),
     )
 
     def _stop(sig, frame):

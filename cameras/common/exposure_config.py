@@ -1,6 +1,6 @@
 """The two intensity-control blocks of config.json, validated.
 
-``prefix`` (``asi`` or ``japan``) opens every message, so an operator knows which
+``prefix`` (the camera's config section) opens every message, so an operator knows which
 section to edit. :func:`parse_overexposure` takes the modes the split guard may run
 in: the ASI imager runs it in every mode with slots, the Hamamatsu only in
 ``sun_cycle``.
@@ -54,7 +54,9 @@ class OverexposureCfg:
     bias: float = 0.0                 # pedestal, ADU; used when there are no darks
 
 
-def parse_preflight(raw, mode, sun_max_angle, errors, *, prefix):
+def parse_preflight(raw, mode, sun_max_angle, errors, *, prefix,
+                    modes=("sun_cycle",)):
+    """``modes`` names the sun-driven modes this camera runs the stage in."""
     cfg = PreflightCfg(
         enabled=cfgparse.as_bool(raw, "enabled", False),
         sun_start_angle=cfgparse.as_float(raw, "sun_start_angle", -6.0),
@@ -73,8 +75,9 @@ def parse_preflight(raw, mode, sun_max_angle, errors, *, prefix):
     if raw_binning not in (None, "", 0):
         cfg.binning = cfgparse.as_int(raw, "binning", 0) or None
 
-    if cfg.enabled and mode != "sun_cycle":
-        errors.append(f"{prefix}.preflight works only in 'sun_cycle' mode (mode is "
+    if cfg.enabled and mode not in modes:
+        listed = " or ".join(repr(m) for m in modes)
+        errors.append(f"{prefix}.preflight works only in {listed} mode (mode is "
                       f"{mode!r}); the preflight stage is off")
         cfg.enabled = False
     if cfg.enabled and cfg.sun_start_angle <= sun_max_angle:

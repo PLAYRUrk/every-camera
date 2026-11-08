@@ -38,7 +38,6 @@ def run_console_wizard(config_path=None, camera_type=None):
         configure_console_cannon,
         configure_console_sptt,
         configure_console_infra,
-        configure_console_sentry,
         configure_console_asi,
         configure_console_japan,
         _configure_alerts,
@@ -51,7 +50,6 @@ def run_console_wizard(config_path=None, camera_type=None):
         "cannon": configure_console_cannon,
         "sptt":   configure_console_sptt,
         "infra":  configure_console_infra,
-        "sentry": configure_console_sentry,
         "asi":    configure_console_asi,
         "japan":  configure_console_japan,
     }
@@ -152,6 +150,97 @@ def _group_grid(title, col_stretch=1):
     lay.setHorizontalSpacing(8)
     lay.setVerticalSpacing(6)
     return box, lay
+
+
+class _IntensityControls:
+    """The "Intensity control" group of a camera that shoots on capture seconds. Only the
+    settings changed between nights are on screen; the rest stay in the file, which
+    ``_merge_into`` keeps.
+
+    ``preflight_text`` None leaves the twilight stage out.
+    """
+
+    def __init__(self, section, *, split_text, preflight_text=None):
+        from PyQt5.QtWidgets import QCheckBox, QDoubleSpinBox, QSpinBox
+        pre = section.get("preflight") or {}
+        guard = section.get("overexposure") or {}
+        self.box, grid = _group_grid("Intensity control")
+        row = 0
+        self.cb_preflight = None
+        groups = []
+        if preflight_text is not None:
+            self.cb_preflight = QCheckBox(preflight_text)
+            self.cb_preflight.setChecked(bool(pre.get("enabled", False)))
+            self.cb_preflight.setToolTip(
+                "Opens the window at a higher solar altitude and holds a mean frame "
+                "intensity instead of the set exposure. At the capture-window angle "
+                "the automation stops and the set exposure takes over.")
+            grid.addWidget(self.cb_preflight, row, 0, 1, 2); row += 1
+            self.sb_pre_angle = QDoubleSpinBox()
+            self.sb_pre_angle.setRange(-90.0, 90.0)
+            self.sb_pre_angle.setDecimals(1)
+            self.sb_pre_angle.setSuffix("°")
+            self.sb_pre_angle.setToolTip("Must be ABOVE the capture-window angle: the "
+                                         "sun passes it first on the way down.")
+            self.sb_pre_angle.setValue(float(pre.get("sun_start_angle", -6.0)))
+            _add_label_row(grid, row, "Automatic stage below:", self.sb_pre_angle)
+            row += 1
+            self.sb_pre_target = QDoubleSpinBox()
+            self.sb_pre_target.setRange(0.0, 65535.0)
+            self.sb_pre_target.setDecimals(0)
+            self.sb_pre_target.setSuffix(" ADU")
+            self.sb_pre_target.setValue(float(pre.get("target_mean", 20000.0)))
+            _add_label_row(grid, row, "Target mean intensity:", self.sb_pre_target)
+            row += 1
+            self.sb_pre_min_exp = QDoubleSpinBox()
+            self.sb_pre_min_exp.setRange(0.001, 3600.0)
+            self.sb_pre_min_exp.setDecimals(3)
+            self.sb_pre_min_exp.setSuffix(" s")
+            self.sb_pre_min_exp.setValue(float(pre.get("min_exposure", 0.05)))
+            _add_label_row(grid, row, "Shortest automatic exposure:",
+                           self.sb_pre_min_exp)
+            row += 1
+            groups.append((self.cb_preflight, (self.sb_pre_angle, self.sb_pre_target,
+                                               self.sb_pre_min_exp)))
+
+        self.cb_overexp = QCheckBox(split_text)
+        self.cb_overexp.setChecked(bool(guard.get("enabled", False)))
+        self.cb_overexp.setToolTip(
+            "When a frame comes back brighter than the threshold, the next tick takes "
+            "several shorter frames in the time of one frame and its readout. Short "
+            "exposures leave no room for that; the log says so once.")
+        grid.addWidget(self.cb_overexp, row, 0, 1, 2); row += 1
+        self.sb_overexp_limit = QDoubleSpinBox()
+        self.sb_overexp_limit.setRange(0.0, 65535.0)
+        self.sb_overexp_limit.setDecimals(0)
+        self.sb_overexp_limit.setSuffix(" ADU")
+        self.sb_overexp_limit.setValue(float(guard.get("threshold", 55000.0)))
+        _add_label_row(grid, row, "Split above:", self.sb_overexp_limit); row += 1
+        self.sb_overexp_max = QSpinBox()
+        self.sb_overexp_max.setRange(2, 16)
+        self.sb_overexp_max.setValue(int(guard.get("max_splits", 4)))
+        _add_label_row(grid, row, "Most sub-frames:", self.sb_overexp_max); row += 1
+        groups.append((self.cb_overexp, (self.sb_overexp_limit, self.sb_overexp_max)))
+
+        for box, widgets in groups:
+            for widget in widgets:
+                box.toggled.connect(widget.setEnabled)
+                widget.setEnabled(box.isChecked())
+
+    def values(self):
+        result = {"overexposure": {
+            "enabled": self.cb_overexp.isChecked(),
+            "threshold": self.sb_overexp_limit.value(),
+            "max_splits": self.sb_overexp_max.value(),
+        }}
+        if self.cb_preflight is not None:
+            result["preflight"] = {
+                "enabled": self.cb_preflight.isChecked(),
+                "sun_start_angle": self.sb_pre_angle.value(),
+                "target_mean": self.sb_pre_target.value(),
+                "min_exposure": self.sb_pre_min_exp.value(),
+            }
+        return result
 
 
 class CannonConfigTab:
@@ -409,6 +498,16 @@ class SpttConfigTab:
         self.sb_elev.setValue(float(loc.get("elevation", 0.0)))
         _add_label_row(sgrid, row, "Elevation:", self.sb_elev); row += 1
         root.addWidget(sbox)
+
+        self._intensity = _IntensityControls(
+            c, split_text="Split a frame into shorter ones when it over-exposes",
+            preflight_text="Sun mode: start earlier, with automatic exposure")
+        # Preflight starts at a solar altitude, so it needs the sun window.
+        sun_mode = lambda: self.cb_sun_mode.currentIndex() == 1  # noqa: E731
+        self._intensity.cb_preflight.setEnabled(sun_mode())
+        self.cb_sun_mode.currentIndexChanged.connect(
+            lambda _i: self._intensity.cb_preflight.setEnabled(sun_mode()))
+        root.addWidget(self._intensity.box)
         root.addStretch()
 
     def _find_cameras(self):
@@ -474,6 +573,7 @@ class SpttConfigTab:
             "sun_max_angle": self.sb_sun_angle.value(),
             "location": {"lat": self.sb_lat.value(), "lon": self.sb_lon.value(),
                          "elevation": self.sb_elev.value()},
+            **self._intensity.values(),
         }
 
 
@@ -531,6 +631,9 @@ class InfraConfigTab:
         _add_label_row(grid, row, "Capture seconds:", self.le_capture_secs); row += 1
 
         root.addWidget(box)
+        self._intensity = _IntensityControls(
+            c, split_text="Split a frame into shorter ones when it over-exposes")
+        root.addWidget(self._intensity.box)
         root.addStretch()
 
     def get_config(self) -> dict:
@@ -549,191 +652,7 @@ class InfraConfigTab:
             "roi":             roi_vals[self.cb_roi.currentIndex()],
             "save_format":     fmt_vals[self.cb_fmt.currentIndex()],
             "capture_seconds": secs,
-        }
-
-
-class SentryConfigTab:
-    SLOT_HEADERS  = ["Filter #", "Start (ms)", "Exposure (ms)", "Binning", "Gain", "Readout (ms)"]
-    SLOT_KEYS     = ["filter_num", "start_ms",  "exposure_ms",   "binning", "gain", "readout_ms"]
-    SLOT_DEFAULTS = [1,            0,            55000,           2,         3,      5000]
-
-    def __init__(self, cfg: dict):
-        from PyQt5.QtWidgets import (
-            QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-            QDoubleSpinBox, QSpinBox, QComboBox, QPushButton,
-            QTableWidget, QTableWidgetItem, QHeaderView,
-            QAbstractItemView,
-        )
-        c = cfg.get("sentry", {})
-        self.widget = QWidget()
-        root = QVBoxLayout(self.widget)
-        root.setContentsMargins(8, 8, 8, 8)
-
-        box, grid = _group_grid("Sentry Camera (imagerd_rt supervisor)")
-        row = 0
-
-        self.le_dir = QLineEdit(c.get("imagerd_rt_dir", "/usr/local/imagerd_rt"))
-        _add_dir_row(grid, row, "imagerd_rt directory:", self.le_dir); row += 1
-
-        self.le_output = QLineEdit(c.get("output_dir", ""))
-        _add_dir_row(grid, row, "Output directory:", self.le_output); row += 1
-
-        self.le_instance = QLineEdit(c.get("instance_name", ""))
-        self.le_instance.setPlaceholderText("auto")
-        _add_label_row(grid, row, "Instance name:", self.le_instance); row += 1
-
-        self.le_device_id = QLineEdit(c.get("device_id", "ASI1"))
-        _add_label_row(grid, row, "Device ID:", self.le_device_id); row += 1
-
-        self.le_site_id = QLineEdit(c.get("site_id", "SITE"))
-        _add_label_row(grid, row, "Site ID:", self.le_site_id); row += 1
-
-        self.sb_zenith = QDoubleSpinBox()
-        self.sb_zenith.setRange(-90.0, 90.0)
-        self.sb_zenith.setDecimals(1)
-        self.sb_zenith.setSuffix("°")
-        self.sb_zenith.setToolTip("Solar zenith angle at which imaging starts (negative = sun below horizon)")
-        self.sb_zenith.setValue(c.get("zenith_angle_start", -10))
-        _add_label_row(grid, row, "Night start zenith angle:", self.sb_zenith); row += 1
-
-        self.sb_sched_len = QSpinBox()
-        self.sb_sched_len.setRange(5000, 86_400_000)
-        self.sb_sched_len.setSuffix(" ms")
-        self.sb_sched_len.setToolTip("Duration of one imaging cycle in milliseconds (1 440 000 = 24 min)")
-        self.sb_sched_len.setValue(c.get("schedule_len_ms", 1440000))
-        _add_label_row(grid, row, "Schedule cycle length:", self.sb_sched_len); row += 1
-
-        self.cb_mode = QComboBox()
-        self.cb_mode.addItems(["schedule", "rapid"])
-        mode_val = c.get("imaging_mode", c.get("image_mode", "schedule"))
-        if isinstance(mode_val, int):
-            mode_val = "schedule" if mode_val == 0 else "rapid"
-        self.cb_mode.setCurrentText(mode_val)
-        self.cb_mode.setToolTip("'schedule' = timed slots; 'rapid' = continuous capture")
-        _add_label_row(grid, row, "Imaging mode:", self.cb_mode); row += 1
-
-        self.le_capture_secs = QLineEdit(
-            ", ".join(str(s) for s in c.get("capture_seconds", [0, 30]))
-        )
-        self.le_capture_secs.setToolTip("Seconds within each minute to poll the daemon's status")
-        _add_label_row(grid, row, "Capture seconds:", self.le_capture_secs); row += 1
-
-        root.addWidget(box)
-
-        from PyQt5.QtWidgets import QGroupBox
-        slot_box = QGroupBox("Imaging Slots  (one row per filter position)")
-        slot_root = QVBoxLayout(slot_box)
-
-        self._slot_table = QTableWidget(0, len(self.SLOT_HEADERS))
-        self._slot_table.setHorizontalHeaderLabels(self.SLOT_HEADERS)
-        self._slot_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._slot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._slot_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
-        self._slot_table.setMinimumHeight(140)
-
-        for slot in c.get("slots", []):
-            self._append_slot_row(slot)
-
-        slot_root.addWidget(self._slot_table)
-
-        btn_bar = QHBoxLayout()
-        btn_add = QPushButton("+ Add slot")
-        btn_add.clicked.connect(self._add_slot)
-        btn_del = QPushButton("− Remove selected")
-        btn_del.clicked.connect(self._remove_slot)
-        btn_up = QPushButton("↑ Move up")
-        btn_up.clicked.connect(self._move_up)
-        btn_dn = QPushButton("↓ Move down")
-        btn_dn.clicked.connect(self._move_down)
-        for b in (btn_add, btn_del, btn_up, btn_dn):
-            btn_bar.addWidget(b)
-        btn_bar.addStretch()
-        slot_root.addLayout(btn_bar)
-
-        root.addWidget(slot_box)
-        root.addStretch()
-
-
-    def _append_slot_row(self, slot=None):
-        from PyQt5.QtWidgets import QTableWidgetItem
-        row = self._slot_table.rowCount()
-        self._slot_table.insertRow(row)
-        vals = slot or {}
-        for col, (key, default) in enumerate(zip(self.SLOT_KEYS, self.SLOT_DEFAULTS)):
-            # Configs may still hold the older key names.
-            if key == "start_ms":
-                v = vals.get("start_ms", vals.get("start_time_ms", default))
-            elif key == "gain":
-                v = vals.get("gain", vals.get("ccd_gain", default))
-            elif key == "readout_ms":
-                v = vals.get("readout_ms", vals.get("prep_time_ms", default))
-            else:
-                v = vals.get(key, default)
-            self._slot_table.setItem(row, col, QTableWidgetItem(str(v)))
-
-    def _add_slot(self):
-        self._append_slot_row()
-
-    def _remove_slot(self):
-        row = self._slot_table.currentRow()
-        if row >= 0:
-            self._slot_table.removeRow(row)
-
-    def _move_up(self):
-        row = self._slot_table.currentRow()
-        if row > 0:
-            self._swap_rows(row, row - 1)
-            self._slot_table.selectRow(row - 1)
-
-    def _move_down(self):
-        row = self._slot_table.currentRow()
-        if 0 <= row < self._slot_table.rowCount() - 1:
-            self._swap_rows(row, row + 1)
-            self._slot_table.selectRow(row + 1)
-
-    def _swap_rows(self, a, b):
-        from PyQt5.QtWidgets import QTableWidgetItem
-        for col in range(self._slot_table.columnCount()):
-            ia = self._slot_table.item(a, col)
-            ib = self._slot_table.item(b, col)
-            ta = ia.text() if ia else ""
-            tb = ib.text() if ib else ""
-            self._slot_table.setItem(a, col, QTableWidgetItem(tb))
-            self._slot_table.setItem(b, col, QTableWidgetItem(ta))
-
-    def _read_slots(self) -> list:
-        slots = []
-        for row in range(self._slot_table.rowCount()):
-            slot = {}
-            for col, (key, default) in enumerate(zip(self.SLOT_KEYS, self.SLOT_DEFAULTS)):
-                item = self._slot_table.item(row, col)
-                raw = item.text().strip() if item else str(default)
-                try:
-                    slot[key] = int(raw)
-                except ValueError:
-                    try:
-                        slot[key] = float(raw)
-                    except ValueError:
-                        slot[key] = default
-            slots.append(slot)
-        return slots
-
-    def get_config(self) -> dict:
-        try:
-            secs = [int(s.strip()) for s in self.le_capture_secs.text().split(",") if s.strip()]
-        except ValueError:
-            secs = [0, 30]
-        return {
-            "imagerd_rt_dir":  self.le_dir.text().strip(),
-            "output_dir":      self.le_output.text().strip(),
-            "instance_name":   self.le_instance.text().strip(),
-            "device_id":       self.le_device_id.text().strip(),
-            "site_id":         self.le_site_id.text().strip(),
-            "zenith_angle_start": self.sb_zenith.value(),
-            "schedule_len_ms": self.sb_sched_len.value(),
-            "imaging_mode":    self.cb_mode.currentText(),
-            "capture_seconds": secs,
-            "slots":           self._read_slots(),
+            **self._intensity.values(),
         }
 
 
@@ -2108,7 +2027,7 @@ class GeneralConfigTab:
 
 
 class ConfigWizardWindow:
-    TAB_ALL = ["cannon", "sptt", "infra", "sentry", "asi", "japan", "alerts",
+    TAB_ALL = ["cannon", "sptt", "infra", "asi", "japan", "alerts",
                "server", "general"]
 
     def __init__(self, cfg: dict, camera_type=None, config_path: str = LOCAL_CONFIG_FILE):
@@ -2141,7 +2060,6 @@ class ConfigWizardWindow:
             "cannon":  (CannonConfigTab,  "Canon"),
             "sptt":    (SpttConfigTab,    "SPTT"),
             "infra":   (InfraConfigTab,   "Infra"),
-            "sentry":  (SentryConfigTab,  "Sentry"),
             "asi":     (AsiConfigTab,     "ASI"),
             "japan":   (JapanConfigTab,   "Japan"),
             "alerts":  (AlertsConfigTab,  "Оповещения"),
@@ -2197,7 +2115,6 @@ class ConfigWizardWindow:
             "cannon":  "cannon",
             "sptt":    "sptt",
             "infra":   "infra",
-            "sentry":  "sentry",
             "asi":     "asi",
             "japan":   "japan",
             "alerts":  "alerts",
@@ -2290,7 +2207,6 @@ def main():
         epilog="""
 Examples:
   python setup_app.py                      # GUI wizard, all cameras
-  python setup_app.py --type sentry        # GUI wizard, Sentry tab only
   python setup_app.py --type asi           # GUI wizard, ASI tab only
   python setup_app.py --console            # console wizard, all cameras
   python setup_app.py --console --type infra  # console wizard, Infra only
@@ -2298,7 +2214,7 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--type", choices=["cannon", "sptt", "infra", "sentry", "asi", "japan"],
+        "--type", choices=["cannon", "sptt", "infra", "asi", "japan"],
         help="Show/configure only this camera type",
     )
     parser.add_argument(
