@@ -151,11 +151,21 @@ class WorkerBus:
             except Exception:
                 pass
         try:
-            write_status_file(self.status_path, payload)
+            write_status_file(self.status_path, self._with_tunnel(payload))
         except Exception as exc:
             console_ui.warn(f"Could not write status file: {exc}")
         self._telemetry.write(payload)
         return True
+
+    def _with_tunnel(self, payload):
+        """Only the status file, which only this machine reads, carries the token:
+        ``/api/status`` is served through the tunnel itself.
+        """
+        url = getattr(self._service, "tunnel_url", None)
+        if not url:
+            return payload
+        return dict(payload, tunnel_url=url,
+                    tunnel_token=getattr(self._service, "tunnel_token", None))
 
     def publish_error(self, kind, error, ts_iso=None):
         if self._service is None:

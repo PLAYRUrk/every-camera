@@ -47,6 +47,7 @@
 **Сеть**
 - [HTTP-сервер кадров](Frame-Server.md)
 - [Обнаружение и шлюз](Discovery-And-Gateway.md)
+- [Доступ извне](Tunnel.md)
 
 **Разработчику**
 - [Структура проекта](Project-Structure.md)

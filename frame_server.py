@@ -6,11 +6,15 @@ object: live data comes from :class:`camera_service.CameraService`, archive data
 disk, so a hung worker leaves the archive answering. MJPEG streams and listing sizes
 are capped.
 
-Unauthenticated by design: run it on a trusted network, not a public interface.
+The LAN listener is unauthenticated by design: run it on a trusted network. Access from
+outside goes only through ``tunnel.py`` to a second listener on 127.0.0.1, where POST
+needs the run's token.
 """
 import errno
+import hmac
 import json
 import os
+import secrets
 import select
 import socket
 import threading
@@ -28,6 +32,7 @@ import cycles
 import frame_archive
 import frame_grouping
 import intensity
+import tunnel
 
 SERVER_VERSION = "every-camera/1.0"
 
@@ -82,18 +87,21 @@ class _ThumbCache:
 
 
 class FrameServer:
-    def __init__(self, httpd, thread, responder, port, fleet=None):
+    def __init__(self, httpd, thread, responder, port, fleet=None, external=None):
         self._httpd = httpd
         self._thread = thread
         self._responder = responder
         self.port = port
         self._fleet = fleet
+        self._external = external
 
     @property
     def url(self):
         return f"http://{_local_ip()}:{self.port}/"
 
     def stop(self):
+        if self._external is not None:
+            self._external.stop()
         if self._responder is not None:
             try:
                 self._responder.stop()
@@ -138,6 +146,8 @@ class _Handler(BaseHTTPRequestHandler):
     focus_ttl = 60.0
     stream_slots = None
     thumb_cache = None
+    # Set only on the listener the tunnel reaches.
+    control_token = None
     gateway = None
     verbose = False
 
@@ -235,10 +245,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def _token_ok(self):
+        if self.control_token is None:
+            return True
+        given = (self.headers.get(tunnel.TOKEN_HEADER)
+                 or self._arg(self._query(), "token") or "")
+        return hmac.compare_digest(str(given).encode("utf-8"),
+                                   self.control_token.encode("utf-8"))
+
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/params":
+            if not self._token_ok():
+                self._error(403, "this address is read-only without the control token")
+            elif path == "/api/params":
                 self._post_params()
             elif path == "/api/focus":
                 self._post_focus()
@@ -820,7 +840,50 @@ def start_frame_server(server_cfg, service, verbose=False):
 
     console_ui.log(f"LAN frame server: http://{_local_ip()}:{port}/  "
                    f"(archive: {service.output_dir or 'none'})")
-    return FrameServer(httpd, thread, responder, port, fleet)
+    external = _start_external(cfg.get("tunnel"), handler, service)
+    return FrameServer(httpd, thread, responder, port, fleet, external)
+
+
+class _External:
+    def __init__(self, httpd, thread, link):
+        self._httpd = httpd
+        self._thread = thread
+        self.tunnel = link
+
+    def stop(self):
+        try:
+            self.tunnel.stop()
+        except Exception:
+            pass
+        try:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+        except Exception:
+            pass
+        self._thread.join(timeout=5)
+
+
+def _start_external(tunnel_cfg, handler, service):
+    """No tunnel section means off: only a loaded config carries the default."""
+    if not isinstance(tunnel_cfg, dict) or not tunnel_cfg.get("enabled"):
+        return None
+    try:
+        token = secrets.token_urlsafe(16)
+        guarded = type("_TunnelHandler", (handler,), {"control_token": token})
+        httpd = _FrameHTTPServer(("127.0.0.1", 0), guarded)
+        thread = threading.Thread(target=httpd.serve_forever,
+                                  kwargs={"poll_interval": 0.5}, daemon=True,
+                                  name="everycam-tunnel-server")
+        thread.start()
+        try:
+            service.tunnel_token = token
+        except Exception:
+            pass
+        link = tunnel.Tunnel(httpd.server_address[1], tunnel_cfg, service).start()
+        return _External(httpd, thread, link)
+    except Exception as exc:
+        console_ui.warn(f"Tunnel not started: {exc}. Measurements continue.")
+        return None
 
 
 _INDEX_HTML = """<!doctype html>

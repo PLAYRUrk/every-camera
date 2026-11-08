@@ -216,6 +216,15 @@ DEFAULT_CONFIG = {
         "bayer_pattern": "RGGB",
         "r_offset": None,               # None: the camera keeps its own
         "g_offset": None,
+        # "always": around the clock; "sun": only while the sun is at or below
+        # sun_max_angle. The process waits for the next night instead of exiting.
+        "mode": "always",
+        "sun_max_angle": -10.0,
+        "location": {
+            "lat": 0.0,
+            "lon": 0.0,
+            "elevation": 0.0,
+        },
     },
     "infra": {
         "instance_name": "",
@@ -455,6 +464,15 @@ DEFAULT_CONFIG = {
         "discovery_port": 45455,
         "max_list": 5000,
         "focus_ttl": 60,
+        # Cloudflare quick tunnel: a new trycloudflare.com address every run, mailed by
+        # the sentinel. Read-only from outside unless the request carries the token.
+        "tunnel": {
+            "enabled": True,
+            "to": [],                   # empty = alerts.to
+            "mail_minutes": 180,        # resend period; 0 = only when it changes
+            "cloudflared": "",          # empty = PATH, ~/.every_camera/bin, download
+            "auto_download": True,
+        },
     },
     # Friendly name of this machine, shown by viewer_app/focus_app/monitor
     # instead of a bare IP. Empty means "use the hostname".
@@ -955,6 +973,21 @@ def configure_console_sptt(cfg, config_path=None):
     sptt["bayer_pattern"] = (pattern if pattern in ("RGGB", "GRBG", "GBRG", "BGGR")
                              else "RGGB")
 
+    print("\n  Sun mode: scheduled frames wait while the sun is above the threshold;")
+    print("  the program keeps running and starts again the next night.")
+    if _ask_bool("Capture only while the sun is low?", sptt.get("mode") == "sun"):
+        sptt["mode"] = "sun"
+        sptt["sun_max_angle"] = _ask_float("Sun altitude at or below (degrees)",
+                                           sptt.get("sun_max_angle", -10.0))
+        location = sptt.get("location") or {}
+        location["lat"] = _ask_float("Site latitude (degrees)", location.get("lat", 0.0))
+        location["lon"] = _ask_float("Site longitude (degrees)", location.get("lon", 0.0))
+        location["elevation"] = _ask_float("Site elevation (m)",
+                                           location.get("elevation", 0.0))
+        sptt["location"] = location
+    else:
+        sptt["mode"] = "always"
+
     cfg["sptt"] = sptt
     _configure_server(cfg)
 
@@ -1371,6 +1404,19 @@ def _configure_server(cfg):
         if srv["discovery"]:
             srv["discovery_port"] = _ask_int("Discovery UDP port",
                                              srv.get("discovery_port", 45455))
+        tun = srv.get("tunnel") or _deep_copy(DEFAULT_CONFIG["server"]["tunnel"])
+        print("\n  Access from outside: a Cloudflare quick tunnel, its address mailed")
+        print("  by sentinel.py. Read-only from outside without the mailed token.")
+        tun["enabled"] = _ask_bool("Enable access from outside?",
+                                   tun.get("enabled", True))
+        if tun["enabled"]:
+            answer = _ask("Who gets the address (comma-separated; blank = alerts.to)",
+                          ", ".join(tun.get("to") or []))
+            tun["to"] = [a.strip() for a in answer.split(",") if a.strip()]
+            tun["mail_minutes"] = _ask_int("Resend the address every N minutes "
+                                           "(0 = only when it changes)",
+                                           tun.get("mail_minutes", 180))
+        srv["tunnel"] = tun
     else:
         srv["enabled"] = False
     cfg["server"] = srv

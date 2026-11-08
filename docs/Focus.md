@@ -7,7 +7,10 @@ python focus_app.py                      # найти камеры в локал
 python focus_app.py --host 192.168.1.5   # сразу подключиться
 python focus_app.py --host 192.168.1.5 --port 8766
 python focus_app.py --host 10.0.0.5 --via 192.168.1.5:8765   # через шлюз
+python focus_app.py --host "https://….trycloudflare.com/?token=…"   # извне
 ```
+
+Извне камера доступна через [туннель Cloudflare](Tunnel.md). Чтобы менять параметры и включать фокусировку, нужен адрес с токеном из письма; без токена камера отвечает только на чтение.
 
 ## Порядок работы
 

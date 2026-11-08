@@ -7,6 +7,7 @@
 | `filterwheel.py`, `filterwheel_sim.py` | контроллер Animatics SmartMotor: `GOSUB5` — домой, `g=<n>` — переход, `GOSUB4` — опрос позиции, `d=` + `GOSUB6` — затвор |
 | `schedule.py` | слоты, тайминг цикла, оценка длительности тёмных кадров, разбор `schedule.txt` |
 | `sun.py`, `timeutil.py` | высота Солнца и единое определение UTC для имён, шапок и расчётов |
+| `sun_gate.py` | окно съёмки по высоте Солнца для SPTT, см. [SPTT](Camera-SPTT.md#съёмка-по-углу-солнца) |
 | `cfgparse.py` | чтение значений из `config.json` без исключений |
 | `fits.py` | 18 общих карт, 16 карт `imagerd_rt` и запись файла; карты об инструменте можно опустить (`instrument=False`) |
 | `archive_paths.py`, `seqno.py` | дерево UTC `YYYY/MM/DD`, имена `imagerd_rt`, счётчик `SEQNO`: ASI всегда, Japan в `sun_cycle` |

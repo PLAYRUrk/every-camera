@@ -6,7 +6,7 @@ import os
 import socket
 import threading
 
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
@@ -14,6 +14,30 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 DEFAULT_TIMEOUT = 10.0
 SETTINGS_FILE_NAME = "viewer.json"
+# Same header as tunnel.TOKEN_HEADER; tunnel.py is not imported to keep this PyQt-only.
+TOKEN_HEADER = "X-Everycam-Token"
+
+
+def parse_address(text, default_port=8765):
+    """``host``, ``host:port`` or a tunnel URL with ``?token=``; returns
+    ``(host, port, token)``, where a URL stays whole in ``host``.
+    """
+    text = (text or "").strip()
+    if "://" in text:
+        parts = urlsplit(text)
+        token = (parse_qs(parts.query).get("token") or [None])[0]
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        port = port or (443 if parts.scheme == "https" else 80)
+        return f"{parts.scheme}://{parts.netloc}", port, token
+    host, _, port = text.partition(":")
+    return host.strip(), int(port) if port.strip().isdigit() else default_port, None
+
+
+def _root(address):
+    return address.rstrip("/") if "://" in address else f"http://{address}"
 
 
 class CameraHttpError(Exception):
@@ -44,23 +68,36 @@ class CameraClient:
     ``/api/node/<host:port>/...`` to a neighbour it has seen (``gateway.py``).
     """
 
-    def __init__(self, host, port=8765, timeout=DEFAULT_TIMEOUT, via=None):
+    def __init__(self, host, port=8765, timeout=DEFAULT_TIMEOUT, via=None, token=None):
         self.host = host
         self.port = int(port)
         self.timeout = timeout
-        # host:port of the node that will do the fetching, or None for direct.
+        # host:port or tunnel URL of the node that will do the fetching, or None.
         self.via = str(via) if via else None
+        # Needed for POST through a tunnel; the LAN ignores it.
+        self.token = token or None
 
     @property
     def base_url(self):
         if self.via:
-            return f"http://{self.via}/api/node/{self.host}:{self.port}"
+            return f"{_root(self.via)}/api/node/{self.host}:{self.port}"
+        if "://" in str(self.host):
+            return str(self.host).rstrip("/")
         return f"http://{self.host}:{self.port}"
 
+    def _headers(self, extra=None):
+        # Cloudflare may answer urllib's default User-Agent with 403 (error 1010).
+        headers = {"User-Agent": "every-camera"}
+        headers.update(extra or {})
+        if self.token:
+            headers[TOKEN_HEADER] = self.token
+        return headers
+
     def __str__(self):
+        own = self.host if "://" in str(self.host) else f"{self.host}:{self.port}"
         if self.via:
-            return f"{self.host}:{self.port} via {self.via}"
-        return f"{self.host}:{self.port}"
+            return f"{own} via {self.via}"
+        return own
 
     def nodes(self):
         return self.get_json("/api/nodes").get("nodes", [])
@@ -72,7 +109,8 @@ class CameraClient:
     def get_bytes(self, path, timeout=None, **params):
         url = self.url_for(path, **params)
         try:
-            with urlopen(url, timeout=timeout or self.timeout) as resp:
+            with urlopen(Request(url, headers=self._headers()),
+                         timeout=timeout or self.timeout) as resp:
                 return resp.read(), dict(resp.headers)
         except HTTPError as exc:
             detail = ""
@@ -94,7 +132,7 @@ class CameraClient:
     def post_json(self, path, payload, timeout=None):
         body = json.dumps(payload or {}).encode("utf-8")
         req = Request(f"{self.base_url}{path}", data=body,
-                      headers={"Content-Type": "application/json"},
+                      headers=self._headers({"Content-Type": "application/json"}),
                       method="POST")
         try:
             with urlopen(req, timeout=timeout or self.timeout) as resp:
@@ -272,7 +310,8 @@ class MjpegStream(QThread):
         url = self._client.url_for("/api/live.mjpg", max=self._max_side,
                                    stretch=self._stretch, fps=self._fps)
         self.state.emit("connecting")
-        with urlopen(url, timeout=15.0) as resp:
+        with urlopen(Request(url, headers=self._client._headers()),
+                     timeout=15.0) as resp:
             self.state.emit("streaming")
             buf = b""
             while not self._stop.is_set():

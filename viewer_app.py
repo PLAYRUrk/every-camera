@@ -25,7 +25,7 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QFont
 
 from net_client import (
     CameraClient, TaskRunner, DiscoveryTask, load_settings, save_settings,
-    node_label, node_name_of,
+    node_label, node_name_of, parse_address,
 )
 from frame_grouping import (
     entry_timestamp, group_by_session, group_japan_cycles,
@@ -446,7 +446,7 @@ class LanPanel(QWidget):
         cam_lay.addWidget(self.btn_discover, 1, 0)
 
         self.le_manual = QLineEdit()
-        self.le_manual.setPlaceholderText("host or host:port")
+        self.le_manual.setPlaceholderText("host, host:port or tunnel URL")
         self.le_manual.returnPressed.connect(self._on_manual_connect)
         cam_lay.addWidget(self.le_manual, 2, 0)
         btn_connect = QPushButton("Connect")
@@ -742,14 +742,17 @@ class LanPanel(QWidget):
         text = self.le_manual.text().strip()
         if not text:
             return
-        host, _, port = text.partition(":")
-        self.connect_to(host.strip(), int(port) if port.strip().isdigit()
-                        else DEFAULT_HTTP_PORT)
+        host, port, _ = parse_address(text, DEFAULT_HTTP_PORT)
+        self.connect_to(host, port)
 
     def connect_to(self, host, port=DEFAULT_HTTP_PORT, via=None):
+        if "://" in str(host):
+            host, port, _ = parse_address(host, port)
         self._client = CameraClient(host, port, via=via)
-        self._remember(host, port)
-        self.lbl_camera.setText(f"connecting to {host}:{port}…")
+        if "://" not in host:
+            # A tunnel address lasts one run; remembered it would mislead.
+            self._remember(host, port)
+        self.lbl_camera.setText(f"connecting to {self._client}…")
         # The switch belongs to a camera type: hide it while the next camera identifies itself.
         self._camera_type = None
         self._mode = None

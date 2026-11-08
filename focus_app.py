@@ -26,7 +26,7 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont
 
 from net_client import (
     CameraClient, CameraHttpError, TaskRunner, DiscoveryTask, MjpegStream,
-    load_settings, save_settings, node_label, node_name_of,
+    load_settings, save_settings, node_label, node_name_of, parse_address,
 )
 
 DEFAULT_HTTP_PORT = 8765
@@ -657,7 +657,7 @@ class FocusWindow(QMainWindow):
         self.btn_discover.clicked.connect(self.discover)
         bar.addWidget(self.btn_discover)
         self.le_manual = QLineEdit()
-        self.le_manual.setPlaceholderText("host or host:port")
+        self.le_manual.setPlaceholderText("host, host:port or tunnel URL")
         self.le_manual.setMaximumWidth(180)
         self.le_manual.returnPressed.connect(self._on_manual)
         bar.addWidget(self.le_manual)
@@ -872,10 +872,9 @@ class FocusWindow(QMainWindow):
         text = self.le_manual.text().strip()
         if not text:
             return
-        host, _, port = text.partition(":")
-        target = (host.strip(),
-                  int(port) if port.strip().isdigit() else DEFAULT_HTTP_PORT)
-        self.cmb_cameras.insertItem(0, f"{target[0]}:{target[1]}", target)
+        target = parse_address(text, DEFAULT_HTTP_PORT)
+        label = target[0] if "://" in target[0] else f"{target[0]}:{target[1]}"
+        self.cmb_cameras.insertItem(0, label, target)
         self.cmb_cameras.setCurrentIndex(0)
         self._on_start()
 
@@ -890,10 +889,13 @@ class FocusWindow(QMainWindow):
             QMessageBox.information(self, "No camera",
                                     "Pick a camera or type its address first.")
             return
-        host, port = target
-        self._client = CameraClient(host, port, via=self._via)
-        self._remember(host, port)
-        self.lbl_camera.setText(f"connecting to {host}:{port}…")
+        host, port = target[0], target[1]
+        token = target[2] if len(target) > 2 else None
+        self._client = CameraClient(host, port, via=self._via, token=token)
+        if "://" not in host:
+            # A tunnel address and its token last one run; remembered they mislead.
+            self._remember(host, port)
+        self.lbl_camera.setText(f"connecting to {self._client}…")
         self._tasks.run(self._client.info, self._on_info, self._on_error)
 
     def set_via(self, via):
@@ -1283,8 +1285,8 @@ def main():
     window.show()
 
     if args.host:
-        window.cmb_cameras.addItem(f"{args.host}:{args.port}",
-                                   (args.host, args.port))
+        target = parse_address(args.host, args.port)
+        window.cmb_cameras.addItem(args.host, target)
         QTimer.singleShot(100, window._on_start)
     else:
         QTimer.singleShot(200, window.discover)

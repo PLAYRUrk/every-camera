@@ -9,7 +9,9 @@ that program being gone. This runs beside it as its own service and:
 - notices a worker that hung: alive, but its status has stopped moving;
 - warns about the disk, from the free space workers last reported;
 - mails a status summary if ``alerts.status_mail_minutes`` asks, so somebody who cannot
-  reach in still hears from the station.
+  reach in still hears from the station;
+- mails the workers' tunnel addresses when they change and every
+  ``server.tunnel.mail_minutes``.
 
 No numpy, PyQt or camera driver: it must be what is still running when nothing else is.
 """
@@ -56,6 +58,8 @@ DEFAULT_INTERVAL = 15.0
 # stale at 30. Far looser here: a tile going orange is a glance, a letter is somebody's
 # evening.
 HANG_SECONDS = 600.0
+# Cameras started together get their addresses seconds apart: one letter, not six.
+TUNNEL_SETTLE_SECONDS = 30.0
 
 
 def _read_json(path):
@@ -173,6 +177,15 @@ class Sentinel:
         # A full interval from start, not at start: a station rebooting in a loop would
         # otherwise mail on every boot.
         self._next_status_mail = time.monotonic() + self.status_mail_seconds
+        self.tunnel_cfg = (cfg.get("server") or {}).get("tunnel") or {}
+        self.tunnel_recipients = ([a for a in (self.tunnel_cfg.get("to") or []) if a]
+                                  or self.recipients)
+        self.tunnel_mail_seconds = (
+            float(self.tunnel_cfg.get("mail_minutes", 0) or 0) * 60.0)
+        self._tunnel_seen = None
+        self._tunnel_seen_at = 0.0
+        # As for the status mail: a restarted sentinel resends only what changed.
+        self._next_tunnel_mail = time.monotonic() + self.tunnel_mail_seconds
         self._state = _read_json(self.state_file) or {}
         self._known = dict(self._state.get("known") or {})
         self._reconcile_boot()
@@ -343,7 +356,65 @@ class Sentinel:
                 ("обновлён только что" if age is None or age < 60
                  else f"без обновлений {age / 60:.0f} мин"),
             )))
+            if status.get("tunnel_url"):
+                lines.append(f"{'':<16}  {status['tunnel_url']}")
         return "\n".join(lines)
+
+    def tunnels(self):
+        found = {}
+        for key, entry in self._known.items():
+            status = entry.get("status") or {}
+            if status.get("tunnel_url"):
+                found[key] = {"instance": entry.get("instance") or key,
+                              "camera": entry.get("camera") or "?",
+                              "url": status["tunnel_url"],
+                              "token": status.get("tunnel_token") or ""}
+        return found
+
+    def send_tunnel_mail(self, force=False, now=None):
+        now = time.monotonic() if now is None else now
+        current = self.tunnels()
+        urls = sorted(t["url"] for t in current.values())
+        if urls != self._tunnel_seen:
+            self._tunnel_seen = urls
+            self._tunnel_seen_at = now
+        if not current:
+            return False
+        # A camera that stopped, or whose tunnel is restarting, brings nobody news.
+        new = not set(urls) <= set(self._state.get("tunnel_mailed") or [])
+        due = (self.tunnel_mail_seconds > 0 and now >= self._next_tunnel_mail)
+        settled = now - self._tunnel_seen_at >= TUNNEL_SETTLE_SECONDS
+        if not force and not (settled and (new or due)):
+            return False
+        queued = self.spool.put(
+            f"[every-camera] {self.node_name} — адреса доступа извне",
+            self._tunnel_letter(current),
+            to=self.tunnel_recipients, kind="tunnel") is not None
+        if queued:
+            if self.tunnel_mail_seconds > 0:
+                self._next_tunnel_mail = now + self.tunnel_mail_seconds
+            self._state["tunnel_mailed"] = urls
+            self._save_state()
+        return queued
+
+    def _tunnel_letter(self, current):
+        parts = [f"Узел {self.node_name} ({socket.gethostname()}), "
+                 f"{dt.now().isoformat(timespec='seconds')}",
+                 "",
+                 "Адреса меняются при каждом перезапуске камеры; новое письмо придёт "
+                 "само.",
+                 "Браузер и viewer_app.py — просмотр по адресу без токена. Изменение "
+                 "параметров и фокус — focus_app.py, адрес с токеном вставить в поле "
+                 "адреса камеры."]
+        for key in sorted(current):
+            item = current[key]
+            parts += ["",
+                      f"{item['instance']} ({item['camera']})",
+                      f"  браузер:      {item['url']}/"]
+            if item["token"]:
+                parts += [f"  с токеном:    {item['url']}/?token={item['token']}",
+                          f"  токен:        {item['token']}"]
+        return "\n".join(parts)
 
     def send_status_mail(self, force=False):
         if self.status_mail_seconds <= 0 and not force:
@@ -364,6 +435,7 @@ class Sentinel:
         self.watch_workers()
         self.check_disk()
         self.send_status_mail()
+        self.send_tunnel_mail()
         return self.send_spool()
 
     def run(self, interval=DEFAULT_INTERVAL):
@@ -394,6 +466,8 @@ def main():
                         help="Do a single pass and exit")
     parser.add_argument("--status-mail", action="store_true",
                         help="Queue a status summary now, whatever the schedule")
+    parser.add_argument("--tunnel-mail", action="store_true",
+                        help="Queue the tunnel addresses now, whatever the schedule")
     args = parser.parse_args()
 
     try:
@@ -405,7 +479,11 @@ def main():
     if args.status_mail:
         sentinel.watch_workers()
         sentinel.send_status_mail(force=True)
-    if args.once or args.status_mail:
+    if args.tunnel_mail:
+        sentinel.watch_workers()
+        if not sentinel.send_tunnel_mail(force=True):
+            print("no camera on this machine reports a tunnel address")
+    if args.once or args.status_mail or args.tunnel_mail:
         sent, failed, dropped = sentinel.tick()
         print(f"sent {sent}, failed {failed}, dropped {dropped}, "
               f"queued {sentinel.spool.count()}")

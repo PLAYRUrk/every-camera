@@ -375,6 +375,40 @@ class SpttConfigTab:
             _add_label_row(cgrid, row, label, spin); row += 1
 
         root.addWidget(cbox)
+
+        loc = c.get("location") or {}
+        sbox, sgrid = _group_grid("Capture window")
+        row = 0
+        self.cb_sun_mode = QComboBox()
+        self.cb_sun_mode.addItems(["Around the clock", "Only while the sun is low"])
+        self.cb_sun_mode.setCurrentIndex(1 if c.get("mode") == "sun" else 0)
+        self.cb_sun_mode.setToolTip(
+            "In sun mode scheduled frames wait while the sun is above the threshold;"
+            "\nthe program keeps running and starts again the next night.")
+        _add_label_row(sgrid, row, "Capture:", self.cb_sun_mode); row += 1
+        self.sb_sun_angle = QDoubleSpinBox()
+        self.sb_sun_angle.setRange(-30.0, 10.0)
+        self.sb_sun_angle.setDecimals(1)
+        self.sb_sun_angle.setSuffix(" °")
+        self.sb_sun_angle.setValue(float(c.get("sun_max_angle", -10.0)))
+        _add_label_row(sgrid, row, "Sun at or below:", self.sb_sun_angle); row += 1
+        self.sb_lat = QDoubleSpinBox()
+        self.sb_lat.setRange(-90.0, 90.0)
+        self.sb_lat.setDecimals(6)
+        self.sb_lat.setValue(float(loc.get("lat", 0.0)))
+        _add_label_row(sgrid, row, "Latitude:", self.sb_lat); row += 1
+        self.sb_lon = QDoubleSpinBox()
+        self.sb_lon.setRange(-180.0, 180.0)
+        self.sb_lon.setDecimals(6)
+        self.sb_lon.setValue(float(loc.get("lon", 0.0)))
+        _add_label_row(sgrid, row, "Longitude:", self.sb_lon); row += 1
+        self.sb_elev = QDoubleSpinBox()
+        self.sb_elev.setRange(-500.0, 9000.0)
+        self.sb_elev.setDecimals(1)
+        self.sb_elev.setSuffix(" m")
+        self.sb_elev.setValue(float(loc.get("elevation", 0.0)))
+        _add_label_row(sgrid, row, "Elevation:", self.sb_elev); row += 1
+        root.addWidget(sbox)
         root.addStretch()
 
     def _find_cameras(self):
@@ -436,6 +470,10 @@ class SpttConfigTab:
             "bayer_pattern": self.BAYER_PATTERNS[self.cb_bayer.currentIndex()],
             "r_offset":      None if self.sb_r_offset.value() < 0 else self.sb_r_offset.value(),
             "g_offset":      None if self.sb_g_offset.value() < 0 else self.sb_g_offset.value(),
+            "mode":          "sun" if self.cb_sun_mode.currentIndex() == 1 else "always",
+            "sun_max_angle": self.sb_sun_angle.value(),
+            "location": {"lat": self.sb_lat.value(), "lon": self.sb_lon.value(),
+                         "elevation": self.sb_elev.value()},
         }
 
 
@@ -1918,7 +1956,7 @@ class ServerConfigTab:
             "captured frame and <b>focus_app.py</b> watch a live stream, over "
             "the local network.<br>It runs on its own threads and never "
             "delays a measurement — if the port is busy it just logs a "
-            "warning.<br><b>Access is unauthenticated</b>: use it on a "
+            "warning.<br><b>LAN access is unauthenticated</b>: use it on a "
             "trusted network only.")
         blurb.setWordWrap(True)
         root.addWidget(blurb)
@@ -1988,10 +2026,40 @@ class ServerConfigTab:
         _add_label_row(grid, row, "Focus mode timeout:", self.sb_focus_ttl); row += 1
 
         root.addWidget(box)
+
+        t = s.get("tunnel") or {}
+        tbox, tgrid = _group_grid("Access from outside (Cloudflare)")
+        self.cb_tunnel = QCheckBox("Open a Cloudflare quick tunnel with the program")
+        self.cb_tunnel.setChecked(bool(t.get("enabled", True)))
+        self.cb_tunnel.setToolTip(
+            "A new https://….trycloudflare.com address every run, mailed by "
+            "sentinel.py.\nWithout the token in the same letter it is read-only. "
+            "cloudflared is downloaded\nonce into ~/.every_camera/bin if it is not "
+            "installed. A failed tunnel never stops a measurement.")
+        tgrid.addWidget(self.cb_tunnel, 0, 0, 1, 2)
+        self.le_tunnel_to = QLineEdit(", ".join(t.get("to") or []))
+        self.le_tunnel_to.setPlaceholderText("empty = the alert recipients")
+        _add_label_row(tgrid, 1, "Send the address to:", self.le_tunnel_to)
+        self.sb_tunnel_mail = QSpinBox()
+        self.sb_tunnel_mail.setRange(0, 10080)
+        self.sb_tunnel_mail.setSuffix(" min")
+        try:
+            self.sb_tunnel_mail.setValue(int(t.get("mail_minutes", 180)))
+        except (ValueError, TypeError):
+            self.sb_tunnel_mail.setValue(180)
+        self.sb_tunnel_mail.setToolTip("0 = only when the address changes.")
+        _add_label_row(tgrid, 2, "Resend every:", self.sb_tunnel_mail)
+        root.addWidget(tbox)
         root.addStretch()
 
     def get_config(self) -> dict:
         return {
+            "tunnel": {
+                "enabled": self.cb_tunnel.isChecked(),
+                "to": [a.strip() for a in self.le_tunnel_to.text().split(",")
+                       if a.strip()],
+                "mail_minutes": self.sb_tunnel_mail.value(),
+            },
             "enabled":        self.cb_enabled.isChecked(),
             "bind":           self.le_bind.text().strip() or "0.0.0.0",
             "port":           self.sb_port.value(),

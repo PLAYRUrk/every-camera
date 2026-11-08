@@ -27,6 +27,7 @@
 | `worker_common.py` | обвязка воркеров: статусы, публикация кадров |
 | `camera_service.py` | потокобезопасная прослойка между воркером и сетью, `PARAM_SCHEMAS` |
 | `frame_server.py` | HTTP-сервер кадров |
+| `tunnel.py` | [туннель Cloudflare](Tunnel.md): поиск и скачивание `cloudflared`, слежение за процессом |
 | `frame_archive.py` | чтение архива, JPEG, метрика резкости |
 | `frame_grouping.py` | группировка кадров по циклам и фильтрам |
 | `discovery.py` | обнаружение камер по UDP |

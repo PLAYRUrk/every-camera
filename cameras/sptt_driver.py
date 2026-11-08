@@ -36,6 +36,7 @@ from .sptt_load_firmware import (
     find_libusb_backend, load_firmware_files, detach_kernel_driver,
     load_fx2_firmware, wait_for_configured_device, load_fpga_bitstream,
 )
+from .common.sun_gate import SunSettingsError, gate_from_config
 from .sptt_timing import (
     exposure_to_us, derive_period_us, exposure_mismatch, period_mismatch,
     describe_timing, PERIOD_READOUT_MARGIN_US, CMD_VALUE_MAX,
@@ -1072,9 +1073,11 @@ class SpttWorkerConsole(threading.Thread):
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
                  capture_seconds=None, service=None, node_name="",
-                 setup_mode=False, debayer=False):
+                 setup_mode=False, debayer=False, sun_gate=None):
         super().__init__(daemon=True)
         self.cam = cam
+        # None: captures around the clock.
+        self.sun_gate = sun_gate
         # Archive the colour camera's frames as R, G, B cubes instead of the raw mosaic.
         self.debayer = bool(debayer)
         self.output_dir = output_dir
@@ -1195,7 +1198,8 @@ class SpttWorkerConsole(threading.Thread):
             console_ui.log("SPTT ready for focusing (setup mode) — nothing is archived")
             self._save_status(SETUP_STATUS, force=True)
         else:
-            console_ui.log("SPTT measurement started (captures at :00 and :30)")
+            console_ui.log("SPTT measurement started (captures at :00 and :30"
+                           f"{', sun permitting' if self.sun_gate else ''})")
             self._save_status("running", force=True)
 
         try:
@@ -1206,6 +1210,10 @@ class SpttWorkerConsole(threading.Thread):
             self._save_status("error", force=True)
             self._bus.shutdown(failed=f"Failed to start camera: {exc}")
             return
+
+        if self.sun_gate is not None:
+            # The first altitude imports astropy, seconds: not on a capture second.
+            self.sun_gate.is_open(dt.now())
 
         while not self._stop_event.is_set():
             now = dt.now()
@@ -1226,6 +1234,13 @@ class SpttWorkerConsole(threading.Thread):
                 # No schedule to honour: focus gets every tick, nothing is saved.
                 self._handle_focus(now)
                 self._save_status(SETUP_STATUS)
+                self._stop_event.wait(0.1)
+                continue
+            if self.sun_gate is not None and not self.sun_gate.is_open(
+                    now, refresh=now.second not in self.capture_seconds):
+                last_fired = (-1, -1)
+                self._handle_focus(now)
+                self._save_status("waiting")
                 self._stop_event.wait(0.1)
                 continue
             if now.second in self.capture_seconds and fire_key != last_fired:
@@ -1337,6 +1352,10 @@ class SpttWorkerConsole(threading.Thread):
         # free on a network share.
         if self._system_info is not None:
             payload["system"] = self._system_info
+        if self.sun_gate is not None:
+            payload["sun_altitude"] = self.sun_gate.angle
+            payload["sun_max_angle"] = self.sun_gate.max_angle
+            console_ui.update(schedule=self.sun_gate.describe())
 
         console_ui.update(status=status, frames=self._shots, errors=self._errors,
                           output_dir=self.output_dir)
@@ -1550,6 +1569,12 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         console_ui.error("output_dir is required.")
         sys.exit(1)
 
+    try:
+        sun_gate = None if setup_mode else gate_from_config(sptt_cfg)
+    except SunSettingsError as exc:
+        console_ui.error(f"sptt: {exc}")
+        sys.exit(1)
+
     if setup_mode:
         announce_setup_mode(None)
         dash.update(schedule="setup mode — no scheduled captures")
@@ -1606,6 +1631,7 @@ def _run_console_sptt(cfg, sptt_cfg, config_path, preview, dash,
         node_name=node_name,
         setup_mode=setup_mode,
         debayer=sptt_cfg.get("debayer", False),
+        sun_gate=sun_gate,
     )
 
     def _stop(sig, frame):

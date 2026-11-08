@@ -738,10 +738,11 @@ class SpttScheduledWorkerQt(QThread):
     MAX_CONSECUTIVE_ERRORS = 5
 
     def __init__(self, cam, output_dir, instance_name, status_dir,
-                 service=None, capture_seconds=None, debayer=False):
+                 service=None, capture_seconds=None, debayer=False, sun_gate=None):
         super().__init__()
         from sptt_driver import SPTT_CAPTURE_SECONDS
         self.cam = cam
+        self.sun_gate = sun_gate
         self.debayer = bool(debayer)
         self.output_dir = output_dir
         self.instance_name = instance_name
@@ -802,6 +803,7 @@ class SpttScheduledWorkerQt(QThread):
         from sptt_driver import save_fits, frame_metadata, seconds_to_next_capture
 
         last_fired = (-1, -1)
+        waiting_saved = 0.0
         consecutive_errors = 0
         self._bus.prepare_status_dir()
 
@@ -818,8 +820,27 @@ class SpttScheduledWorkerQt(QThread):
             self.finished.emit()
             return
 
+        if self.sun_gate is not None:
+            # The first altitude imports astropy, seconds: not on a capture second.
+            self.sun_gate.is_open(dt.now())
+
         while not self._stop:
             now = dt.now()
+
+            if self.sun_gate is not None and not self.sun_gate.is_open(
+                    now, refresh=now.second not in self.capture_seconds):
+                last_fired = (-1, -1)
+                self.countdown.emit(self.sun_gate.describe())
+                self.status_msg.emit("Waiting for the night")
+                self._handle_focus(now)
+                # Each save asks the camera for its status over USB: not ten times a
+                # second, but often enough that the sentinel does not call it hung.
+                if time.monotonic() - waiting_saved > 10.0:
+                    waiting_saved = time.monotonic()
+                    self._save_status("waiting", force=True)
+                self.msleep(100)
+                continue
+            waiting_saved = 0.0
 
             remaining = seconds_to_next_capture(now, self.capture_seconds)
             self.countdown.emit(f"{remaining:.1f}s")
@@ -927,6 +948,9 @@ class SpttScheduledWorkerQt(QThread):
             "encoding": "12bit" if self.cam.encoding == ENCODING_12BPP else "8bit",
             "last_update": dt.now().isoformat(),
         }
+        if self.sun_gate is not None:
+            payload["sun_altitude"] = self.sun_gate.angle
+            payload["sun_max_angle"] = self.sun_gate.max_angle
         payload.update({f"cam_{k}": v for k, v in cam_status.items()})
         try:
             payload["system"] = get_system_info(self.output_dir)
@@ -1283,6 +1307,13 @@ class SpttTab(QWidget):
         if not _make_dirs(self, output_dir, status_dir):
             return
 
+        from cameras.common.sun_gate import SunSettingsError, gate_from_config
+        try:
+            sun_gate = gate_from_config(self._sptt_cfg)
+        except SunSettingsError as exc:
+            QMessageBox.warning(self, "Sun settings", f"sptt: {exc}")
+            return
+
         self._claim = claim_instance_name(
             self.le_instance.text().strip() or get_instance_name("SPTT", self._cfg))
         instance_name = self._claim.name
@@ -1297,6 +1328,7 @@ class SpttTab(QWidget):
             service=self._service,
             capture_seconds=self._capture_seconds,
             debayer=self._sptt_cfg.get("debayer", False),
+            sun_gate=sun_gate,
         )
         self.scheduled_worker.log_msg.connect(self._log)
         self.scheduled_worker.shot_taken.connect(
