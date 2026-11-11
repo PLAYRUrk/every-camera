@@ -543,11 +543,21 @@ class SpttCamera:
         # size, so it means nothing until binning, ROI and encoding are in force.
         _, sl = read_crb(self.ep_wr, self.ep_rd)
         self._set_frame_size(*self._frame_size(sl))
+        frame_bytes = self.w * self.h * (3 if encoding == ENCODING_12BPP else 2) // 2
+        console_ui.log(f"SPTT binning {self.binning}: status size {sl[17]}x{sl[18]}, "
+                       f"frame {self.w}x{self.h}, {frame_bytes} bytes")
         self.min_period_us = sl[14]
         return self._apply_period()
 
     def _frame_size(self, sl):
-        return (sl[17], sl[18]) if self.model.has_binning else (sl[10], sl[11])
+        if not self.model.has_binning:
+            return sl[10], sl[11]
+        size = sl[17], sl[18]
+        # Some CSDU-429 firmware reports the full sensor even for binned frames.
+        if (self.model == CSDU429 and sl[7] in (1, 3)
+                and size == self.model.nominal_sizes[0]):
+            return self.model.nominal_sizes[sl[7]]
+        return size
 
     @property
     def single_shot(self):
@@ -569,7 +579,7 @@ class SpttCamera:
         self._settings_gen += 1
 
     def _set_frame_size(self, w, h):
-        """Trust the firmware's size: a table keyed on binning is wrong under an ROI.
+        """Use the resolved frame size, preserving nonstandard ROI dimensions.
 
         The size decides how many bytes are asked for, and a wrong one leaves the rest of
         the frame in the FIFO to be read as the next one.
